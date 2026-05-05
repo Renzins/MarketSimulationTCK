@@ -9,7 +9,8 @@
       "Bash(python /c/Users/User/Desktop/web2/validate.py)",
       "mcp__Claude_Preview__preview_start",
       "Bash(python /c/Users/User/Desktop/web2/sensitivity.py)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "PowerShell(gh pr list --head change-lvl --state all --json number,url,state 2>&1)"
     ]
   }
 }
