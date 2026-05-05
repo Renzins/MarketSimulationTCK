@@ -4,7 +4,7 @@
     {
       "name": "wind-park-tool",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "8770", "--directory", "wind-park-tool"],
+      "runtimeArgs": ["-m", "http.server", "8770"],
       "port": 8770
     }
   ]

@@ -18,7 +18,7 @@ import pandas as pd
 def load_data():
     import os
     base = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(base, "wind-park-tool", "data.js"), "r") as f:
+    with open(os.path.join(base, "data.js"), "r") as f:
         text = f.read()
     # Strip the "const WIND_DATA = " prefix and trailing semicolon/comments
     start = text.index("{")

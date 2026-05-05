@@ -42,21 +42,30 @@ For each level you get:
 
 ## File layout
 
+The site lives at the **repository root** so the whole repo can be
+deployed to GitHub Pages with zero subfolder configuration.
+
 ```
-wind-park-tool/
-├── index.html         page structure
-├── style.css          dark theme
-├── data.js            pre-processed dataset (1.7 MB, generated)
-├── engine.js          simulation engine (winsorize, simulate, sweep)
-├── charts.js          Plotly chart builders
-├── app.js             UI wiring, tabs, sliders, debounced recompute
-├── preprocess.py      regenerate data.js from the source CSV
-└── README.md          this file
+.                                   ← repo root (= GitHub Pages root)
+├── index.html                      page structure
+├── style.css                       dark theme
+├── data.js                         pre-processed dataset (1.7 MB, generated)
+├── engine.js                       simulation engine (winsorize, simulate, sweep)
+├── charts.js                       Plotly chart builders
+├── app.js                          UI wiring, tabs, sliders, debounced recompute
+├── preprocess.py                   regenerate data.js from the source CSV
+├── main_data_with_imbalance.csv    raw 15-min ISP data (kept for reproducibility)
+└── README.md                       this file
 ```
+
+The `.py` and `.csv` files are downloadable but harmless — GitHub Pages
+just serves them as static files; they aren't part of the rendered site.
+If you don't want them in the public repo, delete `preprocess.py` and
+`main_data_with_imbalance.csv` before pushing.
 
 ## Running locally
 
-The site is fully static. From this folder:
+The site is fully static. From the repo root:
 
 ```
 python -m http.server 8000
@@ -68,7 +77,7 @@ then open <http://localhost:8000>. Or just **double-click `index.html`**
 ## Deploying to GitHub Pages
 
 1. Create a new GitHub repository (e.g. `vanessa-wind-tool`).
-2. Copy **all files in this folder** into the repo root and commit:
+2. From this folder push the contents to the repo:
    ```
    git init
    git add .
@@ -84,17 +93,15 @@ then open <http://localhost:8000>. Or just **double-click `index.html`**
 
 ## Regenerating the data
 
-`data.js` is generated from the source CSV by `preprocess.py`. The
-script expects `main_data_with_imbalance.csv` to live one directory
-above this folder. To regenerate (after updating the CSV):
+`data.js` is generated from the source CSV by `preprocess.py`. Both
+files live in the repo root, so simply:
 
 ```
-cd wind-park-tool
 python preprocess.py
 ```
 
-It also runs the spec's two worked Level 2 examples through the
-identical Python formulas as a sign-convention sanity check.
+The script also runs the spec's two worked Level 2 examples through
+the identical Python formulas as a sign-convention sanity check.
 
 ## Sign conventions
 

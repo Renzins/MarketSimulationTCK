@@ -15,7 +15,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-CSV_PATH = "../main_data_with_imbalance.csv"
+CSV_PATH = "main_data_with_imbalance.csv"
 OUT_PATH = "data.js"
 
 NEEDED = [
