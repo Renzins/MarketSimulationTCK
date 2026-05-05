@@ -1,0 +1,394 @@
+================================================================================
+  main_data_imputed.csv  —  COLUMN DESCRIPTIONS
+================================================================================
+
+File:     main_data_imputed.csv
+Period:   2025-02-05 00:00 UTC  to  2026-05-02 23:45 UTC
+Interval: 15 minutes, strictly UTC, no timezone offset
+
+All hourly source data (EE/LV load, EE/LV wind/solar, reserves legacy,
+Scipher day-ahead before Oct 2025) was expanded to 15-min by repeating the
+same value four times per hour.
+Turbine data was originally 10-min EET; it was imputed, converted to UTC,
+and resampled to 15-min by averaging values within each bin.
+
+NordPool intraday VWAP snapshots (at 1h and 3h before delivery) were
+joined on the floored hour, so each hour's value is repeated across all
+four 15-min slots.
+
+Data was trimmed to start at 2025-02-05 to eliminate the structural gap in
+reserves data that existed before that date.
+
+================================================================================
+  IMPUTATION AND CLEANING APPLIED
+================================================================================
+
+Before imputation, a rolling z-score anomaly detector (24-hour centered
+window, threshold 3.5, minimum 30% nonzero neighbours) was applied to all
+load, wind/solar generation, and turbine columns. Suspicious false zeros
+were set to NaN and subsequently filled by linear interpolation.
+
+Imputation strategies by column group:
+  - Scipher DA forecast:        linear interpolation (limit 4 = 1 hour)
+  - Scipher ID forecast:        forward-fill (limit 8 = 2 hours), then
+                                fallback to scipher_da_p50_mw
+  - Renewcast forecasts:        linear interpolation (limit 4)
+  - MFRR SA prices:             forward-fill then back-fill (limit 4)
+  - Imbalance volumes:          linear interpolation (limit 4)
+  - SA-mFRR bid prices:         forward-fill then back-fill (limit 4)
+  - Reserves (aFRR/FCR/mFRR):   forward-fill then back-fill (limit 4)
+  - aFRR LMP:                   forward-fill (limit 4), then fill 0.0
+  - aFRR bid prices:            forward-fill (limit 4), then fill 0.0
+  - LT day-ahead price:         forward-fill then back-fill (limit 4)
+  - Loads (actual & forecast):  linear interpolation (limit 4)
+  - Wind & solar generation:    linear interpolation (limit 4);
+                                solar columns clipped >= 0
+  - WTG turbines:               linear interpolation (limit 4),
+                                then summed into wind_park_possible
+  - NordPool intraday VWAP:    forward-fill then back-fill (limit 4)
+  - Imbalance price (Latvia):  joined from external files, left as NaN
+                                where no matching timestamp exists
+
+Columns removed after imputation:
+  - All MFRR Direct Activation (DA) columns (mfrr_da_*): too sparse to be
+    useful (Latvia 94% NaN, Lithuania 20% NaN).
+  - All individual turbine columns (wtg*_possible_power): replaced by the
+    aggregated wind_park_possible column.
+
+--------------------------------------------------------------------------------
+  INDEX
+--------------------------------------------------------------------------------
+
+datetime_utc
+    Timestamp marking the START of each 15-minute period, in UTC.
+    Format: YYYY-MM-DD HH:MM:SS  (e.g. 2025-03-15 14:30:00 = 14:30–14:45 UTC)
+
+================================================================================
+  SECTION 1 — WIND FARM GENERATION FORECASTS  (Vanessa / Targale, Latvia)
+================================================================================
+
+Source: Scipher.Fx forecast accuracy reports for the "Vanessa" wind farm
+        (located at Targale, Latvia; installed capacity 58.8 MW).
+        Only the P50 (median) forecast is retained. The day-ahead file
+        transitions from hourly resolution to 15-min on 2025-09-26; the
+        intraday file is 15-min throughout. For hourly slots the same
+        P50 value is repeated at :00, :15, :30 and :45.
+
+ 1  scipher_da_p50_mw
+        Scipher day-ahead (R1 revision) P50 forecast of active power output
+        for the Vanessa wind farm, in MW.
+        Imputation: linear interpolation (limit 1 hour).
+        Range: 0.01 – 58.80 MW
+
+ 2  scipher_id_p50_mw
+        Scipher intraday (latest revision available) P50 forecast of active
+        power output for the Vanessa wind farm, in MW.
+        Imputation: forward-fill (limit 2 hours), then fallback to
+        scipher_da_p50_mw for any remaining gaps.
+        Range: 0.00 – 58.80 MW
+
+Source: Renewcast forecast for Targale / Vanessa.
+
+ 3  renewcast_continuous_capped_kw
+        Renewcast latest intraday (continuous) forecast of total farm output,
+        in kW, capped at installed capacity (58,800 kW = 58.8 MW).
+        Imputation: linear interpolation (limit 1 hour).
+        Range: 0 – 58,800 kW
+
+ 4  renewcast_dayahead_capped_kw
+        Renewcast day-ahead forecast of total farm output, in kW,
+        capped at installed capacity (58,800 kW).
+        Imputation: linear interpolation (limit 1 hour).
+        Range: 0 – 58,800 kW
+
+================================================================================
+  SECTION 2 — MFRR SCHEDULED ACTIVATION PRICES  (Baltic balancing market)
+================================================================================
+
+Source: MFRR_PRICE files (Estonia, Latvia, Lithuania).
+        SA = Scheduled Activation (predominant product; price agreed at
+             procurement/scheduling stage).
+        Upward = activation to increase generation / reduce load.
+        Downward = activation to reduce generation / increase load.
+        Units: EUR/MWh.  Negative prices can occur in downward direction.
+        Country suffixes: _ee = Estonia, _lv = Latvia, _lt = Lithuania.
+        Imputation: forward-fill then back-fill (limit 1 hour).
+
+Note: MFRR Direct Activation (DA) columns were removed due to extreme
+      sparsity (Latvia 94% NaN, Lithuania 20% NaN).
+
+ 5  mfrr_sa_downward_ee    — MFRR Scheduled Activation downward price, Estonia (EUR/MWh)
+ 6  mfrr_sa_downward_lt    — MFRR Scheduled Activation downward price, Lithuania (EUR/MWh)
+ 7  mfrr_sa_downward_lv    — MFRR Scheduled Activation downward price, Latvia (EUR/MWh)
+ 8  mfrr_sa_upward_ee      — MFRR Scheduled Activation upward price, Estonia (EUR/MWh)
+ 9  mfrr_sa_upward_lt      — MFRR Scheduled Activation upward price, Lithuania (EUR/MWh)
+10  mfrr_sa_upward_lv      — MFRR Scheduled Activation upward price, Latvia (EUR/MWh)
+
+================================================================================
+  SECTION 3 — SYSTEM IMBALANCE VOLUMES  (Baltic balancing market)
+================================================================================
+
+Source: imbalance-volumes-v2 files (Estonia, Latvia, Lithuania).
+        Net system imbalance volume per 15-min settlement period, in MW
+        (positive = grid surplus, i.e. generation exceeds consumption;
+         negative = grid deficit, i.e. consumption exceeds generation).
+        Imputation: linear interpolation (limit 1 hour).
+
+11  imbalance_volume_ee    — Net imbalance volume, Estonia (MW)
+12  imbalance_volume_lt    — Net imbalance volume, Lithuania (MW)
+13  imbalance_volume_lv    — Net imbalance volume, Latvia (MW)
+
+================================================================================
+  SECTION 4 — SA-MFRR BID PRICES  (Baltic balancing market)
+================================================================================
+
+Source: sa-mfrr-bid-prices files (newer 2026-05-04 versions used for 2026
+        period to fill previously missing values).
+        These are the market participants' submitted bid prices for the
+        Scheduled Activation mFRR market: min_bid is the floor price and
+        max_bid is the ceiling price of the accepted bid band for that period.
+        Units: EUR/MWh.
+        Imputation: forward-fill then back-fill (limit 1 hour).
+
+14  sa_mfrr_maxbid_downward_ee    — SA-mFRR max bid price, downward, Estonia (EUR/MWh)
+15  sa_mfrr_maxbid_downward_lt    — SA-mFRR max bid price, downward, Lithuania (EUR/MWh)
+16  sa_mfrr_maxbid_downward_lv    — SA-mFRR max bid price, downward, Latvia (EUR/MWh)
+17  sa_mfrr_maxbid_upward_ee      — SA-mFRR max bid price, upward, Estonia (EUR/MWh)
+18  sa_mfrr_maxbid_upward_lt      — SA-mFRR max bid price, upward, Lithuania (EUR/MWh)
+19  sa_mfrr_maxbid_upward_lv      — SA-mFRR max bid price, upward, Latvia (EUR/MWh)
+20  sa_mfrr_minbid_downward_ee    — SA-mFRR min bid price, downward, Estonia (EUR/MWh)
+21  sa_mfrr_minbid_downward_lt    — SA-mFRR min bid price, downward, Lithuania (EUR/MWh)
+22  sa_mfrr_minbid_downward_lv    — SA-mFRR min bid price, downward, Latvia (EUR/MWh)
+23  sa_mfrr_minbid_upward_ee      — SA-mFRR min bid price, upward, Estonia (EUR/MWh)
+24  sa_mfrr_minbid_upward_lt      — SA-mFRR min bid price, upward, Lithuania (EUR/MWh)
+25  sa_mfrr_minbid_upward_lv      — SA-mFRR min bid price, upward, Latvia (EUR/MWh)
+
+================================================================================
+  SECTION 5 — PROCURED RESERVES  (Baltic balancing market)
+================================================================================
+
+Source: price-procured-reserves-legacy (hourly, 2025, expanded 4x to 15-min)
+        for the 2025 period; price-procured-reserves 2026 file (native 15-min)
+        for 2026. FCR = Frequency Containment Reserve (symmetric product).
+        aFRR = automatic Frequency Restoration Reserve.
+        mFRR = manual Frequency Restoration Reserve.
+        Units: MW (volume of reserve procured).
+        Imputation: forward-fill then back-fill (limit 1 hour).
+
+Note: the structural gap before 2025-02-05 was eliminated by trimming.
+      Remaining NaN within the data period reflects sporadic source gaps.
+
+26  reserves_afrr_downward_ee    — aFRR downward reserve procured, Estonia (MW)
+27  reserves_afrr_downward_lt    — aFRR downward reserve procured, Lithuania (MW)
+28  reserves_afrr_downward_lv    — aFRR downward reserve procured, Latvia (MW)
+29  reserves_afrr_upward_ee      — aFRR upward reserve procured, Estonia (MW)
+30  reserves_afrr_upward_lt      — aFRR upward reserve procured, Lithuania (MW)
+31  reserves_afrr_upward_lv      — aFRR upward reserve procured, Latvia (MW)
+32  reserves_fcr_symmetric_ee    — FCR symmetric reserve procured, Estonia (MW)
+33  reserves_fcr_symmetric_lt    — FCR symmetric reserve procured, Lithuania (MW)
+34  reserves_fcr_symmetric_lv    — FCR symmetric reserve procured, Latvia (MW)
+35  reserves_mfrr_downward_ee    — mFRR downward reserve procured, Estonia (MW)
+36  reserves_mfrr_downward_lt    — mFRR downward reserve procured, Lithuania (MW)
+37  reserves_mfrr_downward_lv    — mFRR downward reserve procured, Latvia (MW)
+38  reserves_mfrr_upward_ee      — mFRR upward reserve procured, Estonia (MW)
+39  reserves_mfrr_upward_lt      — mFRR upward reserve procured, Lithuania (MW)
+40  reserves_mfrr_upward_lv      — mFRR upward reserve procured, Latvia (MW)
+
+================================================================================
+  SECTION 6 — AFRR LOCAL MARGINAL PRICES  (Baltic balancing market)
+================================================================================
+
+Source: local-marginal-price-afrr files (Estonia, Latvia, Lithuania).
+        The 15-minute average settlement price for activated aFRR capacity.
+        Units: EUR/MWh.  Negative prices are possible (e.g. downward aFRR).
+        Imputation: forward-fill (limit 1 hour) for sporadic gaps, then
+        remaining NaN filled with 0.0 (no activation = no price signal).
+
+41  afrr_lmp_upward_ee      — aFRR upward local marginal price, Estonia (EUR/MWh)
+42  afrr_lmp_upward_lt      — aFRR upward local marginal price, Lithuania (EUR/MWh)
+43  afrr_lmp_upward_lv      — aFRR upward local marginal price, Latvia (EUR/MWh)
+44  afrr_lmp_downward_ee    — aFRR downward local marginal price, Estonia (EUR/MWh)
+45  afrr_lmp_downward_lt    — aFRR downward local marginal price, Lithuania (EUR/MWh)
+46  afrr_lmp_downward_lv    — aFRR downward local marginal price, Latvia (EUR/MWh)
+
+================================================================================
+  SECTION 7 — AFRR BID PRICES  (Baltic balancing market)
+================================================================================
+
+Source: afrr-bid-prices files (Estonia, Latvia, Lithuania).
+        Market participants' submitted minimum and maximum bid prices for the
+        aFRR market. min_bid = floor price of the accepted bid band;
+        max_bid = ceiling price of the accepted bid band.
+        Units: EUR/MWh.
+        Imputation: forward-fill (limit 1 hour) for sporadic gaps, then
+        remaining NaN filled with 0.0 (no bids submitted = no signal).
+
+47  afrr_maxbid_downward_ee    — aFRR max bid price, downward, Estonia (EUR/MWh)
+48  afrr_maxbid_downward_lt    — aFRR max bid price, downward, Lithuania (EUR/MWh)
+49  afrr_maxbid_downward_lv    — aFRR max bid price, downward, Latvia (EUR/MWh)
+50  afrr_maxbid_upward_ee      — aFRR max bid price, upward, Estonia (EUR/MWh)
+51  afrr_maxbid_upward_lt      — aFRR max bid price, upward, Lithuania (EUR/MWh)
+52  afrr_maxbid_upward_lv      — aFRR max bid price, upward, Latvia (EUR/MWh)
+53  afrr_minbid_downward_ee    — aFRR min bid price, downward, Estonia (EUR/MWh)
+54  afrr_minbid_downward_lt    — aFRR min bid price, downward, Lithuania (EUR/MWh)
+55  afrr_minbid_downward_lv    — aFRR min bid price, downward, Latvia (EUR/MWh)
+56  afrr_minbid_upward_ee      — aFRR min bid price, upward, Estonia (EUR/MWh)
+57  afrr_minbid_upward_lt      — aFRR min bid price, upward, Lithuania (EUR/MWh)
+58  afrr_minbid_upward_lv      — aFRR min bid price, upward, Latvia (EUR/MWh)
+
+================================================================================
+  SECTION 8 — ELECTRICITY PRICES AND LOADS  (ENTSO-E Transparency)
+================================================================================
+
+Source: ENTSO-E Transparency Platform GUI exports.
+        Country codes: LT = Lithuania, LV = Latvia, EE = Estonia.
+        LT data is native 15-min throughout; LV and EE load data was hourly
+        and has been expanded to 15-min by repeating each hour's value.
+        Imputation: price forward-filled (limit 1 hour); loads linearly
+        interpolated (limit 1 hour). Loads also underwent rolling z-score
+        cleaning to replace false zeros before interpolation.
+
+59  lt_dayahead_price_eur_mwh
+        Lithuania (BZN|LT) day-ahead electricity market clearing price,
+        EUR/MWh.
+
+60  lt_actual_load_mw
+        Lithuania actual total system load (consumption), MW.
+
+61  lt_dayahead_load_forecast_mw
+        Lithuania day-ahead total load forecast, MW.
+
+62  lv_actual_load_mw
+        Latvia actual total system load (consumption), MW.
+
+63  lv_dayahead_load_forecast_mw
+        Latvia day-ahead total load forecast, MW.
+
+64  ee_actual_load_mw
+        Estonia actual total system load (consumption), MW.
+
+65  ee_dayahead_load_forecast_mw
+        Estonia day-ahead total load forecast, MW.
+
+================================================================================
+  SECTION 9 — GENERATION FORECASTS: WIND AND SOLAR  (ENTSO-E Transparency)
+================================================================================
+
+Source: ENTSO-E Transparency Platform GUI exports for wind and solar generation.
+        EE and LV data was hourly; expanded to 15-min by repeating values.
+        LT data is native 15-min.
+        All values in MW.
+        Imputation: linear interpolation (limit 1 hour). Solar columns
+        clipped >= 0 after interpolation. Rolling z-score cleaning applied
+        to replace false zeros before interpolation.
+
+66  ee_wind_onshore_dayahead_mw    — Estonia onshore wind day-ahead forecast (MW)
+67  ee_wind_onshore_actual_mw      — Estonia onshore wind actual generation (MW)
+68  ee_solar_dayahead_mw           — Estonia solar day-ahead forecast (MW)
+69  ee_solar_actual_mw             — Estonia solar actual generation (MW)
+
+70  lv_solar_dayahead_mw           — Latvia solar day-ahead forecast (MW)
+71  lv_solar_intraday_mw           — Latvia solar intraday forecast (MW)
+72  lv_solar_current_mw            — Latvia solar current/latest forecast (MW)
+73  lv_solar_actual_mw             — Latvia solar actual generation (MW)
+
+74  lv_wind_onshore_dayahead_mw    — Latvia onshore wind day-ahead forecast (MW)
+75  lv_wind_onshore_intraday_mw    — Latvia onshore wind intraday forecast (MW)
+76  lv_wind_onshore_current_mw     — Latvia onshore wind current/latest forecast (MW)
+77  lv_wind_onshore_actual_mw      — Latvia onshore wind actual generation (MW)
+
+78  lt_wind_onshore_dayahead_mw    — Lithuania onshore wind day-ahead forecast (MW)
+79  lt_wind_onshore_intraday_mw    — Lithuania onshore wind intraday forecast (MW)
+80  lt_wind_onshore_current_mw     — Lithuania onshore wind current/latest forecast (MW)
+81  lt_wind_onshore_actual_mw      — Lithuania onshore wind actual generation (MW)
+
+82  lt_solar_dayahead_mw           — Lithuania solar day-ahead forecast (MW)
+83  lt_solar_intraday_mw           — Lithuania solar intraday forecast (MW)
+84  lt_solar_current_mw            — Lithuania solar current/latest forecast (MW)
+85  lt_solar_actual_mw             — Lithuania solar actual generation (MW)
+
+================================================================================
+  SECTION 10 — WIND FARM POSSIBLE POWER  (Vanessa / Targale, Latvia)
+================================================================================
+
+Source: Targale_turbine_possible_power_EET.xlsx
+        Aggregated from 14 individual turbine "Grid Production Possible Power
+        Average" readings from the SCADA system of the Targale (Vanessa) wind
+        farm in Latvia.
+
+Processing applied:
+  1. Missing turbine values at any timestamp were imputed with the mean of
+     the remaining turbines that had valid readings at that same timestamp,
+     BEFORE any resampling.
+  2. Timestamps were originally in EET (UTC+2 fixed offset) and converted
+     to UTC by subtracting 2 hours.
+  3. Original 10-min data was resampled to 15-min by averaging values
+     within each bin.
+  4. Individual turbines linearly interpolated (limit 1 hour) and underwent
+     rolling z-score cleaning for false zeros.
+  5. All 14 turbines summed into a single column; individual turbine columns
+     removed.
+
+Units: kW (sum of 14 turbines). Maximum rated: 58,800 kW (14 × 4,200 kW).
+
+86  wind_park_possible
+        Total wind farm possible power output (kW), sum of turbines WTG01,
+        WTG02, WTG03, WTG13–WTG18, WTG21–WTG25.
+
+================================================================================
+  SECTION 11 — NORDPOOL INTRADAY STATISTICS  (Latvia bidding zone)
+================================================================================
+
+Source: NordPool Data API, Intraday/HourlyStatistics/Yearly/ByArea endpoint
+        for area LV. Hourly resolution; each hour's value is repeated across
+        all four 15-min slots within that hour.
+        These are NOT rolling averages; each value is a fixed snapshot of the
+        volume-weighted average price (VWAP) of intraday trades for that
+        delivery hour, captured at a specific lead time before delivery.
+        Linear interpolation was applied during the fetch phase to fill
+        sporadic gaps in the hourly source. Any remaining NaN after merge
+        was forward-filled then back-filled (limit 1 hour).
+        Units: EUR/MWh.
+
+87  averagePriceLast1H
+        Volume-weighted average intraday market price for the LV delivery
+        hour, observed 1 hour before the time of delivery (EUR/MWh).
+
+88  averagePriceLast3H
+        Volume-weighted average intraday market price for the LV delivery
+        hour, observed 3 hours before the time of delivery (EUR/MWh).
+
+================================================================================
+  SECTION 12 — FINAL IMBALANCE PRICE  (Latvia)
+================================================================================
+
+Source: Baltic Balancing Market imbalance-prices files (two files spanning
+        2025-01-01 to 2027-01-01). Semicolon-delimited with European decimal
+        format (comma as decimal separator). The "Final" column is used;
+        "Preliminary" is discarded.
+        Data is filtered to area = Latvia and joined on datetime_from matching
+        datetime_utc. Both source files are concatenated and de-duplicated;
+        only the date range present in the main CSV is retained.
+        Units: EUR/MWh.
+
+89  final_imbalance_price_latvia
+        Final imbalance settlement price for the Latvia bidding zone
+        (EUR/MWh). This is the ex-post price applied to imbalance energy
+        in each 15-minute settlement period.
+
+================================================================================
+  NOTES ON DATA QUALITY
+================================================================================
+
+- Data starts at 2025-02-05 to avoid the structural reserves gap.
+- MFRR Direct Activation (DA) columns removed due to extreme sparsity.
+- Individual turbine columns replaced by aggregated wind_park_possible.
+- Rolling z-score anomaly detection (24h window, z > 3.5) was applied to
+  loads, wind/solar, and turbine columns to replace false zeros with
+  interpolated values before imputation.
+- aFRR LMP and aFRR bid columns: NaN after short forward-fill was set to
+  0.0, reflecting periods with no activation or no submitted bids.
+- Some columns may still contain residual NaN if gaps exceeded the 1-hour
+  imputation limit; check the post-imputation report from the script.
+
+================================================================================

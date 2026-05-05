@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1200, initial-scale=1" />
+    <title>Vanessa Wind Park — Market Strategy Backtester</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <h1>Vanessa Wind Park — Market Strategy Backtester</h1>
+      <p class="subtitle">
+        14 × 4.2&nbsp;MW (58.8&nbsp;MW) onshore wind park at Targale, Latvia.
+        15-minute ISP backtester comparing day-ahead vs mFRR-balancing
+        allocations with optional ID-forecast adjustment. Data covers
+        <span id="data-range">…</span>.
+      </p>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-level="1">Level 1 — Perfect Foresight</button>
+      <button class="tab" data-level="2">Level 2 — Real Forecast Errors</button>
+    </nav>
+
+    <main>
+      <!-- =================================================================
+           LEVEL 1 PANEL
+           ================================================================= -->
+      <section id="panel-1" class="panel active">
+        <div class="controls-card">
+          <div class="controls-grid" id="l1-params"></div>
+          <div class="actions">
+            <button id="l1-optimise" class="btn primary">⚡ Optimise</button>
+            <button id="l1-reset" class="btn">⇄ Reset to naïve</button>
+            <span id="l1-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <div class="stats-card" id="l1-stats">
+          <div class="stat-grid">
+            <div class="big-stat">
+              <div class="label" title="Sum of per-ISP P&L over the entire backtest window.">Total revenue</div>
+              <div class="value" id="l1-total">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Difference vs. selling everything to DA at every ISP (Y=0, Z=0). Computed at the current θ_flat and winsorization.">Vs. naïve baseline</div>
+              <div class="value" id="l1-vs-naive">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated). Useful as an asset-yield comparison.">Revenue per MWh of potential</div>
+              <div class="value" id="l1-per-mwh">–</div>
+            </div>
+          </div>
+          <table class="decomposition" id="l1-decomp-table"></table>
+          <table class="decomposition" id="l1-counts-table"></table>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Time series</h2>
+            <div class="ts-controls">
+              <label>From:
+                <input type="date" id="l1-date-from" />
+              </label>
+              <label>To:
+                <input type="date" id="l1-date-to" />
+              </label>
+              <button id="l1-prev-range" class="btn small" title="Shift backward by current span">◀</button>
+              <button id="l1-next-range" class="btn small" title="Shift forward by current span">▶</button>
+              <span class="preset-group">
+                <button class="btn small preset" data-level="1" data-preset="1d">1d</button>
+                <button class="btn small preset" data-level="1" data-preset="1w">1w</button>
+                <button class="btn small preset" data-level="1" data-preset="1mo">1mo</button>
+                <button class="btn small preset" data-level="1" data-preset="3mo">3mo</button>
+                <button class="btn small preset" data-level="1" data-preset="all">all</button>
+              </span>
+              <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
+            </div>
+          </div>
+          <p class="card-desc">
+            DA-sold (line) and mFRR up/down volumes (bars) over the chosen window.
+            Hover any ISP for the full P&L breakdown. Bar mode for ranges ≤ 6 days;
+            filled-area scatter for longer ranges (the "all" preset plots all 40 k ISPs).
+          </p>
+          <div id="l1-ts-chart" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Robustness</h2>
+          </div>
+          <p class="card-desc">
+            How concentrated is the revenue? If a few rare periods dominate, the
+            "optimum" may be a coincidence. Read the numbers below as a stress test.
+          </p>
+          <div class="robust-grid">
+            <div class="robust-item">
+              <div class="label">Top 1% concentration</div>
+              <div class="big-num" id="l1-top1pct">–</div>
+              <div class="robust-help">
+                Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
+                <br><b>&lt; 10%:</b> well-distributed.
+                <br><b>&gt; 30%:</b> strategy depends on rare events.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 5% concentration</div>
+              <div class="big-num" id="l1-top5pct">–</div>
+              <div class="robust-help">
+                Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 10% concentration</div>
+              <div class="big-num" id="l1-top10pct">–</div>
+              <div class="robust-help">
+                Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
+              </div>
+            </div>
+          </div>
+          <div class="two-col">
+            <div>
+              <h3>Monthly revenue (decomposition)</h3>
+              <p class="chart-desc">
+                Stacked bar per calendar month showing how each leg contributes.
+                Big swings between months suggest seasonality.
+              </p>
+              <div id="l1-monthly-chart" class="chart small"></div>
+            </div>
+            <div>
+              <h3>Per-ISP revenue distribution</h3>
+              <p class="chart-desc">
+                Histogram (log-scale Y) of every ISP's revenue. A long right tail
+                means a few periods dominate.
+              </p>
+              <div id="l1-hist-chart" class="chart small"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Optimisation surface</h2>
+            <div>
+              <button id="l1-show-heatmap" class="btn">Compute heatmap</button>
+              <span id="l1-heatmap-progress" class="progress"></span>
+            </div>
+          </div>
+          <div id="l1-heatmap" class="chart"></div>
+        </div>
+      </section>
+
+      <!-- =================================================================
+           LEVEL 2 PANEL
+           ================================================================= -->
+      <section id="panel-2" class="panel">
+        <div class="controls-card">
+          <div class="controls-grid" id="l2-params"></div>
+          <div class="actions">
+            <button id="l2-optimise" class="btn primary">⚡ Optimise</button>
+            <button id="l2-reset" class="btn">⇄ Reset to naïve</button>
+            <span id="l2-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <div class="stats-card" id="l2-stats">
+          <div class="stat-grid">
+            <div class="big-stat">
+              <div class="label" title="Sum of per-ISP P&L over the entire backtest window.">Total revenue</div>
+              <div class="value" id="l2-total">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Difference vs. selling everything to DA at every ISP (Y=0, Z=0). Computed at the current θ_flat and winsorization.">Vs. naïve baseline</div>
+              <div class="value" id="l2-vs-naive">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated). Useful as an asset-yield comparison.">Revenue per MWh of potential</div>
+              <div class="value" id="l2-per-mwh">–</div>
+            </div>
+          </div>
+          <table class="decomposition" id="l2-decomp-table"></table>
+          <table class="decomposition" id="l2-counts-table"></table>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Time series</h2>
+            <div class="ts-controls">
+              <label>From:
+                <input type="date" id="l2-date-from" />
+              </label>
+              <label>To:
+                <input type="date" id="l2-date-to" />
+              </label>
+              <button id="l2-prev-range" class="btn small" title="Shift backward by current span">◀</button>
+              <button id="l2-next-range" class="btn small" title="Shift forward by current span">▶</button>
+              <span class="preset-group">
+                <button class="btn small preset" data-level="2" data-preset="1d">1d</button>
+                <button class="btn small preset" data-level="2" data-preset="1w">1w</button>
+                <button class="btn small preset" data-level="2" data-preset="1mo">1mo</button>
+                <button class="btn small preset" data-level="2" data-preset="3mo">3mo</button>
+                <button class="btn small preset" data-level="2" data-preset="all">all</button>
+              </span>
+              <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
+            </div>
+          </div>
+          <p class="card-desc">
+            DA-sold (line) and mFRR up/down volumes (bars) over the chosen window.
+            Hover any ISP for the full P&L breakdown. Bar mode for ranges ≤ 6 days;
+            filled-area scatter for longer ranges (the "all" preset plots all 40 k ISPs).
+          </p>
+          <div id="l2-ts-chart" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Robustness</h2>
+          </div>
+          <p class="card-desc">
+            How concentrated is the revenue? If a few rare periods dominate, the
+            "optimum" may be a coincidence. Read the numbers below as a stress test.
+          </p>
+          <div class="robust-grid">
+            <div class="robust-item">
+              <div class="label">Top 1% concentration</div>
+              <div class="big-num" id="l2-top1pct">–</div>
+              <div class="robust-help">
+                Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
+                <br><b>&lt; 10%:</b> well-distributed.
+                <br><b>&gt; 30%:</b> strategy depends on rare events.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 5% concentration</div>
+              <div class="big-num" id="l2-top5pct">–</div>
+              <div class="robust-help">
+                Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 10% concentration</div>
+              <div class="big-num" id="l2-top10pct">–</div>
+              <div class="robust-help">
+                Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
+              </div>
+            </div>
+          </div>
+          <div class="two-col">
+            <div>
+              <h3>Monthly revenue (decomposition)</h3>
+              <p class="chart-desc">
+                Stacked bar per calendar month showing how each leg contributes.
+                Big swings between months suggest seasonality.
+              </p>
+              <div id="l2-monthly-chart" class="chart small"></div>
+            </div>
+            <div>
+              <h3>Per-ISP revenue distribution</h3>
+              <p class="chart-desc">
+                Histogram (log-scale Y) of every ISP's revenue. A long right tail
+                means a few periods dominate.
+              </p>
+              <div id="l2-hist-chart" class="chart small"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Optimisation surface</h2>
+            <div>
+              <label>Heatmap pair:
+                <select id="l2-heatmap-pair">
+                  <option value="XY">X × Y (at current Z)</option>
+                  <option value="XZ">X × Z (at current Y)</option>
+                  <option value="YZ">Y × Z (at current X)</option>
+                </select>
+              </label>
+              <button id="l2-show-heatmap" class="btn">Compute heatmap</button>
+              <span id="l2-heatmap-progress" class="progress"></span>
+            </div>
+          </div>
+          <div id="l2-heatmap" class="chart"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Click any point on the heatmap to set parameters to that value.
+        Hover the time-series chart for per-ISP detail. All math runs
+        client-side — no server required.
+      </p>
+    </footer>
+
+    <!-- Plotly via plot.ly CDN (no SRI hash published by Plotly). -->
+    <script
+      src="https://cdn.plot.ly/plotly-2.35.2.min.js"
+      charset="utf-8"
+    ></script>
+    <script src="data.js"></script>
+    <script src="engine.js"></script>
+    <script src="charts.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

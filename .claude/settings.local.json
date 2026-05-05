@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pandas; print\\('pandas', pandas.__version__\\)\")",
+      "Bash(python -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python preprocess.py)",
+      "Bash(python validate.py)",
+      "Bash(python /c/Users/User/Desktop/web2/validate.py)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(python /c/Users/User/Desktop/web2/sensitivity.py)"
+    ]
+  }
+}
