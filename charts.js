@@ -39,12 +39,18 @@ const Charts = (() => {
   // to keep multi-week views responsive.
   function drawTimeSeries(targetId, level, simResult, params, startIdx, endIdx) {
     const D = Engine.getData();
-    const N = endIdx - startIdx;
+    // perISP arrays are sized to the simulation window; map global ISP
+    // index i → perISP index k_p = i - simResult.windowStart.
+    const winStart = simResult.windowStart;
+    const winEnd = simResult.windowEnd;
+    const clampedStart = Math.max(startIdx, winStart);
+    const clampedEnd = Math.min(endIdx, winEnd);
+    const N = Math.max(0, clampedEnd - clampedStart);
     if (N <= 0) {
       Plotly.purge(targetId);
       return;
     }
-    const BAR_THRESHOLD = 600; // ~6 days at 15-min
+    const BAR_THRESHOLD = 600;
     const useBars = N <= BAR_THRESHOLD;
     const theta = (params && params.theta_flat) || 0;
 
@@ -61,19 +67,20 @@ const Charts = (() => {
     const rev = new Array(N);
     const short = new Array(N);
     for (let k = 0; k < N; k++) {
-      const i = startIdx + k;
+      const i = clampedStart + k; // global ISP index
+      const k_p = i - winStart; // perISP-array index
       ts[k] = Engine.tsAt(i);
-      da[k] = simResult.perISP.Q_da_sold[i];
-      up[k] = simResult.perISP.Q_up[i];
-      dn[k] = -simResult.perISP.Q_dn[i]; // negative bar (visual)
+      da[k] = simResult.perISP.Q_da_sold[k_p];
+      up[k] = simResult.perISP.Q_up[k_p];
+      dn[k] = -simResult.perISP.Q_dn[k_p]; // negative bar (visual)
       pot[k] = D.q_pot[i];
       f_arr[k] = D.da_forecast[i];
       id_arr[k] = D.id_forecast[i];
       pda_arr[k] = D.p_da[i];
       pmfrr_arr[k] = D.p_mfrr[i];
       pimb_arr[k] = D.p_imb[i];
-      rev[k] = simResult.perISP.revenue[i];
-      short[k] = simResult.perISP.Q_short[i];
+      rev[k] = simResult.perISP.revenue[k_p];
+      short[k] = simResult.perISP.Q_short[k_p];
     }
 
     // ---- Build sectioned tooltip ----

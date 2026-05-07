@@ -7,8 +7,52 @@
   //  CONFIG: single source of truth for every parameter
   // =====================================================================
 
+  // group: 'setup' = experiment env (NOT optimised), 'market' = strategy lever (optimised)
   const PARAM_DEFS = {
+    sim_range: {
+      group: "setup",
+      isDateRange: true,
+      label: "Simulation date range",
+      description:
+        "Restricts the simulation to ISPs in this window. All revenue, imbalance, robustness and sweep calculations use only the selected period; winsorization percentiles are also computed within it.",
+      extremes: [
+        ["Full dataset", "all 14 months — most statistically powerful"],
+        [
+          "Sub-period",
+          "stress-test: does the strategy still win when the window excludes a known easy month?",
+        ],
+      ],
+    },
+    w_mfrr: {
+      group: "setup",
+      label: "Winsorize mFRR price (percentiles)",
+      unit: "%",
+      isWinsor: true,
+      defaultLo: 10,
+      defaultHi: 90,
+      description:
+        "Caps extreme mFRR clearing prices at the chosen percentiles within the simulation window. The 2025 data has a few −10 000 / +10 000 EUR/MWh outliers that would otherwise dominate.",
+      extremes: [
+        ["0 / 100", "no winsorization — raw outliers retained"],
+        ["25 / 75", "very aggressive trimming — only the middle 50 % of values used"],
+      ],
+    },
+    w_imb: {
+      group: "setup",
+      label: "Winsorize imbalance price (percentiles)",
+      unit: "%",
+      isWinsor: true,
+      defaultLo: 10,
+      defaultHi: 90,
+      description:
+        "Same idea as mFRR winsorization, applied to the Latvian imbalance price within the window.",
+      extremes: [
+        ["0 / 100", "no winsorization"],
+        ["25 / 75", "aggressive trimming"],
+      ],
+    },
     X: {
+      group: "market",
       label: "DA price threshold X",
       unit: "EUR/MWh",
       min: -100,
@@ -24,6 +68,7 @@
       ],
     },
     Y: {
+      group: "market",
       label: "Withhold fraction Y",
       unit: "0–1",
       min: 0,
@@ -39,6 +84,7 @@
       ],
     },
     Z: {
+      group: "market",
       label: "ID trust coefficient Z",
       unit: "0–1",
       min: 0,
@@ -57,6 +103,7 @@
       ],
     },
     theta_flat: {
+      group: "market",
       label: "Flat penalty θ",
       unit: "EUR/MWh shortfall",
       min: 0,
@@ -71,47 +118,29 @@
         ["θ = 100", "very risk-averse — discourages any over-promising"],
       ],
     },
-    w_mfrr: {
-      label: "Winsorize mFRR price (percentiles)",
-      unit: "%",
-      isWinsor: true,
-      defaultLo: 10,
-      defaultHi: 90,
-      description:
-        "Caps extreme mFRR clearing prices at the chosen percentiles. The 2025 dataset contains a few −10 000 / +10 000 EUR/MWh outliers that would otherwise dominate the result.",
-      extremes: [
-        ["0 / 100", "no winsorization — raw outliers retained"],
-        ["25 / 75", "very aggressive trimming — only the middle 50 % of values used"],
-      ],
-    },
-    w_imb: {
-      label: "Winsorize imbalance price (percentiles)",
-      unit: "%",
-      isWinsor: true,
-      defaultLo: 10,
-      defaultHi: 90,
-      description:
-        "Same idea as mFRR winsorization, applied to the Latvian imbalance price.",
-      extremes: [
-        ["0 / 100", "no winsorization"],
-        ["25 / 75", "aggressive trimming"],
-      ],
-    },
   };
 
   // Per-level configuration. naive = parameters used as the baseline that
   // every "vs. naïve" line compares against (always sell everything to DA).
+  // paramKeys are listed in display order. Setup keys are rendered in the
+  // top section; market keys in the (optimised) bottom section.
   const LEVEL_CONFIG = {
     1: {
-      paramKeys: ["X", "Y", "w_mfrr", "w_imb"],
-      naive: { X: 0, Y: 0, Z: 0 },
-      defaults: { X: 30, Y: 1.0, w_mfrr_lo: 10, w_mfrr_hi: 90, w_imb_lo: 10, w_imb_hi: 90 },
-      // Imbalance section is shown but disabled in L1 (kept for parity)
+      paramKeys: ["sim_range", "w_mfrr", "w_imb", "X", "Y"],
+      naive: { X: 0, Y: 0, Z: 0 }, // only market params reset by Reset button
+      defaults: {
+        X: 30,
+        Y: 1.0,
+        w_mfrr_lo: 10,
+        w_mfrr_hi: 90,
+        w_imb_lo: 10,
+        w_imb_hi: 90,
+      },
       imbalanceDisabled: true,
       hasImbalance: false,
     },
     2: {
-      paramKeys: ["X", "Y", "Z", "theta_flat", "w_mfrr", "w_imb"],
+      paramKeys: ["sim_range", "w_mfrr", "w_imb", "X", "Y", "Z", "theta_flat"],
       naive: { X: 0, Y: 0, Z: 0 },
       defaults: {
         X: 30,
@@ -182,9 +211,12 @@
     const cfg = LEVEL_CONFIG[lvl];
     state[lvl] = {
       params: { ...cfg.defaults },
+      // Setup-only state (NOT mutated by Reset to naïve)
+      simRange: { from: dataMinDate, to: dataMaxDate },
+      // Time-series visualization range (clamped to simRange)
+      tsRange: { from: null, to: null },
       lastSim: null,
       lastSweep: null,
-      tsRange: { from: null, to: null },
     };
   }
 
@@ -196,9 +228,33 @@
     const def = PARAM_DEFS[key];
     const cfg = LEVEL_CONFIG[level];
     const idBase = `l${level}-${key}`;
-    const disabled =
-      def.isWinsor && key === "w_imb" && cfg.imbalanceDisabled ? "disabled" : "";
+
+    // ---- date-range card ----
+    if (def.isDateRange) {
+      const from = state[level].simRange.from;
+      const to = state[level].simRange.to;
+      return `
+        <div class="control sim-range">
+          <label>${def.label}</label>
+          <div class="slider-row two">
+            <input type="date" id="${idBase}-from" value="${from}" min="${dataMinDate}" max="${dataMaxDate}">
+            <span>→</span>
+            <input type="date" id="${idBase}-to" value="${to}" min="${dataMinDate}" max="${dataMaxDate}">
+            <button type="button" class="btn small" id="${idBase}-reset" title="Reset to full dataset">↻</button>
+          </div>
+          <div class="param-desc">
+            <p>${def.description}</p>
+            <ul class="extremes">
+              ${def.extremes.map(([v, m]) => `<li><b>${v}:</b> ${m}</li>`).join("")}
+            </ul>
+          </div>
+        </div>`;
+    }
+
+    // ---- winsor card ----
     if (def.isWinsor) {
+      const disabled =
+        key === "w_imb" && cfg.imbalanceDisabled ? "disabled" : "";
       const lo = cfg.defaults[`${key}_lo`];
       const hi = cfg.defaults[`${key}_hi`];
       return `
@@ -217,6 +273,8 @@
           </div>
         </div>`;
     }
+
+    // ---- numeric (slider+number) card ----
     const value = cfg.defaults[key];
     return `
       <div class="control">
@@ -236,10 +294,14 @@
 
   function renderParamCards(level) {
     const cfg = LEVEL_CONFIG[level];
-    const html = cfg.paramKeys.map((k) => paramCardHTML(level, k)).join("");
-    document.getElementById(`l${level}-params`).innerHTML = html;
+    const setupKeys = cfg.paramKeys.filter((k) => PARAM_DEFS[k].group === "setup");
+    const marketKeys = cfg.paramKeys.filter((k) => PARAM_DEFS[k].group === "market");
+    const setupHtml = setupKeys.map((k) => paramCardHTML(level, k)).join("");
+    const marketHtml = marketKeys.map((k) => paramCardHTML(level, k)).join("");
+    document.getElementById(`l${level}-setup-params`).innerHTML = setupHtml;
+    document.getElementById(`l${level}-market-params`).innerHTML = marketHtml;
     document.getElementById(`l${level}-reset`).textContent =
-      level === 1 ? "⇄ Reset to naïve (Y=0)" : "⇄ Reset to naïve (Y=0, Z=0)";
+      level === 1 ? "⇄ Reset market params (Y=0)" : "⇄ Reset market params (Y=0, Z=0)";
   }
 
   // =====================================================================
@@ -324,10 +386,15 @@
   function updateLevel(level) {
     const cfg = LEVEL_CONFIG[level];
     const p = state[level].params;
+
+    // 1. Set engine window from simRange BEFORE winsorize/simulate.
+    //    Percentile bounds come from the window slice, so order matters.
+    const sim_range = state[level].simRange;
+    const { start: winStart, end: winEnd } = rangeToIdx(sim_range.from, sim_range.to);
+    Engine.setWindow(winStart, winEnd);
     Engine.maybeWinsorize(p.w_mfrr_lo, p.w_mfrr_hi, p.w_imb_lo, p.w_imb_hi);
 
-    // BUGFIX: always recompute naive at current θ_flat. Caching it on
-    // theta-change broke when θ moved without explicit recomputeNaive call.
+    // 2. Always recompute naive at current θ_flat (and current window).
     const naive = Engine.simulateTotal(level, 0, 0, 0, p.theta_flat || 0);
     const sim = Engine.simulate(level, p);
     state[level].lastSim = sim;
@@ -343,10 +410,10 @@
     vsEl.textContent = `${diff >= 0 ? "+" : ""}${fmtEUR(diff)} (${diff >= 0 ? "+" : ""}${(diffPct * 100).toFixed(2)}%)`;
     vsEl.className = "value " + (Math.abs(diff) < 1 ? "" : diff >= 0 ? "up" : "down");
 
-    let totalPotMWh = 0;
-    for (let i = 0; i < D.n; i++) totalPotMWh += D.q_pot[i] * 0.25;
+    // Per-MWh of potential — over the window only
+    const totalPotMWh = Engine.totalPotMWhInWindow();
     document.getElementById(`${prefix}-per-mwh`).textContent =
-      (sim.totalRevenue / totalPotMWh).toFixed(2) + " €/MWh";
+      totalPotMWh > 0 ? (sim.totalRevenue / totalPotMWh).toFixed(2) + " €/MWh" : "–";
 
     // Decomposition table
     for (const col of DECOMP_COLUMNS[level]) {
@@ -370,7 +437,7 @@
       document.getElementById(`${prefix}-cnt-${col.key}`).textContent = v;
     }
 
-    // Robustness
+    // Robustness — perISP is window-length, so concentrations are over window
     const conc1 = Engine.topConcentration(sim.perISP.revenue, 0.01);
     const conc5 = Engine.topConcentration(sim.perISP.revenue, 0.05);
     const conc10 = Engine.topConcentration(sim.perISP.revenue, 0.1);
@@ -379,21 +446,44 @@
     document.getElementById(`${prefix}-top5pct`).textContent = fmtPct(conc5.share);
     document.getElementById(`${prefix}-top10pct`).textContent = fmtPct(conc10.share);
 
-    // Time series — pick default range if not yet set
+    // Time series — pick default range if not yet set, clamp to simRange
     let { from, to } = state[level].tsRange;
-    if (!from || !to) {
-      const midIdx = Math.floor(D.n / 2);
-      const midDate = isoDate(Engine.tsAt(midIdx));
-      from = midDate;
-      to = midDate;
+    if (!from || !to || from < sim_range.from || to > sim_range.to) {
+      // Default to a single day at the midpoint of the simulation window
+      const midIdx = Math.floor((winStart + Math.max(winStart, winEnd - 1)) / 2);
+      const midDate = isoDate(Engine.tsAt(Math.max(0, Math.min(D.n - 1, midIdx))));
+      from = clampDate(midDate, sim_range.from, sim_range.to);
+      to = from;
       state[level].tsRange = { from, to };
-      document.getElementById(`${prefix}-date-from`).value = from;
-      document.getElementById(`${prefix}-date-to`).value = to;
+      const fromEl = document.getElementById(`${prefix}-date-from`);
+      const toEl = document.getElementById(`${prefix}-date-to`);
+      if (fromEl) {
+        fromEl.value = from;
+        fromEl.min = sim_range.from;
+        fromEl.max = sim_range.to;
+      }
+      if (toEl) {
+        toEl.value = to;
+        toEl.min = sim_range.from;
+        toEl.max = sim_range.to;
+      }
+    } else {
+      // Keep date input bounds in sync with current sim range
+      const fromEl = document.getElementById(`${prefix}-date-from`);
+      const toEl = document.getElementById(`${prefix}-date-to`);
+      if (fromEl) {
+        fromEl.min = sim_range.from;
+        fromEl.max = sim_range.to;
+      }
+      if (toEl) {
+        toEl.min = sim_range.from;
+        toEl.max = sim_range.to;
+      }
     }
-    const { start: startI, end: endI } = rangeToIdx(from, to);
-    Charts.drawTimeSeries(`${prefix}-ts-chart`, level, sim, p, startI, endI);
+    const chartIdx = rangeToIdx(from, to);
+    Charts.drawTimeSeries(`${prefix}-ts-chart`, level, sim, p, chartIdx.start, chartIdx.end);
 
-    // Monthly + histogram
+    // Monthly + histogram (over window)
     Charts.drawMonthly(`${prefix}-monthly-chart`, level, Engine.monthlyAggregation(level, p));
     Charts.drawHistogram(`${prefix}-hist-chart`, sim.perISP.revenue);
   }
@@ -412,6 +502,33 @@
     for (const key of cfg.paramKeys) {
       const def = PARAM_DEFS[key];
       const idBase = `l${level}-${key}`;
+
+      if (def.isDateRange) {
+        const fromEl = document.getElementById(`${idBase}-from`);
+        const toEl = document.getElementById(`${idBase}-to`);
+        const resetEl = document.getElementById(`${idBase}-reset`);
+        const onChange = () => {
+          let f = clampDate(fromEl.value || dataMinDate, dataMinDate, dataMaxDate);
+          let t = clampDate(toEl.value || dataMaxDate, dataMinDate, dataMaxDate);
+          if (f > t) [f, t] = [t, f];
+          fromEl.value = f;
+          toEl.value = t;
+          state[level].simRange = { from: f, to: t };
+          // Sim range changed → invalidate the chart range so updateLevel
+          // re-anchors it to the (possibly narrower) window.
+          state[level].tsRange = { from: null, to: null };
+          scheduleUpdate(level);
+        };
+        fromEl.addEventListener("change", onChange);
+        toEl.addEventListener("change", onChange);
+        resetEl.addEventListener("click", () => {
+          fromEl.value = dataMinDate;
+          toEl.value = dataMaxDate;
+          onChange();
+        });
+        continue;
+      }
+
       if (def.isWinsor) {
         const lo = document.getElementById(`${idBase}-lo`);
         const hi = document.getElementById(`${idBase}-hi`);
@@ -425,21 +542,23 @@
         };
         lo.addEventListener("change", onChange);
         hi.addEventListener("change", onChange);
-      } else {
-        const slider = document.getElementById(idBase);
-        const num = document.getElementById(`${idBase}-num`);
-        const onSet = (raw) => {
-          let v = parseFloat(raw);
-          if (isNaN(v)) return;
-          v = clamp(v, def.min, def.max);
-          slider.value = v;
-          num.value = v;
-          state[level].params[key] = v;
-          scheduleUpdate(level);
-        };
-        slider.addEventListener("input", (e) => onSet(e.target.value));
-        num.addEventListener("change", (e) => onSet(e.target.value));
+        continue;
       }
+
+      // numeric (slider+number)
+      const slider = document.getElementById(idBase);
+      const num = document.getElementById(`${idBase}-num`);
+      const onSet = (raw) => {
+        let v = parseFloat(raw);
+        if (isNaN(v)) return;
+        v = clamp(v, def.min, def.max);
+        slider.value = v;
+        num.value = v;
+        state[level].params[key] = v;
+        scheduleUpdate(level);
+      };
+      slider.addEventListener("input", (e) => onSet(e.target.value));
+      num.addEventListener("change", (e) => onSet(e.target.value));
     }
   }
 
@@ -544,22 +663,24 @@
   // =====================================================================
   //  DATE RANGE NAVIGATION
   // =====================================================================
+  // The CHART date-range navigation is bounded by the simulation window
+  // (so you can't view ISPs that aren't simulated). "all" preset means
+  // the entire simulation window — not the entire dataset.
   function bindDateNav(level) {
     const prefix = `l${level}`;
     const fromEl = document.getElementById(`${prefix}-date-from`);
     const toEl = document.getElementById(`${prefix}-date-to`);
-    [fromEl, toEl].forEach((el) => {
-      el.min = dataMinDate;
-      el.max = dataMaxDate;
-    });
+    function simBounds() {
+      return state[level].simRange;
+    }
     function applyRange(from, to) {
-      from = clampDate(from, dataMinDate, dataMaxDate);
-      to = clampDate(to, dataMinDate, dataMaxDate);
+      const sb = simBounds();
+      from = clampDate(from, sb.from, sb.to);
+      to = clampDate(to, sb.from, sb.to);
       if (from > to) [from, to] = [to, from];
       fromEl.value = from;
       toEl.value = to;
       state[level].tsRange = { from, to };
-      // Mark active preset visually
       document
         .querySelectorAll(`.preset[data-level="${level}"]`)
         .forEach((b) => b.classList.remove("active"));
@@ -582,7 +703,8 @@
     document.querySelectorAll(`.preset[data-level="${level}"]`).forEach((btn) => {
       btn.addEventListener("click", () => {
         const preset = btn.dataset.preset;
-        const anchor = state[level].tsRange.to || dataMaxDate;
+        const sb = simBounds();
+        const anchor = state[level].tsRange.to || sb.to;
         let from, to;
         if (preset === "1d") {
           from = anchor;
@@ -597,8 +719,8 @@
           to = anchor;
           from = addDays(anchor, -89);
         } else if (preset === "all") {
-          from = dataMinDate;
-          to = dataMaxDate;
+          from = sb.from;
+          to = sb.to;
         }
         applyRange(from, to);
         document

@@ -28,7 +28,30 @@
            ================================================================= -->
       <section id="panel-1" class="panel active">
         <div class="controls-card">
-          <div class="controls-grid" id="l1-params"></div>
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Define the experiment environment — what data is fed into the
+                simulation. These bound the analysis but aren't varied by the
+                optimiser.
+              </p>
+            </div>
+            <div class="controls-grid" id="l1-setup-params"></div>
+          </div>
+
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>Market parameters <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                The strategy levers — the Optimise button searches over these.
+                Reset rolls just these back to the naïve values; setup parameters
+                keep their current values.
+              </p>
+            </div>
+            <div class="controls-grid" id="l1-market-params"></div>
+          </div>
+
           <div class="actions">
             <button id="l1-optimise" class="btn primary">⚡ Optimise</button>
             <button id="l1-reset" class="btn">⇄ Reset to naïve</button>
@@ -155,7 +178,30 @@
            ================================================================= -->
       <section id="panel-2" class="panel">
         <div class="controls-card">
-          <div class="controls-grid" id="l2-params"></div>
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Define the experiment environment — what data is fed into the
+                simulation. These bound the analysis but aren't varied by the
+                optimiser.
+              </p>
+            </div>
+            <div class="controls-grid" id="l2-setup-params"></div>
+          </div>
+
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>Market parameters <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                The strategy levers — the Optimise button searches over these.
+                Reset rolls just these back to the naïve values; setup parameters
+                keep their current values.
+              </p>
+            </div>
+            <div class="controls-grid" id="l2-market-params"></div>
+          </div>
+
           <div class="actions">
             <button id="l2-optimise" class="btn primary">⚡ Optimise</button>
             <button id="l2-reset" class="btn">⇄ Reset to naïve</button>
