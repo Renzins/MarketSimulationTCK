@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1200, initial-scale=1" />
+    <title>Vanessa Wind Park — Graphs</title>
+    <link rel="stylesheet" href="style.css?v=5" />
+  </head>
+  <body>
+    <nav class="site-nav">
+      <a href="index.html" class="brand">Vanessa Wind Park</a>
+      <a href="index.html" class="navlink">Backtester</a>
+      <a href="graphs.html" class="navlink active">Graphs</a>
+    </nav>
+
+    <header class="site-header compact">
+      <h1>Graphs — ENTSOE day-ahead wind/solar impact on mFRR</h1>
+      <p class="subtitle">
+        Box plots and heatmaps of the mFRR scheduled-activation spread
+        (P<sub>mFRR</sub> − P<sub>DA</sub>) split by Baltic-level wind
+        and solar day-ahead forecasts and by surplus / deficit regime.
+        Data covers <span id="data-range">…</span>.
+      </p>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-section="mfrr">mFRR</button>
+      <button class="tab" data-section="afrr">aFRR</button>
+    </nav>
+
+    <main>
+      <!-- =================================================================
+           mFRR SECTION
+           ================================================================= -->
+      <section id="panel-mfrr" class="panel active">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Define the experiment environment: which ISPs are fed into the
+                graphs, how to tame extreme prices, and how many buckets each
+                axis is split into.
+              </p>
+            </div>
+            <div class="controls-grid" id="g-setup-params"></div>
+          </div>
+
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>Bucket counts <span class="badge">x-axis</span></h3>
+              <p class="group-desc">
+                Each x-axis on the graphs below is a quantile binning over the
+                selected window. Increase the count for finer granularity.
+              </p>
+            </div>
+            <div class="controls-grid" id="g-bucket-params"></div>
+          </div>
+
+          <div class="actions">
+            <button id="g-recompute" class="btn primary">↻ Recompute</button>
+            <span id="g-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <!-- ===== Spread by Wind power (1-D) ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Spread by Baltic Wind Forecast — by regime</h2>
+          </div>
+          <p class="card-desc">
+            Box plots of the mFRR spread (P<sub>mFRR</sub> − P<sub>DA</sub>),
+            split into wind-forecast quantile bins. Surplus (left) shows the
+            spread when the system was over-generating; deficit (right) when
+            it was short. Bin counts and boundaries are computed from the
+            current simulation window.
+          </p>
+          <div class="two-col">
+            <div id="g-wind-surplus" class="chart"></div>
+            <div id="g-wind-deficit" class="chart"></div>
+          </div>
+        </div>
+
+        <!-- ===== Spread by Solar power (1-D) ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Spread by Baltic Solar Forecast — by regime</h2>
+          </div>
+          <p class="card-desc">
+            Same idea as the wind-binned plots, but using the Baltic-level
+            solar day-ahead forecast as the x-axis.
+          </p>
+          <div class="two-col">
+            <div id="g-solar-surplus" class="chart"></div>
+            <div id="g-solar-deficit" class="chart"></div>
+          </div>
+        </div>
+
+        <!-- ===== Spread by Wind × Solar (heatmap) ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Spread by Wind × Solar — by regime</h2>
+          </div>
+          <p class="card-desc">
+            Median spread for every (wind bin × solar bin) cell. Each cell
+            shows the median, mean, σ and sample count. Cells with no
+            observations are blank.
+          </p>
+          <div class="two-col">
+            <div id="g-heatmap-deficit" class="chart"></div>
+            <div id="g-heatmap-surplus" class="chart"></div>
+          </div>
+        </div>
+
+        <!-- ===== |Spread| matched by DA Price Band — by WIND ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>|Spread| by Wind Level — Matched by DA Price Band</h2>
+          </div>
+          <p class="card-desc">
+            One panel per DA-price quantile band. Within each panel, the
+            Baltic wind forecast is split into Low / Mid / High by global
+            quantiles (so panel-internal counts can be uneven). The y-axis is
+            the absolute value of the spread, so this view shows volatility
+            rather than direction.
+          </p>
+          <div id="g-matched" class="chart wide"></div>
+        </div>
+
+        <!-- ===== |Spread| matched by DA Price Band — by SOLAR ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>|Spread| by Solar Level — Matched by DA Price Band</h2>
+          </div>
+          <p class="card-desc">
+            Same layout as the wind version, but the level axis splits ISPs
+            by Baltic solar day-ahead forecast (sum of EE + LV + LT). Useful
+            for spotting whether high-irradiance hours co-move with mFRR
+            volatility differently from wind.
+          </p>
+          <div id="g-matched-solar" class="chart wide"></div>
+        </div>
+
+        <!-- ===== |Spread| matched by DA Price Band — by RENEWABLES ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>|Spread| by Renewables Level — Matched by DA Price Band</h2>
+          </div>
+          <p class="card-desc">
+            Combines wind + solar into a single Baltic renewables axis (sum
+            of EE + LV + LT day-ahead wind and solar forecasts). Shows how
+            mFRR volatility depends on total VRE penetration once DA price is
+            held constant.
+          </p>
+          <div id="g-matched-renew" class="chart wide"></div>
+        </div>
+      </section>
+
+      <!-- =================================================================
+           aFRR SECTION (placeholder)
+           ================================================================= -->
+      <section id="panel-afrr" class="panel">
+        <div class="card placeholder-card">
+          <h2>aFRR — coming soon</h2>
+          <p class="card-desc">
+            aFRR-specific data (activated volumes / local-marginal prices
+            split by direction with the same kind of resolution as mFRR
+            scheduled-activation prices) is not yet present in the dataset.
+            This section is reserved so that, once the data lands, the same
+            box-plot / heatmap analyses can be plugged in here.
+          </p>
+          <p class="card-desc">
+            Existing aFRR LMP columns in the source CSV are sparse and
+            largely zero-filled, so they wouldn't produce meaningful plots
+            today.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        All math runs client-side. Parameters are quantile-driven: changing
+        bucket counts re-derives the bin boundaries from the data.
+      </p>
+    </footer>
+
+    <script
+      src="https://cdn.plot.ly/plotly-2.35.2.min.js"
+      charset="utf-8"
+    ></script>
+    <script src="data.js?v=5"></script>
+    <script src="engine.js?v=5"></script>
+    <script src="graphs-engine.js?v=5"></script>
+    <script src="graphs-charts.js?v=5"></script>
+    <script src="graphs-app.js?v=5"></script>
+  </body>
+</html>

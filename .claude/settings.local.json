@@ -10,7 +10,12 @@
       "mcp__Claude_Preview__preview_start",
       "Bash(python /c/Users/User/Desktop/web2/sensitivity.py)",
       "Bash(git add *)",
-      "PowerShell(gh pr list --head change-lvl --state all --json number,url,state 2>&1)"
+      "PowerShell(gh pr list --head change-lvl --state all --json number,url,state 2>&1)",
+      "Bash(curl -s -I http://localhost:8770/data.js)",
+      "Bash(curl -s http://localhost:8770/data.js)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(sort -k2)",
+      "Bash(python tests.py)"
     ]
   }
 }

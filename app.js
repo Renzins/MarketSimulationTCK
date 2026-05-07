@@ -1,6 +1,44 @@
-// app.js — UI controller for the backtester. Config-driven so Level 1 and
-// Level 2 share the same generation, binding and update code wherever
-// possible.
+// app.js — UI controller for the Backtester page (index.html).
+//
+// ARCHITECTURE
+// ============
+// This file is config-driven so Levels 1 and 2 share one rendering / binding
+// path. The single source of truth is `LEVEL_CONFIG` (per-level metadata)
+// plus `PARAM_DEFS` (per-parameter metadata: label, range, default,
+// description, group=setup|market). Level panels are NOT duplicated in HTML —
+// the HTML has placeholder divs (#l1-setup-params, #l1-market-params, etc.)
+// that this file fills via `renderParamCards()`.
+//
+// FLOW
+// ====
+//   1. Engine.init(WIND_DATA)      — typed-array bootstrap of the dataset
+//   2. renderParamCards(level)     — generates parameter HTML from PARAM_DEFS
+//   3. renderStatsTables(level)    — generates the decomposition + counts tables
+//   4. bindParamCards(level)       — wires each control to scheduleUpdate(level)
+//   5. updateLevel(level)          — the hot path:
+//                                       Engine.setWindow → Engine.maybeWinsorize
+//                                       → Engine.simulate → render stats
+//                                       → Charts.drawTimeSeries / Monthly / Histogram
+//
+// IMPORTANT INVARIANTS
+// ====================
+//   - Setup parameters (sim window, winsorization) are NEVER touched by the
+//     Reset-to-naïve button. Only market params (X, Y, Z) are rolled back.
+//   - Naïve baseline is recomputed at the *current* θ_flat on every update —
+//     do NOT cache it across θ changes (that bug was fixed earlier).
+//   - All HTML date inputs are <input type="text"> with DD/MM/YYYY parsing,
+//     because <input type="date"> is browser-locale-driven and shows
+//     MM/DD/YYYY on US-locale machines. Use parseEU / isoToEU helpers.
+//   - The chart's tsRange is clamped to the simulation window — when sim
+//     window changes, tsRange is invalidated and re-defaulted to a single day.
+//
+// TYPICAL FUTURE EDITS
+// ====================
+//   - New parameter? Add to PARAM_DEFS, add the key to the level's paramKeys
+//     in LEVEL_CONFIG, and (if it's a setup param) decide whether the engine
+//     needs to know about it.
+//   - New stat row in the decomposition table? Add to DECOMP_COLUMNS or
+//     COUNT_COLUMNS — the renderer picks them up automatically.
 
 (() => {
   // =====================================================================
@@ -197,9 +235,32 @@
 
   const startTs = Engine.tsAt(0);
   const endTs = Engine.tsAt(D.n - 1);
+  // ISO (YYYY-MM-DD) is the internal canonical form; EU (DD/MM/YYYY) is what
+  // the user types and sees.
   const fmtDateOnly = (d) => d.toISOString().substring(0, 10);
+  const fmtDateEU = (d) => {
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const yyyy = d.getUTCFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  };
+  // Convert "DD/MM/YYYY" → "YYYY-MM-DD" or null if unparseable.
+  function parseEU(str) {
+    if (!str) return null;
+    const m = str.trim().match(/^(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{4})$/);
+    if (!m) return null;
+    const dd = m[1].padStart(2, "0");
+    const mm = m[2].padStart(2, "0");
+    return `${m[3]}-${mm}-${dd}`;
+  }
+  // Convert "YYYY-MM-DD" → "DD/MM/YYYY".
+  function isoToEU(iso) {
+    if (!iso) return "";
+    const [y, m, d] = iso.split("-");
+    return `${d}/${m}/${y}`;
+  }
   document.getElementById("data-range").textContent =
-    `${fmtDateOnly(startTs)} → ${fmtDateOnly(endTs)} (${D.n.toLocaleString()} ISPs)`;
+    `${fmtDateEU(startTs)} → ${fmtDateEU(endTs)} (${D.n.toLocaleString()} ISPs)`;
   const dataMinDate = fmtDateOnly(startTs);
   const dataMaxDate = fmtDateOnly(endTs);
 
@@ -235,11 +296,15 @@
       const to = state[level].simRange.to;
       return `
         <div class="control sim-range">
-          <label>${def.label}</label>
+          <label>${def.label}<span class="unit">DD/MM/YYYY</span></label>
           <div class="slider-row two">
-            <input type="date" id="${idBase}-from" value="${from}" min="${dataMinDate}" max="${dataMaxDate}">
+            <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                   pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                   id="${idBase}-from" value="${isoToEU(from)}">
             <span>→</span>
-            <input type="date" id="${idBase}-to" value="${to}" min="${dataMinDate}" max="${dataMaxDate}">
+            <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                   pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                   id="${idBase}-to" value="${isoToEU(to)}">
             <button type="button" class="btn small" id="${idBase}-reset" title="Reset to full dataset">↻</button>
           </div>
           <div class="param-desc">
@@ -457,28 +522,8 @@
       state[level].tsRange = { from, to };
       const fromEl = document.getElementById(`${prefix}-date-from`);
       const toEl = document.getElementById(`${prefix}-date-to`);
-      if (fromEl) {
-        fromEl.value = from;
-        fromEl.min = sim_range.from;
-        fromEl.max = sim_range.to;
-      }
-      if (toEl) {
-        toEl.value = to;
-        toEl.min = sim_range.from;
-        toEl.max = sim_range.to;
-      }
-    } else {
-      // Keep date input bounds in sync with current sim range
-      const fromEl = document.getElementById(`${prefix}-date-from`);
-      const toEl = document.getElementById(`${prefix}-date-to`);
-      if (fromEl) {
-        fromEl.min = sim_range.from;
-        fromEl.max = sim_range.to;
-      }
-      if (toEl) {
-        toEl.min = sim_range.from;
-        toEl.max = sim_range.to;
-      }
+      if (fromEl) fromEl.value = isoToEU(from);
+      if (toEl) toEl.value = isoToEU(to);
     }
     const chartIdx = rangeToIdx(from, to);
     Charts.drawTimeSeries(`${prefix}-ts-chart`, level, sim, p, chartIdx.start, chartIdx.end);
@@ -508,22 +553,24 @@
         const toEl = document.getElementById(`${idBase}-to`);
         const resetEl = document.getElementById(`${idBase}-reset`);
         const onChange = () => {
-          let f = clampDate(fromEl.value || dataMinDate, dataMinDate, dataMaxDate);
-          let t = clampDate(toEl.value || dataMaxDate, dataMinDate, dataMaxDate);
-          if (f > t) [f, t] = [t, f];
-          fromEl.value = f;
-          toEl.value = t;
-          state[level].simRange = { from: f, to: t };
-          // Sim range changed → invalidate the chart range so updateLevel
-          // re-anchors it to the (possibly narrower) window.
+          // Parse DD/MM/YYYY; fall back to the dataset bounds on bad input
+          let fIso = parseEU(fromEl.value) || dataMinDate;
+          let tIso = parseEU(toEl.value) || dataMaxDate;
+          fIso = clampDate(fIso, dataMinDate, dataMaxDate);
+          tIso = clampDate(tIso, dataMinDate, dataMaxDate);
+          if (fIso > tIso) [fIso, tIso] = [tIso, fIso];
+          fromEl.value = isoToEU(fIso);
+          toEl.value = isoToEU(tIso);
+          state[level].simRange = { from: fIso, to: tIso };
+          // Invalidate the chart range so updateLevel re-anchors to the new window
           state[level].tsRange = { from: null, to: null };
           scheduleUpdate(level);
         };
         fromEl.addEventListener("change", onChange);
         toEl.addEventListener("change", onChange);
         resetEl.addEventListener("click", () => {
-          fromEl.value = dataMinDate;
-          toEl.value = dataMaxDate;
+          fromEl.value = isoToEU(dataMinDate);
+          toEl.value = isoToEU(dataMaxDate);
           onChange();
         });
         continue;
@@ -673,21 +720,26 @@
     function simBounds() {
       return state[level].simRange;
     }
-    function applyRange(from, to) {
+    // Range arguments are ISO YYYY-MM-DD; the inputs display DD/MM/YYYY.
+    function applyRange(fromIso, toIso) {
       const sb = simBounds();
-      from = clampDate(from, sb.from, sb.to);
-      to = clampDate(to, sb.from, sb.to);
-      if (from > to) [from, to] = [to, from];
-      fromEl.value = from;
-      toEl.value = to;
-      state[level].tsRange = { from, to };
+      fromIso = clampDate(fromIso, sb.from, sb.to);
+      toIso = clampDate(toIso, sb.from, sb.to);
+      if (fromIso > toIso) [fromIso, toIso] = [toIso, fromIso];
+      fromEl.value = isoToEU(fromIso);
+      toEl.value = isoToEU(toIso);
+      state[level].tsRange = { from: fromIso, to: toIso };
       document
         .querySelectorAll(`.preset[data-level="${level}"]`)
         .forEach((b) => b.classList.remove("active"));
       updateLevel(level);
     }
-    fromEl.addEventListener("change", () => applyRange(fromEl.value, toEl.value));
-    toEl.addEventListener("change", () => applyRange(fromEl.value, toEl.value));
+    fromEl.addEventListener("change", () =>
+      applyRange(parseEU(fromEl.value) || simBounds().from, parseEU(toEl.value) || simBounds().to),
+    );
+    toEl.addEventListener("change", () =>
+      applyRange(parseEU(fromEl.value) || simBounds().from, parseEU(toEl.value) || simBounds().to),
+    );
     document.getElementById(`${prefix}-prev-range`).addEventListener("click", () => {
       const { from, to } = state[level].tsRange;
       const span =

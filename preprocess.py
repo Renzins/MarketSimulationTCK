@@ -1,10 +1,55 @@
 """
-Preprocess main_data_with_imbalance.csv into data.js for the static website.
+preprocess.py — build data.js from main_data_with_imbalance.csv.
 
-Outputs a JavaScript file that defines a global WIND_DATA object containing
-parallel arrays for each variable used by the simulation engine.
+WHAT THIS DOES
+==============
+1. Reads only the CSV columns the Backtester + Graphs engines need.
+2. Drops rows with NaN in critical columns (forecasts, prices, q_pot,
+   Baltic aggregates). Does NOT require final_imbalance_price_latvia
+   (that source ends in March 2026; April rows are kept and p_imb is
+   exported as JSON null where missing).
+3. Computes Baltic aggregates (LV + EE + LT) for wind day-ahead, solar
+   day-ahead, and imbalance volume.
+4. Emits data.js with a global WIND_DATA object.
+5. Re-runs the spec's two Level-2 worked examples (−322.5 € / +375.0 €)
+   as a sanity check on every regenerate.
 
-Sign-convention sanity check (Level 2 example 1) is verified at the bottom.
+DATA REFRESH WORKFLOW
+=====================
+After replacing main_data_with_imbalance.csv:
+
+    python preprocess.py
+
+The Backtester and Graphs pages auto-adapt to:
+  * new date range / ISP count
+  * new April imbalance prices (if present, p_imb just stops being null)
+  * new bin boundaries (recomputed from data on every chart render)
+
+Manual updates needed for:
+  * tests.py frozen regression values (L1 = 13,257,221 €, L2 = 13,367,642 €)
+  * cache-busting ?v=N on <script> tags in index.html / graphs.html
+
+If the source CSV's column names change, NEEDED below must be updated
+or the script fails with KeyError (intentional — better than silently
+producing garbage).
+
+OUTPUT FORMAT
+=============
+data.js contains a single global:
+
+    const WIND_DATA = {
+      start_iso, n, step_min, offsets,
+      da_forecast, id_forecast,             // Vanessa-specific
+      p_da, p_mfrr,                         // Single clearing prices
+      q_pot,                                // Vanessa potential gen, MW
+      p_imb,                                // [..., null, null, ...] where missing
+      baltic_wind_da, baltic_solar_da,      // LV+EE+LT sums (MW)
+      baltic_imb_vol,                       // LV+EE+LT sum, signed (MW)
+    };
+
+null entries in p_imb are turned into NaN by engine.js's _toFloat32WithNaN()
+helper; simulate / simulateTotal / monthlyAggregation each guard NaN p_imb
+and treat its imbalance + flat-penalty contributions as 0.
 """
 
 import json
@@ -27,6 +72,16 @@ NEEDED = [
     "mfrr_sa_downward_lv",
     "wind_park_possible",
     "final_imbalance_price_latvia",
+    # Baltic-level columns (used by the Graphs page)
+    "lv_wind_onshore_dayahead_mw",
+    "ee_wind_onshore_dayahead_mw",
+    "lt_wind_onshore_dayahead_mw",
+    "lv_solar_dayahead_mw",
+    "ee_solar_dayahead_mw",
+    "lt_solar_dayahead_mw",
+    "imbalance_volume_lv",
+    "imbalance_volume_ee",
+    "imbalance_volume_lt",
 ]
 
 
@@ -50,14 +105,37 @@ def main():
     # Convert kW -> MW for actual production
     df["q_pot"] = df["wind_park_possible"] / 1000.0
 
-    # Drop rows with NaN in any required column
+    # Baltic-level aggregates (sum of EE + LV + LT)
+    df["baltic_wind_da"] = (
+        df["lv_wind_onshore_dayahead_mw"]
+        + df["ee_wind_onshore_dayahead_mw"]
+        + df["lt_wind_onshore_dayahead_mw"]
+    )
+    df["baltic_solar_da"] = (
+        df["lv_solar_dayahead_mw"]
+        + df["ee_solar_dayahead_mw"]
+        + df["lt_solar_dayahead_mw"]
+    )
+    df["baltic_imb_vol"] = (
+        df["imbalance_volume_lv"]
+        + df["imbalance_volume_ee"]
+        + df["imbalance_volume_lt"]
+    )
+
+    # Drop rows with NaN in any column required by EITHER consumer (Backtester
+    # or Graphs). p_imb is intentionally NOT in this list — its source file
+    # ends in March 2026, so requiring it would cut April off. The Backtester
+    # engine treats NaN p_imb as 0 cost (April rows still contribute DA + mFRR
+    # revenue but no imbalance penalty).
     needed_cols = [
         "scipher_da_p50_mw",
         "scipher_id_p50_mw",
         "lt_dayahead_price_eur_mwh",
         "p_mfrr",
         "q_pot",
-        "final_imbalance_price_latvia",
+        "baltic_wind_da",
+        "baltic_solar_da",
+        "baltic_imb_vol",
     ]
     before = len(df)
     df = df.dropna(subset=needed_cols).reset_index(drop=True)
@@ -65,6 +143,11 @@ def main():
     print(
         f"  dropped {before - after} NaN rows ({(before - after) / before * 100:.2f}%); "
         f"remaining: {after}"
+    )
+    n_pimb_missing = df["final_imbalance_price_latvia"].isna().sum()
+    print(
+        f"  p_imb (Latvia imbalance price) missing in {n_pimb_missing} rows "
+        f"({n_pimb_missing / after * 100:.2f}%) — encoded as null in JSON"
     )
 
     # Parse timestamps to derive offset from a fixed start
@@ -80,7 +163,15 @@ def main():
     pda = df["lt_dayahead_price_eur_mwh"].round(2).tolist()
     pmfrr = df["p_mfrr"].round(2).tolist()
     qpot = df["q_pot"].round(3).tolist()
-    pimb = df["final_imbalance_price_latvia"].round(2).tolist()
+    # Encode NaN p_imb as null (JSON doesn't allow NaN literal). JS receives
+    # null → engine converts to NaN in its Float32Array.
+    pimb = [
+        None if pd.isna(v) else round(float(v), 2)
+        for v in df["final_imbalance_price_latvia"]
+    ]
+    bw = df["baltic_wind_da"].round(2).tolist()
+    bs = df["baltic_solar_da"].round(2).tolist()
+    bi = df["baltic_imb_vol"].round(3).tolist()
     offsets = df["idx"].tolist()
 
     out = {
@@ -94,6 +185,9 @@ def main():
         "p_mfrr": pmfrr,
         "q_pot": qpot,
         "p_imb": pimb,
+        "baltic_wind_da": bw,
+        "baltic_solar_da": bs,
+        "baltic_imb_vol": bi,
     }
 
     js = "// Auto-generated by preprocess.py — do not edit by hand.\n"
@@ -115,9 +209,14 @@ def main():
         ("p_da (EUR/MWh)", pda),
         ("p_mfrr (EUR/MWh)", pmfrr),
         ("q_pot (MW)", qpot),
-        ("p_imb (EUR/MWh)", pimb),
+        ("p_imb (EUR/MWh)", [v for v in pimb if v is not None]),
+        ("baltic_wind_da (MW)", bw),
+        ("baltic_solar_da (MW)", bs),
+        ("baltic_imb_vol (MW)", bi),
     ]:
-        a = np.asarray(arr)
+        a = np.asarray(arr, dtype=float)
+        if len(a) == 0:
+            continue
         print(
             f"  {name:25s} min={a.min():10.2f} p10={np.percentile(a, 10):10.2f} "
             f"p50={np.percentile(a, 50):10.2f} p90={np.percentile(a, 90):10.2f} "
