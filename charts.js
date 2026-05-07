@@ -1,5 +1,35 @@
-// charts.js — all Plotly chart drawing for the backtester.
-// Pure rendering: receives data + a target element id, returns nothing.
+// charts.js — Plotly renderers for the Backtester page.
+//
+// All functions are PURE drawers: they take a target element id, pre-computed
+// arrays / stats and a Plotly layout. No DOM mutation outside the chart div.
+//
+// EXPORTS
+//   drawTimeSeries(targetId, level, simResult, params, startIdx, endIdx)
+//     One day → many weeks of DA-sold (line) + mFRR up/dn (bars or fills) +
+//     optional Q_pot (L2). Single hover trace owns the sectioned tooltip.
+//
+//   drawMonthly(targetId, level, monthly)
+//     Stacked bar per calendar month showing decomposition.
+//
+//   drawHistogram(targetId, perISPRev)
+//     Per-ISP revenue distribution (log-Y, ~80 bins).
+//
+//   drawHeatmap(targetId, grid, xs, ys, axisLabels, markX, markY, onClick)
+//     Optimisation-surface heatmap (Plotly heatmap + click handler).
+//
+// TOOLTIP DESIGN
+// ==============
+// All four visible traces have hoverinfo:'skip'. A 5th invisible scatter at
+// y = chart-top owns the unified tooltip. This avoids the duplicated-tooltip
+// problem that plagues Plotly's "x unified" mode when multiple traces have
+// hovertemplate. The tooltip is sectioned (Forecast / DA market / Balancing /
+// Imbalance / P&L) and shows each section ONLY when relevant.
+//
+// PERFORMANCE
+// ===========
+//   - useBars = N <= 600 (~6 days). Above that, switches to scattergl with
+//     filled-area mFRR traces for >40k-point full-dataset views.
+//   - tickformat / hoverformat are %d/%m/%Y for European date display.
 
 const Charts = (() => {
   const PLOTLY_LAYOUT_DEFAULTS = {
@@ -95,7 +125,13 @@ const Charts = (() => {
       );
     }
     const hover = ts.map((t, k) => {
-      const stamp = t.toISOString().substring(0, 16).replace("T", " ");
+      // European-style timestamp DD/MM/YYYY HH:MM
+      const dd = String(t.getUTCDate()).padStart(2, "0");
+      const mm = String(t.getUTCMonth() + 1).padStart(2, "0");
+      const yyyy = t.getUTCFullYear();
+      const hh = String(t.getUTCHours()).padStart(2, "0");
+      const mn = String(t.getUTCMinutes()).padStart(2, "0");
+      const stamp = `${dd}/${mm}/${yyyy} ${hh}:${mn}`;
       let s = `<b>${stamp} UTC</b><br>`;
 
       // --- Forecast ---
@@ -300,6 +336,9 @@ const Charts = (() => {
       xaxis: {
         ...PLOTLY_LAYOUT_DEFAULTS.xaxis,
         type: "date",
+        // European date format on tick labels and on the unified hover guideline
+        tickformat: "%d/%m/%Y",
+        hoverformat: "%d/%m/%Y %H:%M",
         title: `UTC · ${N.toLocaleString()} ISPs (${dayCount.toFixed(1)} d)${useBars ? "" : " · zoom in for bar mode"}`,
       },
       hovermode: "x",

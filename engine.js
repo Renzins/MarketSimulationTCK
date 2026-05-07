@@ -1,9 +1,9 @@
-// engine.js — pure simulation logic for the Vanessa wind park backtester.
-// No DOM access. Reads from a pre-loaded WIND_DATA global plus parameter
-// objects. Results: per-ISP arrays, totals and decompositions.
+// engine.js — pure simulation logic for the Vanessa wind-park Backtester.
 //
-// Sign conventions (verified against the spec's two worked Level 2 examples
-// in preprocess.py):
+// No DOM access. Reads from a pre-loaded WIND_DATA global plus parameter
+// objects. Returns per-ISP arrays, totals and decompositions.
+//
+// SIGN CONVENTIONS (verified by tests.py + the spec's two worked examples)
 //   DA revenue:    Q_da_sold * P_da                           [≥ 0]
 //   mFRR-up rev:   Q_up * P_mfrr                              [+ when P_mfrr > 0]
 //   mFRR-dn rev:   -Q_dn * P_mfrr                             [+ when P_mfrr < 0]
@@ -11,31 +11,62 @@
 //   Flat penalty: -Q_short * theta_flat
 //   per-ISP rev = (DA + up + dn - imb - flat) * 0.25          [MW * h]
 //
-// Physical constraints (revised after audit):
-//   * All market quantities are WHOLE MW (balancing market only operates
-//     in integer MW blocks). Q_da_sold, Q_w, trusted_rev and Q_dn_offer
-//     are floored. Fractional MW between floor(.) and the actual forecast
-//     are simply not traded.
-//   * mFRR-dn (downward activation) is CURTAILMENT of an existing DA
-//     position. A wind park can drop from Q_da_sold to 0; it cannot go
-//     below 0. Therefore Q_dn_offer is capped at Q_da_sold and is
-//     independent of the withholding parameter Y.
-//   * When mFRR-dn activates, our promised delivery becomes
-//     Q_da_sold - Q_dn, so Q_position = Q_da_sold + Q_up - Q_dn.
-//     (mFRR-up and mFRR-dn cannot both fire in the same ISP because
-//     P_mfrr is a single signed value.)
+// PHYSICAL CONSTRAINTS (audit-applied, do NOT regress)
+//   * Whole-MW market quantities. Balancing market accepts integer MW only,
+//     so Q_da_sold, Q_w, trusted_rev and Q_dn_offer are floored. Fractional
+//     MW between floor(F) and the actual forecast are simply not traded.
+//   * mFRR-dn capped at the DA position. A wind park can drop from Q_da_sold
+//     to 0 but cannot go below 0. Therefore Q_dn_offer = Q_da_sold (NOT Q_w),
+//     independent of Y. When Q_da_sold = 0 there is no mFRR-dn revenue.
+//   * Q_position = Q_da_sold + Q_up - Q_dn. mFRR-up and mFRR-dn cannot both
+//     fire in the same ISP (P_mfrr is single-signed; tests verify).
 //
-// Simulation window:
-//   The engine carries a half-open ISP-index window [winStart, winEnd).
-//   All summation, sweeping, winsorization-percentile computation and
-//   monthly aggregation respect that window. Setting the window to a
-//   sub-period is equivalent to backtesting that sub-period only.
+// SIMULATION WINDOW
+//   The engine carries a half-open ISP-index window [winStart, winEnd) set
+//   by setWindow(start, end). All summation, sweeping,
+//   winsorization-percentile computation and monthly aggregation respect
+//   it. Per-ISP arrays returned by simulate() are sized to the window —
+//   index k of perISP corresponds to global ISP (windowStart + k).
+//
+// NaN HANDLING
+//   D.p_imb (Latvia imbalance price) is NaN for ~6.8% of rows where the
+//   upstream source ran out (mostly April 2026). simulate() and
+//   simulateTotal() detect NaN p_imb and treat its imbalance + flat
+//   penalty as 0 for that ISP, so April rows still contribute DA + mFRR
+//   revenue to the L2 totals. Tests verify this.
+//
+// EXPORTS
+//   init(rawData)                  — bootstrap typed-array views, reset window
+//   getData()                      — internal D (typed arrays + meta)
+//   setWindow(start, end)          — half-open ISP-index window (invalidates winsor cache)
+//   getWindow()                    — { start, end }
+//   maybeWinsorize(mfrrLo, mfrrHi, imbLo, imbHi) — keyed-cache; recomputes only on change
+//   forceRewinsor()                — invalidate cache (rare)
+//   simulate(level, params)        — full per-ISP detail
+//   simulateTotal(level, X,Y,Z,θ)  — fast total-only (sweeps)
+//   naiveRevenue(level, θ)         — simulateTotal at X=0,Y=0,Z=0
+//   sweepLevel1(xs, ys)            — 2-D grid for the L1 heatmap
+//   sweepLevel2(xs, ys, zs, θ)     — 3-D grid for the L2 heatmap
+//   topConcentration(perISP, frac) — top-N% revenue share (robustness)
+//   monthlyAggregation(level, p)   — month-bucketed decomposition
+//   totalPotMWhInWindow()          — sum of q_pot in current window
+//   tsAt(i)                        — Date object for global ISP index i
 
 const Engine = (() => {
   // ---------- typed-array view of the JSON data --------------------------
   let D = null;
   let winStart = 0;
   let winEnd = 0;
+
+  // null in JSON arrays denotes missing data → convert to NaN in the Float32Array
+  // so engine code can detect it via isNaN().
+  function _toFloat32WithNaN(arr) {
+    const out = new Float32Array(arr.length);
+    for (let i = 0; i < arr.length; i++) {
+      out[i] = arr[i] === null ? NaN : arr[i];
+    }
+    return out;
+  }
 
   function init(rawData) {
     D = {
@@ -46,9 +77,11 @@ const Engine = (() => {
       da_forecast: new Float32Array(rawData.da_forecast),
       id_forecast: new Float32Array(rawData.id_forecast),
       p_da: new Float32Array(rawData.p_da),
-      p_mfrr_raw: new Float32Array(rawData.p_mfrr),
+      p_mfrr_raw: _toFloat32WithNaN(rawData.p_mfrr),
       q_pot: new Float32Array(rawData.q_pot),
-      p_imb_raw: new Float32Array(rawData.p_imb),
+      // p_imb may contain null (April lacks the imbalance-price source).
+      // Engine treats NaN p_imb as zero imbalance cost in L2.
+      p_imb_raw: _toFloat32WithNaN(rawData.p_imb),
     };
     // Working buffers for winsorized prices (filled by maybeWinsorize)
     D.p_mfrr = new Float32Array(D.n);
@@ -97,25 +130,36 @@ const Engine = (() => {
   }
 
   // Compute the percentile bounds over the [winStart, winEnd) slice and
-  // clamp every value in `src` to those bounds, writing into `dst`.
-  // (We clamp the full array — including values outside the window — so
-  // the chart can still display values for ISPs adjacent to the window
-  // without showing raw outliers.)
+  // clamp every value in `src` to those bounds, writing into `dst`. NaN
+  // values are excluded from percentile computation and copied through to
+  // dst as NaN (so the Backtester's L2 can detect missing imbalance prices).
   function applyWinsor(src, dst, pLow, pHigh) {
     const wLen = winEnd - winStart;
     if (wLen <= 0) {
-      // Empty window — leave dst untouched but copy raw values
       for (let i = 0; i < src.length; i++) dst[i] = src[i];
       return { lo: 0, hi: 0 };
     }
-    const sample = new Float32Array(wLen);
-    for (let i = 0; i < wLen; i++) sample[i] = src[winStart + i];
+    // Collect non-NaN window values for percentile estimation
+    const buf = [];
+    for (let i = winStart; i < winEnd; i++) {
+      const v = src[i];
+      if (!isNaN(v)) buf.push(v);
+    }
+    if (buf.length === 0) {
+      for (let i = 0; i < src.length; i++) dst[i] = src[i];
+      return { lo: 0, hi: 0 };
+    }
+    const sample = Float32Array.from(buf);
     sample.sort();
     const lo = percentileValue(sample, pLow);
     const hi = percentileValue(sample, pHigh);
     for (let i = 0; i < src.length; i++) {
       const v = src[i];
-      dst[i] = v < lo ? lo : v > hi ? hi : v;
+      if (isNaN(v)) {
+        dst[i] = NaN;
+      } else {
+        dst[i] = v < lo ? lo : v > hi ? hi : v;
+      }
     }
     return { lo, hi };
   }
@@ -192,9 +236,20 @@ const Engine = (() => {
       const Q_pos = da_sold + up - dn;
       const Q_pot = isL2 ? D.q_pot[i] : F;
       const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
-      const P_imb = isL2 ? D.p_imb[i] : 0;
-      const imb = isL2 ? short * P_imb : 0;
-      const flat = isL2 ? short * theta_flat : 0;
+      // ----- NaN p_imb handling -----
+      // The Latvia imbalance-price source ran out at end-of-March 2026, so
+      // ~6.8% of rows (mostly April) have NaN p_imb. We keep those rows in
+      // the simulation (they still earn DA + mFRR revenue) but zero their
+      // imbalance & flat-penalty contributions — effectively assuming
+      // "perfect imbalance" for those ISPs. This MILDLY undercounts L2 cost
+      // if you point the sim window at April only; mention this in any
+      // narrative about April-specific results. When a refreshed CSV
+      // includes April imbalance prices, no engine change is needed —
+      // p_imb just stops being NaN and the cost flows through.
+      const P_imb_raw = isL2 ? D.p_imb[i] : 0;
+      const P_imb_valid = isL2 ? !isNaN(P_imb_raw) : true;
+      const imb = isL2 && P_imb_valid ? short * P_imb_raw : 0;
+      const flat = isL2 && P_imb_valid ? short * theta_flat : 0;
       const rev = (DA_rev + Up_rev + Dn_rev - imb - flat) * 0.25;
       Q_da_sold[k] = da_sold;
       Q_up[k] = up;
@@ -262,7 +317,10 @@ const Engine = (() => {
         const Q_pos = da_sold + up - dn;
         const Q_pot = Q_pot_arr[i];
         const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
-        rev -= short * (P_imb_arr[i] + theta_flat);
+        // NaN p_imb (April rows): skip imbalance + flat costs entirely.
+        // Mirrors simulate(); see the long comment on NaN handling there.
+        const pimb = P_imb_arr[i];
+        if (!isNaN(pimb)) rev -= short * (pimb + theta_flat);
       }
       total += rev;
     }
@@ -379,8 +437,13 @@ const Engine = (() => {
       if (isL2) {
         const Q_pos = da_sold + up - dn;
         const short = Q_pos > D.q_pot[i] ? Q_pos - D.q_pot[i] : 0;
-        imb = short * D.p_imb[i] * 0.25;
-        flat = short * theta * 0.25;
+        // Guard against NaN p_imb (April rows): treat as 0 cost rather than
+        // letting NaN poison the entire month's bucket.
+        const pimb = D.p_imb[i];
+        if (!isNaN(pimb)) {
+          imb = short * pimb * 0.25;
+          flat = short * theta * 0.25;
+        }
       }
       const b = buckets.get(key) || { DA: 0, up: 0, dn: 0, imb: 0, flat: 0 };
       b.DA += DA_rev;

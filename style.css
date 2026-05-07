@@ -35,10 +35,60 @@ a {
   color: var(--accent);
 }
 
+/* ---------- Top navigation -------------------------------------------- */
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 28px;
+  background: #0c0f13;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.site-nav .brand {
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: none;
+  margin-right: 18px;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+}
+
+.site-nav .navlink {
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s, color 0.12s;
+}
+
+.site-nav .navlink:hover {
+  color: var(--text);
+  background: var(--bg2);
+}
+
+.site-nav .navlink.active {
+  color: #0d1117;
+  background: var(--accent);
+}
+
 .site-header {
   padding: 20px 28px 6px;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #161b22 0%, #0f1216 100%);
+}
+
+.site-header.compact {
+  padding: 14px 28px 8px;
+}
+
+.site-header.compact h1 {
+  font-size: 18px;
 }
 
 .site-header h1 {
@@ -61,7 +111,7 @@ a {
   background: var(--bg);
   border-bottom: 1px solid var(--border);
   position: sticky;
-  top: 0;
+  top: 41px; /* below the site-nav (about 41px tall) */
   z-index: 10;
 }
 
@@ -198,17 +248,31 @@ main {
   flex-wrap: wrap;
 }
 
-.control.sim-range input[type="date"] {
+.control.sim-range input[type="date"],
+.control.sim-range input[type="text"],
+input.date-eu {
   background: var(--bg3);
   border: 1px solid var(--border);
   color: var(--text);
   border-radius: 4px;
-  padding: 4px 6px;
+  padding: 4px 8px;
   font-family: inherit;
   color-scheme: dark;
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
   flex: 1;
   min-width: 110px;
+  letter-spacing: 0.5px;
+}
+
+input.date-eu {
+  width: 110px;
+  flex: none;
+}
+
+.control.sim-range input[type="text"]:invalid,
+input.date-eu:invalid {
+  border-color: var(--bad);
 }
 
 .control label {
@@ -441,6 +505,26 @@ table.decomposition td {
 
 .chart.small {
   min-height: 260px;
+}
+
+.chart.wide {
+  min-height: 420px;
+}
+
+.placeholder-card {
+  text-align: center;
+  padding: 48px 28px !important;
+  background: var(--bg2);
+}
+
+.placeholder-card h2 {
+  margin: 0 0 12px 0;
+  color: var(--text);
+}
+
+.placeholder-card .card-desc {
+  max-width: 720px;
+  margin: 0 auto 8px auto;
 }
 
 .ts-controls {
