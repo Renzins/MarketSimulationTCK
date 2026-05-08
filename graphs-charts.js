@@ -108,10 +108,12 @@ const GraphsCharts = (() => {
 
   // ------------ 1-D box plots (spread by Wind/Solar bins) -----------------
   // result = { labels, boxes }, regime = 'SURPLUS'|'DEFICIT', xaxisTitle, title
+  // yAxisTitle (optional, default "Spread: P_mFRR − P_DA (EUR/MWh)") lets the
+  // aFRR section override the label so the y-axis correctly reads aFRR.
   // Style: white outline / median for high contrast on dark theme. Mean
   // indicator (diamond) is omitted — the box only shows quartiles + whiskers
   // + outliers as separate scatter dots, matching the traditional look.
-  function drawSpreadByBucket(targetId, result, regime, xaxisTitle, title) {
+  function drawSpreadByBucket(targetId, result, regime, xaxisTitle, title, yAxisTitle) {
     const N = result.boxes.length;
     const colours = paletteForN(N, STOPS_BUCKET);
     const traces = [];
@@ -166,7 +168,7 @@ const GraphsCharts = (() => {
       title: { text: title, font: { size: 14, color: "#e6edf3" } },
       yaxis: {
         ...LAYOUT.yaxis,
-        title: "Spread: P_mFRR − P_DA (EUR/MWh)",
+        title: yAxisTitle || "Spread: P_mFRR − P_DA (EUR/MWh)",
         zeroline: true,
         zerolinecolor: "#f85149",
         zerolinewidth: 1,

@@ -238,6 +238,42 @@ main {
   max-width: 720px;
 }
 
+.direction-toggle-card {
+  padding-bottom: 16px !important;
+}
+
+.direction-toggle-card .card-head h2.small-h2 {
+  font-size: 14px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.direction-toggle-card .badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+}
+
+.direction-toggle {
+  display: inline-flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.direction-toggle .btn.preset {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
 .controls-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));

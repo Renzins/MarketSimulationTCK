@@ -402,18 +402,625 @@
     document.getElementById("g-recompute").addEventListener("click", updateAll);
   }
 
+  // =====================================================================
+  //  aFRR SUB-TAB
+  //  Independent state from the mFRR sub-tab. Each tab has its own date
+  //  range (because aFRR data only starts on 2025-05-01) and its own LV
+  //  vs Baltic regime thresholds.
+  // =====================================================================
+  AfrrEngine.init();
+  const afrrRange = AfrrEngine.getAfrrRange();
+  const afrrMinDate = afrrRange ? afrrRange.from.substring(0, 10) : dataMinDate;
+  const afrrMaxDate = afrrRange ? afrrRange.to.substring(0, 10) : dataMaxDate;
+
+  const afrrState = {
+    // Default the aFRR sim window to the aFRR data range (clamped)
+    sim: {
+      from: afrrMinDate > dataMinDate ? afrrMinDate : dataMinDate,
+      to: afrrMaxDate < dataMaxDate ? afrrMaxDate : dataMaxDate,
+    },
+    // Winsorization is unused so far (no price-related charts yet) but kept
+    // here so the same shape applies if/when we add 4-second price plots.
+    winsorAfrrLo: 10,
+    winsorAfrrHi: 90,
+    // LV imbalance is ~1/3 magnitude of Baltic (LV alone, not summed).
+    // Defaults reflect that.
+    lvDeficit: -10,
+    lvSurplus: +10,
+    balticDeficit: -30,
+    balticSurplus: +30,
+    // "Rest of Baltic" = EE + LT (≈ 2/3 of full Baltic, so default ±20).
+    // Used by the divergence chart only.
+    restDeficit: -20,
+    restSurplus: +20,
+    // Bucket counts for aFRR price/spread charts (mirror mFRR section).
+    buckets: {
+      wind: 4,
+      solar: 4,
+      daBand: 5,
+      matchedLevels: 3,
+    },
+    // Lazy-load state for the 86 MB per-slot price file
+    pricesLoaded: false,
+    pricesLoading: false,
+    // Direction filter for signed-spread charts: 'all' | 'pos' | 'neg'.
+    // Matched-by-DA |spread| charts ignore this — they're always merged.
+    direction: "all",
+  };
+
+  function afrrSetupHTML() {
+    return `
+      <div class="control sim-range">
+        <label>Simulation date range<span class="unit">DD/MM/YYYY</span></label>
+        <div class="slider-row two">
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-afrr-sim-from" value="${isoToEU(afrrState.sim.from)}">
+          <span>→</span>
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-afrr-sim-to" value="${isoToEU(afrrState.sim.to)}">
+          <button type="button" class="btn small" id="g-afrr-sim-reset" title="Reset to full aFRR range">↻</button>
+        </div>
+        <div class="param-desc">
+          <p>Restricts every aFRR chart to ISPs in this window. The aFRR data
+             starts on ${isoToEU(afrrMinDate)} and ends on ${isoToEU(afrrMaxDate)}, so the
+             range is clamped accordingly.</p>
+          <ul class="extremes">
+            <li><b>Full aFRR range:</b> all 12 months of aFRR data.</li>
+            <li><b>Sub-period:</b> stress-test specific seasons.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="control winsor">
+        <label>Winsorize aFRR price (percentiles)</label>
+        <div class="slider-row two">
+          <input type="number" id="g-afrr-winsor-lo" value="${afrrState.winsorAfrrLo}" min="0" max="50" step="1">
+          <span>/</span>
+          <input type="number" id="g-afrr-winsor-hi" value="${afrrState.winsorAfrrHi}" min="50" max="100" step="1">
+        </div>
+        <div class="param-desc">
+          <p>Percentile clipping for AST_POS / AST_NEG prices. Currently
+             unused — the activation bar charts only need null-vs-non-null
+             status — but kept consistent with the mFRR setup so that
+             upcoming 4-second price plots have a parameter ready.</p>
+          <ul class="extremes">
+            <li><b>0 / 100:</b> no winsorization.</li>
+            <li><b>10 / 90:</b> default for box plots.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="control">
+        <label>LV imbalance thresholds<span class="unit">MW</span></label>
+        <div class="slider-row two">
+          <input type="number" id="g-afrr-lv-def-thr" value="${afrrState.lvDeficit}" step="1" style="width: 80px">
+          <span>/</span>
+          <input type="number" id="g-afrr-lv-sur-thr" value="${afrrState.lvSurplus}" step="1" style="width: 80px">
+        </div>
+        <div class="param-desc">
+          <p>Classifies each ISP using <b>LV-only</b> imbalance volume
+             (imbalance_volume_lv). LV alone is ≈ 1/3 the magnitude of Baltic, so
+             defaults are tighter (±10 MW vs Baltic ±30).</p>
+          <ul class="extremes">
+            <li><b>−10 / +10 (default):</b> typical Latvia dead band.</li>
+            <li><b>−5 / +5:</b> tighter — more ISPs qualify.</li>
+            <li><b>−25 / +25:</b> only large LV imbalances qualify.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="control">
+        <label>Baltic imbalance thresholds<span class="unit">MW</span></label>
+        <div class="slider-row two">
+          <input type="number" id="g-afrr-bal-def-thr" value="${afrrState.balticDeficit}" step="1" style="width: 80px">
+          <span>/</span>
+          <input type="number" id="g-afrr-bal-sur-thr" value="${afrrState.balticSurplus}" step="1" style="width: 80px">
+        </div>
+        <div class="param-desc">
+          <p>Classifies each ISP using <b>full Baltic</b> imbalance volume
+             (LV + EE + LT). Same defaults as the mFRR section's regime
+             thresholds (±30 MW).</p>
+          <ul class="extremes">
+            <li><b>−30 / +30 (default):</b> ignores small noise.</li>
+            <li><b>0 / 0:</b> sign-only — every non-zero ISP counts.</li>
+            <li><b>−100 / +100:</b> only large Baltic imbalances qualify.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="control">
+        <label>Rest-of-Baltic thresholds (EE+LT)<span class="unit">MW</span></label>
+        <div class="slider-row two">
+          <input type="number" id="g-afrr-rest-def-thr" value="${afrrState.restDeficit}" step="1" style="width: 80px">
+          <span>/</span>
+          <input type="number" id="g-afrr-rest-sur-thr" value="${afrrState.restSurplus}" step="1" style="width: 80px">
+        </div>
+        <div class="param-desc">
+          <p>Used <em>only</em> by the divergence chart at the bottom.
+             "Rest of Baltic" is computed as
+             <code>baltic_imb_vol − lv_imb_vol</code> = EE + LT. EE+LT alone is
+             ≈ 2/3 the magnitude of full Baltic, so the default (±20 MW) is
+             tighter than the full-Baltic ±30.</p>
+          <ul class="extremes">
+            <li><b>−20 / +20 (default):</b> reasonable dead band for EE+LT.</li>
+            <li><b>0 / 0:</b> sign-only.</li>
+            <li><b>−50 / +50:</b> only large EE+LT imbalances qualify.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Bucket counts for aFRR PRICE / SPREAD charts -->
+      <div class="control">
+        <label for="g-afrr-buck-wind">Wind buckets<span class="unit">bins</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-afrr-buck-wind" min="2" max="12" step="1" value="${afrrState.buckets.wind}">
+          <input type="number" id="g-afrr-buck-wind-num" value="${afrrState.buckets.wind}" min="2" max="12" step="1">
+        </div>
+        <div class="param-desc">
+          <p>Quantile bins for the Baltic wind forecast in the aFRR price plots
+             (1-D wind boxes and the wind axis of the heatmap).</p>
+        </div>
+      </div>
+      <div class="control">
+        <label for="g-afrr-buck-solar">Solar buckets<span class="unit">bins</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-afrr-buck-solar" min="2" max="12" step="1" value="${afrrState.buckets.solar}">
+          <input type="number" id="g-afrr-buck-solar-num" value="${afrrState.buckets.solar}" min="2" max="12" step="1">
+        </div>
+        <div class="param-desc">
+          <p>Quantile bins for the Baltic solar forecast in the aFRR price plots.</p>
+        </div>
+      </div>
+      <div class="control">
+        <label for="g-afrr-buck-daBand">DA price bands<span class="unit">bins</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-afrr-buck-daBand" min="2" max="10" step="1" value="${afrrState.buckets.daBand}">
+          <input type="number" id="g-afrr-buck-daBand-num" value="${afrrState.buckets.daBand}" min="2" max="10" step="1">
+        </div>
+        <div class="param-desc">
+          <p>Number of DA-price panels in the matched-by-DA aFRR charts.</p>
+        </div>
+      </div>
+      <div class="control">
+        <label for="g-afrr-buck-matchedLevels">Levels (matched panels)<span class="unit">bins</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-afrr-buck-matchedLevels" min="2" max="6" step="1" value="${afrrState.buckets.matchedLevels}">
+          <input type="number" id="g-afrr-buck-matchedLevels-num" value="${afrrState.buckets.matchedLevels}" min="2" max="6" step="1">
+        </div>
+        <div class="param-desc">
+          <p>Number of level rows inside each DA panel of the matched aFRR charts.</p>
+        </div>
+      </div>
+    `;
+  }
+
+  function clampAfrrDate(s) {
+    return clampDate(s, afrrMinDate, afrrMaxDate);
+  }
+
+  let afrrUpdateTimer = null;
+  function scheduleAfrrUpdate() {
+    clearTimeout(afrrUpdateTimer);
+    afrrUpdateTimer = setTimeout(updateAfrr, 60);
+  }
+
+  function updateAfrr() {
+    const progEl = document.getElementById("g-afrr-progress");
+    progEl.textContent = "computing…";
+    setTimeout(() => {
+      const t0 = performance.now();
+      // Set engine window to the aFRR sim range
+      const { start, end } = rangeToIdx(afrrState.sim.from, afrrState.sim.to);
+      Engine.setWindow(start, end);
+      AfrrEngine.setLvThresholds(afrrState.lvDeficit, afrrState.lvSurplus);
+      AfrrEngine.setBalticThresholds(afrrState.balticDeficit, afrrState.balticSurplus);
+      AfrrEngine.setRestOfBalticThresholds(afrrState.restDeficit, afrrState.restSurplus);
+
+      const lvResult = AfrrEngine.activationRateByRegime("lv");
+      const balticResult = AfrrEngine.activationRateByRegime("baltic");
+      const divResult = AfrrEngine.activationRateByDivergence();
+
+      AfrrCharts.drawActivationBars(
+        "g-afrr-bars-lv",
+        lvResult,
+        "aFRR activation rate by Latvia imbalance regime",
+      );
+      AfrrCharts.drawActivationBars(
+        "g-afrr-bars-baltic",
+        balticResult,
+        "aFRR activation rate by Baltic imbalance regime",
+      );
+      // Divergence chart reuses the same drawer with custom x-labels and
+      // a custom subtitle so the user can read both threshold pairs.
+      const divSubtitle =
+        `LV thresholds: ${afrrState.lvDeficit} / +${afrrState.lvSurplus} MW · ` +
+        `EE+LT thresholds: ${afrrState.restDeficit} / +${afrrState.restSurplus} MW`;
+      AfrrCharts.drawActivationBars(
+        "g-afrr-bars-divergence",
+        divResult,
+        "aFRR activation rate when LV and rest-of-Baltic disagree",
+        ["LV+ / rest−", "LV− / rest+"],
+        divSubtitle,
+      );
+      const ms = Math.round(performance.now() - t0);
+      progEl.textContent = `done in ${ms} ms`;
+      // If the price file is already loaded, re-render the price charts
+      // (their inputs depend on the same window/threshold state).
+      if (afrrState.pricesLoaded) updateAfrrPriceCharts();
+    }, 30);
+  }
+
+  // ---------------------------------------------------------------
+  // Lazy loader for the chunked price file.
+  //
+  // The 86 MB price data is split across N chunk files (currently 3,
+  // each ~30 MB) so that no single file exceeds GitHub's 50 MB warning
+  // threshold. Loading order:
+  //
+  //   1. Inject data-afrr-prices-meta.js → defines AFRR_PRICES_META
+  //      (n_entries, n_pos_entries, n_chunks) and resets
+  //      window.AFRR_PRICES_CHUNKS = [].
+  //   2. Inject all chunk files in parallel. Each one assigns its piece
+  //      to AFRR_PRICES_CHUNKS[c] (preserving global order).
+  //   3. After every chunk has fired its onload, concatenate the chunks
+  //      into a single Int32Array per column and expose as
+  //      window.AFRR_PRICES — same shape AfrrSpreadEngine expects.
+  //   4. Free the chunk references so the GC can release them.
+  //
+  // Total transfer is the same 86 MB but split into smaller files, which
+  // also lets the browser fetch them in parallel (faster on multi-conn
+  // hosts) and survive a single chunk's transient failure with a retry.
+  // ---------------------------------------------------------------
+  function loadAfrrPriceData() {
+    if (afrrState.pricesLoaded) {
+      updateAfrrPriceCharts();
+      return;
+    }
+    if (afrrState.pricesLoading) return;
+    afrrState.pricesLoading = true;
+    document.getElementById("g-afrr-prices-loading-card").style.display = "";
+    document.getElementById("g-afrr-prices-loading-status").textContent =
+      "Fetching meta…";
+
+    const cacheVer = "?v=11";
+    const tStart = performance.now();
+
+    // Step 1 — load the tiny meta file
+    const sMeta = document.createElement("script");
+    sMeta.src = "data-afrr-prices-meta.js" + cacheVer;
+    sMeta.onerror = () => {
+      afrrState.pricesLoading = false;
+      document.getElementById("g-afrr-prices-loading-status").textContent =
+        "Failed to load data-afrr-prices-meta.js — check the network tab.";
+    };
+    sMeta.onload = () => {
+      const total = AFRR_PRICES_META.n_chunks;
+      document.getElementById("g-afrr-prices-loading-status").textContent =
+        `Fetching ${total} price chunks (≈ ${total * 30} MB total)…`;
+
+      // Step 2 — inject all chunk scripts in parallel
+      let loadedChunks = 0;
+      let anyFailed = false;
+      function onAnyChunkDone() {
+        document.getElementById("g-afrr-prices-loading-status").textContent =
+          `Loaded ${loadedChunks} / ${total} chunks…`;
+        if (loadedChunks === total && !anyFailed) {
+          // Step 3 — concatenate chunks into the AFRR_PRICES global
+          assembleAfrrPrices();
+          const elapsed = Math.round((performance.now() - tStart) / 1000);
+          document.getElementById("g-afrr-prices-loading-status").textContent =
+            `Loaded ${(AFRR_PRICES.n_entries / 1e6).toFixed(2)} M entries in ${elapsed} s. Rendering…`;
+          AfrrSpreadEngine.init();
+          afrrState.pricesLoaded = true;
+          afrrState.pricesLoading = false;
+          setTimeout(() => {
+            document.getElementById("g-afrr-prices-loading-card").style.display = "none";
+            document.getElementById("g-afrr-prices-section").style.display = "";
+            updateAfrrPriceCharts();
+          }, 60);
+        }
+      }
+      for (let c = 0; c < total; c++) {
+        const idx = String(c + 1).padStart(3, "0");
+        const sc = document.createElement("script");
+        sc.src = `data-afrr-prices-${idx}.js` + cacheVer;
+        sc.onload = () => {
+          loadedChunks++;
+          onAnyChunkDone();
+        };
+        sc.onerror = () => {
+          anyFailed = true;
+          afrrState.pricesLoading = false;
+          document.getElementById("g-afrr-prices-loading-status").textContent =
+            `Failed to load chunk ${idx} — check the network tab.`;
+        };
+        document.head.appendChild(sc);
+      }
+    };
+    document.head.appendChild(sMeta);
+  }
+
+  // Concatenate AFRR_PRICES_CHUNKS[*] into typed arrays and expose as
+  // window.AFRR_PRICES. After this, the chunk references are released so
+  // the GC can reclaim the duplicate memory.
+  function assembleAfrrPrices() {
+    const meta = AFRR_PRICES_META;
+    const chunks = window.AFRR_PRICES_CHUNKS;
+    const isp = new Int32Array(meta.n_entries);
+    const spread = new Int32Array(meta.n_entries);
+    let off = 0;
+    for (let c = 0; c < meta.n_chunks; c++) {
+      const ch = chunks[c];
+      isp.set(ch.isp_idx, off);
+      spread.set(ch.spread_x10, off);
+      off += ch.isp_idx.length;
+    }
+    if (off !== meta.n_entries) {
+      console.warn(
+        `aFRR price chunk concatenation mismatch: got ${off}, expected ${meta.n_entries}`,
+      );
+    }
+    window.AFRR_PRICES = {
+      n_entries: meta.n_entries,
+      n_pos_entries: meta.n_pos_entries,
+      isp_idx: isp,
+      spread_x10: spread,
+    };
+    // Release the chunked plain-array memory; AfrrSpreadEngine reads
+    // window.AFRR_PRICES (the typed-array form) from here on.
+    window.AFRR_PRICES_CHUNKS = null;
+  }
+
+  // Re-render the 9 aFRR price/spread charts. The first 6 (signed-spread
+  // 1-D boxes + heatmaps) honour `afrrState.direction` (all/pos/neg). The
+  // last 3 (matched-by-DA |spread|) are always merged.
+  function updateAfrrPriceCharts() {
+    if (!afrrState.pricesLoaded || !AfrrSpreadEngine.isLoaded()) return;
+    const t0 = performance.now();
+    AfrrSpreadEngine.setBalticThresholds(afrrState.balticDeficit, afrrState.balticSurplus);
+    const dir = afrrState.direction; // 'all' | 'pos' | 'neg'
+    // Winsorize per direction so each view's box plots have a tight Y range
+    AfrrSpreadEngine.maybeWinsorize(afrrState.winsorAfrrLo, afrrState.winsorAfrrHi, dir);
+
+    const wB = afrrState.buckets.wind;
+    const sB = afrrState.buckets.solar;
+    const daB = afrrState.buckets.daBand;
+    const mL = afrrState.buckets.matchedLevels;
+
+    // Direction-specific decoration for titles + Y-axis label
+    const dirSuffix = dir === "all" ? "" : dir === "pos" ? " · POS only (↑)" : " · NEG only (↓)";
+    const aFrrYLabel = dir === "all"
+      ? "Spread: P_aFRR − P_DA (EUR/MWh)"
+      : dir === "pos"
+        ? "Spread: AST_POS − P_DA (EUR/MWh)"
+        : "Spread: AST_NEG − P_DA (EUR/MWh)";
+
+    // 1-D box plots: spread by Baltic wind, surplus / deficit
+    const wSurp = AfrrSpreadEngine.spreadByAxisRegime("wind", "surplus", wB, dir);
+    const wDef = AfrrSpreadEngine.spreadByAxisRegime("wind", "deficit", wB, dir);
+    GraphsCharts.drawSpreadByBucket(
+      "g-afrr-spread-wind-surplus", wSurp, "SURPLUS",
+      "Baltic Day-Ahead Wind Forecast",
+      `SURPLUS — aFRR spread by Wind power${dirSuffix} (n=${wSurp.totalN.toLocaleString()})`,
+      aFrrYLabel,
+    );
+    GraphsCharts.drawSpreadByBucket(
+      "g-afrr-spread-wind-deficit", wDef, "DEFICIT",
+      "Baltic Day-Ahead Wind Forecast",
+      `DEFICIT — aFRR spread by Wind power${dirSuffix} (n=${wDef.totalN.toLocaleString()})`,
+      aFrrYLabel,
+    );
+    // 1-D box plots: spread by solar
+    const sSurp = AfrrSpreadEngine.spreadByAxisRegime("solar", "surplus", sB, dir);
+    const sDef = AfrrSpreadEngine.spreadByAxisRegime("solar", "deficit", sB, dir);
+    GraphsCharts.drawSpreadByBucket(
+      "g-afrr-spread-solar-surplus", sSurp, "SURPLUS",
+      "Baltic Day-Ahead Solar Forecast",
+      `SURPLUS — aFRR spread by Solar power${dirSuffix} (n=${sSurp.totalN.toLocaleString()})`,
+      aFrrYLabel,
+    );
+    GraphsCharts.drawSpreadByBucket(
+      "g-afrr-spread-solar-deficit", sDef, "DEFICIT",
+      "Baltic Day-Ahead Solar Forecast",
+      `DEFICIT — aFRR spread by Solar power${dirSuffix} (n=${sDef.totalN.toLocaleString()})`,
+      aFrrYLabel,
+    );
+    // 2-D heatmaps
+    const hDef = AfrrSpreadEngine.spreadByWindSolarRegime("deficit", wB, sB, dir);
+    const hSurp = AfrrSpreadEngine.spreadByWindSolarRegime("surplus", wB, sB, dir);
+    GraphsCharts.drawWindSolarHeatmap(
+      "g-afrr-heatmap-deficit", hDef, "DEFICIT",
+      `DEFICIT — aFRR spread by Wind × Solar${dirSuffix} (${wB}×${sB} bins)`,
+    );
+    GraphsCharts.drawWindSolarHeatmap(
+      "g-afrr-heatmap-surplus", hSurp, "SURPLUS",
+      `SURPLUS — aFRR spread by Wind × Solar${dirSuffix} (${wB}×${sB} bins)`,
+    );
+    // Matched-by-DA |spread| panels — INTENTIONALLY direction-agnostic
+    // (always merged) because they look at absolute spread anyway.
+    const mWind = AfrrSpreadEngine.absSpreadByWindMatchedByDABand(daB, mL);
+    const mSolar = AfrrSpreadEngine.absSpreadBySolarMatchedByDABand(daB, mL);
+    const mRenew = AfrrSpreadEngine.absSpreadByRenewablesMatchedByDABand(daB, mL);
+    GraphsCharts.drawAbsSpreadMatchedPanels(
+      "g-afrr-matched-wind", mWind,
+      `|aFRR spread| by Wind Level — Matched by DA Price Band (${daB} panels × ${mL} levels)`,
+    );
+    GraphsCharts.drawAbsSpreadMatchedPanels(
+      "g-afrr-matched-solar", mSolar,
+      `|aFRR spread| by Solar Level — Matched by DA Price Band (${daB} panels × ${mL} levels)`,
+    );
+    GraphsCharts.drawAbsSpreadMatchedPanels(
+      "g-afrr-matched-renew", mRenew,
+      `|aFRR spread| by Renewables Level — Matched by DA Price Band (${daB} panels × ${mL} levels)`,
+    );
+    const ms = Math.round(performance.now() - t0);
+    document.getElementById("g-afrr-progress").textContent =
+      `done in ${ms} ms (direction = ${dir})`;
+  }
+
+  function bindAfrrControls() {
+    // Sim range
+    const fromEl = document.getElementById("g-afrr-sim-from");
+    const toEl = document.getElementById("g-afrr-sim-to");
+    const onSim = () => {
+      let f = clampAfrrDate(parseEU(fromEl.value) || afrrMinDate);
+      let t = clampAfrrDate(parseEU(toEl.value) || afrrMaxDate);
+      if (f > t) [f, t] = [t, f];
+      fromEl.value = isoToEU(f);
+      toEl.value = isoToEU(t);
+      afrrState.sim = { from: f, to: t };
+      scheduleAfrrUpdate();
+    };
+    fromEl.addEventListener("change", onSim);
+    toEl.addEventListener("change", onSim);
+    document.getElementById("g-afrr-sim-reset").addEventListener("click", () => {
+      fromEl.value = isoToEU(afrrMinDate);
+      toEl.value = isoToEU(afrrMaxDate);
+      onSim();
+    });
+    // Winsor
+    const winLo = document.getElementById("g-afrr-winsor-lo");
+    const winHi = document.getElementById("g-afrr-winsor-hi");
+    const onWin = () => {
+      afrrState.winsorAfrrLo = Math.max(0, Math.min(50, parseFloat(winLo.value) || 0));
+      afrrState.winsorAfrrHi = Math.max(50, Math.min(100, parseFloat(winHi.value) || 100));
+      winLo.value = afrrState.winsorAfrrLo;
+      winHi.value = afrrState.winsorAfrrHi;
+      scheduleAfrrUpdate();
+    };
+    winLo.addEventListener("change", onWin);
+    winHi.addEventListener("change", onWin);
+    // LV thresholds
+    const lvDef = document.getElementById("g-afrr-lv-def-thr");
+    const lvSur = document.getElementById("g-afrr-lv-sur-thr");
+    const onLv = () => {
+      let d = parseFloat(lvDef.value);
+      let s = parseFloat(lvSur.value);
+      if (isNaN(d)) d = 0;
+      if (isNaN(s)) s = 0;
+      if (d > s) [d, s] = [s, d];
+      lvDef.value = d;
+      lvSur.value = s;
+      afrrState.lvDeficit = d;
+      afrrState.lvSurplus = s;
+      scheduleAfrrUpdate();
+    };
+    lvDef.addEventListener("change", onLv);
+    lvSur.addEventListener("change", onLv);
+    // Baltic thresholds
+    const balDef = document.getElementById("g-afrr-bal-def-thr");
+    const balSur = document.getElementById("g-afrr-bal-sur-thr");
+    const onBal = () => {
+      let d = parseFloat(balDef.value);
+      let s = parseFloat(balSur.value);
+      if (isNaN(d)) d = 0;
+      if (isNaN(s)) s = 0;
+      if (d > s) [d, s] = [s, d];
+      balDef.value = d;
+      balSur.value = s;
+      afrrState.balticDeficit = d;
+      afrrState.balticSurplus = s;
+      scheduleAfrrUpdate();
+    };
+    balDef.addEventListener("change", onBal);
+    balSur.addEventListener("change", onBal);
+    // Rest-of-Baltic thresholds (EE+LT, used only by divergence chart)
+    const restDef = document.getElementById("g-afrr-rest-def-thr");
+    const restSur = document.getElementById("g-afrr-rest-sur-thr");
+    const onRest = () => {
+      let d = parseFloat(restDef.value);
+      let s = parseFloat(restSur.value);
+      if (isNaN(d)) d = 0;
+      if (isNaN(s)) s = 0;
+      if (d > s) [d, s] = [s, d];
+      restDef.value = d;
+      restSur.value = s;
+      afrrState.restDeficit = d;
+      afrrState.restSurplus = s;
+      scheduleAfrrUpdate();
+    };
+    restDef.addEventListener("change", onRest);
+    restSur.addEventListener("change", onRest);
+    // Bucket counts (price charts only) — same pattern as the mFRR section
+    for (const key of ["wind", "solar", "daBand", "matchedLevels"]) {
+      const slider = document.getElementById(`g-afrr-buck-${key}`);
+      const num = document.getElementById(`g-afrr-buck-${key}-num`);
+      if (!slider || !num) continue;
+      const onSet = (raw) => {
+        let v = parseInt(raw, 10);
+        if (isNaN(v)) return;
+        v = Math.max(2, Math.min(parseInt(slider.max, 10), v));
+        slider.value = v;
+        num.value = v;
+        afrrState.buckets[key] = v;
+        // Bucket changes only matter to the price charts; if those haven't
+        // been loaded yet we defer until they are.
+        if (afrrState.pricesLoaded) updateAfrrPriceCharts();
+      };
+      slider.addEventListener("input", (e) => onSet(e.target.value));
+      num.addEventListener("change", (e) => onSet(e.target.value));
+    }
+    // Recompute
+    document.getElementById("g-afrr-recompute").addEventListener("click", () => {
+      updateAfrr();
+      // Also kick the price file load if user is asking for a full refresh
+      if (afrrState.pricesLoaded) updateAfrrPriceCharts();
+      else loadAfrrPriceData();
+    });
+
+    // Direction toggle (POS / NEG / All) for the signed-spread charts.
+    // Buttons live in graphs.html under #g-afrr-prices-section. They're
+    // present in the DOM at all times (just hidden until prices load), so
+    // we can bind once at page init.
+    document.querySelectorAll(".direction-toggle .preset[data-direction]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const newDir = btn.dataset.direction;
+        if (afrrState.direction === newDir) return; // no-op
+        afrrState.direction = newDir;
+        document
+          .querySelectorAll(".direction-toggle .preset[data-direction]")
+          .forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        if (afrrState.pricesLoaded) updateAfrrPriceCharts();
+      });
+    });
+  }
+
+  function renderAfrrCards() {
+    document.getElementById("g-afrr-setup-params").innerHTML = afrrSetupHTML();
+  }
+
   // ---------- tabs -------------------------------------------------------
+  // Cleared on every render to avoid duplicate listeners. Each tab's update
+  // fires when it's activated (the engine window is shared, so we need to
+  // re-pin it whenever we switch to a tab).
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
-      document.getElementById(`panel-${btn.dataset.section}`).classList.add("active");
+      const section = btn.dataset.section;
+      document.getElementById(`panel-${section}`).classList.add("active");
+      // Re-pin the engine window to whichever tab we just activated
+      if (section === "afrr") {
+        scheduleAfrrUpdate();
+        // Kick off the lazy load of the 86 MB price file in the background.
+        // Safe to call repeatedly — early-returns if already loaded/loading.
+        loadAfrrPriceData();
+      } else {
+        scheduleUpdate();
+      }
     });
   });
 
   // ---------- init -------------------------------------------------------
   renderCards();
   bindControls();
+  renderAfrrCards();
+  bindAfrrControls();
   updateAll();
+  // Pre-compute aFRR so switching tabs is instant
+  setTimeout(updateAfrr, 200);
 })();

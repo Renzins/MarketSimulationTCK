@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Graphs</title>
-    <link rel="stylesheet" href="style.css?v=5" />
+    <link rel="stylesheet" href="style.css?v=11" />
   </head>
   <body>
     <nav class="site-nav">
@@ -157,23 +157,200 @@
       </section>
 
       <!-- =================================================================
-           aFRR SECTION (placeholder)
+           aFRR SECTION
            ================================================================= -->
       <section id="panel-afrr" class="panel">
-        <div class="card placeholder-card">
-          <h2>aFRR — coming soon</h2>
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Same shape of parameters as the mFRR section (date range,
+                winsorization, regime thresholds) — but the date range is
+                clamped to the aFRR data extent (2025-05-01 onward) and a
+                separate set of LV-imbalance thresholds is added so the
+                "by Latvia" vs "by Baltic" charts can use different cuts.
+              </p>
+            </div>
+            <div class="controls-grid" id="g-afrr-setup-params"></div>
+          </div>
+
+          <div class="actions">
+            <button id="g-afrr-recompute" class="btn primary">↻ Recompute</button>
+            <span id="g-afrr-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <!-- ===== Activation rate by LV imbalance regime ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>aFRR activation rate — by Latvia imbalance</h2>
+          </div>
           <p class="card-desc">
-            aFRR-specific data (activated volumes / local-marginal prices
-            split by direction with the same kind of resolution as mFRR
-            scheduled-activation prices) is not yet present in the dataset.
-            This section is reserved so that, once the data lands, the same
-            box-plot / heatmap analyses can be plugged in here.
+            For every 4-second aFRR slot in the chosen window, count whether
+            <em>any direction</em> had a price (activated) or both prices
+            were missing (not activated). Bars are split by the
+            <b>LV-only</b> imbalance regime — so we're asking
+            "does aFRR fire more during Latvian surplus or Latvian deficit?"
           </p>
+          <div id="g-afrr-bars-lv" class="chart"></div>
+        </div>
+
+        <!-- ===== Activation rate by Baltic imbalance regime ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>aFRR activation rate — by Baltic imbalance</h2>
+          </div>
           <p class="card-desc">
-            Existing aFRR LMP columns in the source CSV are sparse and
-            largely zero-filled, so they wouldn't produce meaningful plots
-            today.
+            Same data as the previous chart, but classified by the
+            <b>full Baltic</b> imbalance volume (LV + EE + LT). Comparing
+            this chart with the Latvia-only one tells you whether aFRR
+            activation tracks the Latvian view or the wider Baltic view.
           </p>
+          <div id="g-afrr-bars-baltic" class="chart"></div>
+        </div>
+
+        <!-- ===== Divergence: LV vs rest-of-Baltic disagree ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>aFRR activation rate — when LV and the rest of Baltic disagree</h2>
+          </div>
+          <p class="card-desc">
+            Looks specifically at periods where Latvia's imbalance and the
+            rest of the Baltic (EE + LT) point in <em>opposite</em> directions
+            — i.e. the synchronous area is split. Two bars:
+            <b>LV+ / rest−</b> (Latvia surplus while EE+LT in deficit) and
+            <b>LV− / rest+</b> (Latvia deficit while EE+LT in surplus).
+            If aFRR direction tracks the dominant area, the bars favour the
+            colour matching the <em>rest-of-Baltic</em> sign; if it tracks
+            Latvia specifically, they favour the LV sign. Uses the LV
+            thresholds plus a separate rest-of-Baltic pair (default ±20 MW —
+            EE+LT alone is ≈ 2/3 the magnitude of full Baltic).
+          </p>
+          <div id="g-afrr-bars-divergence" class="chart"></div>
+        </div>
+
+        <!-- ============================================================
+             aFRR PRICE / SPREAD CHARTS
+             — same shape as the mFRR section but using aFRR prices.
+             — uses Baltic-level imbalance only (per request).
+             — every 4-second slot contributes a spread; both POS and NEG
+               directions merged into one distribution per chart.
+             — data-afrr-prices.js (86 MB) is lazy-loaded on first use.
+             ============================================================ -->
+        <div class="card placeholder-card" id="g-afrr-prices-loading-card" style="display: none">
+          <h2>Loading aFRR price data…</h2>
+          <p class="card-desc">
+            The aFRR price file is large (~86 MB raw, ~25-35 MB gzipped).
+            It loads on demand the first time you scroll to these charts;
+            once cached the page loads instantly.
+          </p>
+          <p class="card-desc" id="g-afrr-prices-loading-status">Fetching…</p>
+        </div>
+
+        <div id="g-afrr-prices-section" style="display: none">
+          <!-- ===== Direction toggle =====
+               Affects only the SIGNED-spread charts below (1-D box plots and
+               heatmaps). The matched-by-DA |spread| charts at the bottom
+               remain merged because they look at absolute spread anyway. -->
+          <div class="card direction-toggle-card">
+            <div class="card-head">
+              <h2 class="small-h2">Direction filter <span class="badge">signed-spread charts only</span></h2>
+            </div>
+            <p class="card-desc">
+              Splits the merged spread distribution by aFRR direction. Each 4 s
+              slot still contributes once per non-null direction, but only the
+              selected direction is shown on the SIGNED-spread charts below
+              (wind/solar 1-D boxes and Wind×Solar heatmaps). The
+              <em>|aFRR spread|</em> matched-by-DA charts further down stay
+              merged because they look at absolute spread.
+            </p>
+            <div class="direction-toggle">
+              <button class="btn small preset active" data-direction="all">All (merged)</button>
+              <button class="btn small preset" data-direction="pos">↑ POS only (upward)</button>
+              <button class="btn small preset" data-direction="neg">↓ NEG only (downward)</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>aFRR spread by Baltic Wind Forecast — by regime</h2>
+            </div>
+            <p class="card-desc">
+              Box plots of the merged aFRR spread (price − P<sub>DA</sub>),
+              split into wind-forecast quantile bins. Each 4-second slot
+              with at least one direction priced contributes one entry
+              (slots with both POS and NEG active contribute both). Bin
+              boundaries are derived from the ISP-level wind distribution
+              <em>within the chosen regime</em>, matching the mFRR section.
+            </p>
+            <div class="two-col">
+              <div id="g-afrr-spread-wind-surplus" class="chart"></div>
+              <div id="g-afrr-spread-wind-deficit" class="chart"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>aFRR spread by Baltic Solar Forecast — by regime</h2>
+            </div>
+            <p class="card-desc">
+              Same idea as the wind-binned plots, but using the Baltic-level
+              solar day-ahead forecast as the x-axis.
+            </p>
+            <div class="two-col">
+              <div id="g-afrr-spread-solar-surplus" class="chart"></div>
+              <div id="g-afrr-spread-solar-deficit" class="chart"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>aFRR spread by Wind × Solar — by regime</h2>
+            </div>
+            <p class="card-desc">
+              Median aFRR spread for every (wind bin × solar bin) cell.
+              Each cell shows median, mean, σ and total 4-s sample count.
+            </p>
+            <div class="two-col">
+              <div id="g-afrr-heatmap-deficit" class="chart"></div>
+              <div id="g-afrr-heatmap-surplus" class="chart"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>|aFRR spread| by Wind Level — Matched by DA Price Band</h2>
+            </div>
+            <p class="card-desc">
+              One panel per DA-price quantile band. Within each panel, the
+              Baltic wind forecast is split into Low / Mid / High by global
+              quantiles. y-axis is |spread| so this view shows volatility
+              rather than direction.
+            </p>
+            <div id="g-afrr-matched-wind" class="chart wide"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>|aFRR spread| by Solar Level — Matched by DA Price Band</h2>
+            </div>
+            <p class="card-desc">
+              Same layout as the wind version, but the level axis splits by
+              Baltic solar day-ahead forecast.
+            </p>
+            <div id="g-afrr-matched-solar" class="chart wide"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>|aFRR spread| by Renewables Level — Matched by DA Price Band</h2>
+            </div>
+            <p class="card-desc">
+              Combines wind + solar into a single Baltic renewables axis.
+            </p>
+            <div id="g-afrr-matched-renew" class="chart wide"></div>
+          </div>
         </div>
       </section>
     </main>
@@ -189,10 +366,14 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="data.js?v=5"></script>
-    <script src="engine.js?v=5"></script>
-    <script src="graphs-engine.js?v=5"></script>
-    <script src="graphs-charts.js?v=5"></script>
-    <script src="graphs-app.js?v=5"></script>
+    <script src="data.js?v=11"></script>
+    <script src="data-afrr.js?v=11"></script>
+    <script src="engine.js?v=11"></script>
+    <script src="graphs-engine.js?v=11"></script>
+    <script src="graphs-charts.js?v=11"></script>
+    <script src="afrr-engine.js?v=11"></script>
+    <script src="afrr-charts.js?v=11"></script>
+    <script src="afrr-spread-engine.js?v=11"></script>
+    <script src="graphs-app.js?v=11"></script>
   </body>
 </html>
