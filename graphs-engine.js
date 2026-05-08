@@ -48,6 +48,11 @@ const GraphsEngine = (() => {
       D.baltic_wind_da = new Float32Array(WIND_DATA.baltic_wind_da);
       D.baltic_solar_da = new Float32Array(WIND_DATA.baltic_solar_da);
       D.baltic_imb_vol = new Float32Array(WIND_DATA.baltic_imb_vol);
+      // LV-only imbalance volume (used by the aFRR section's LV-vs-Baltic
+      // regime comparison). Older data.js may not have this key.
+      if (WIND_DATA.lv_imb_vol) {
+        D.lv_imb_vol = new Float32Array(WIND_DATA.lv_imb_vol);
+      }
     }
     spread = new Float32Array(D.n);
     spread_w = new Float32Array(D.n);

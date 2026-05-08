@@ -15,7 +15,12 @@
       "Bash(curl -s http://localhost:8770/data.js)",
       "Bash(awk '{print $5, $9}')",
       "Bash(sort -k2)",
-      "Bash(python tests.py)"
+      "Bash(python tests.py)",
+      "Bash(python preprocess-afrr.py)",
+      "Bash(awk '{printf \"%-40s %s\\\\n\", $9, $5}')",
+      "Bash(awk '{print $5, $NF}')",
+      "Bash(sort -k5 -h)",
+      "Bash(grep -E \"\\\\.csv$\")"
     ]
   }
 }

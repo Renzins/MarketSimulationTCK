@@ -1,0 +1,22 @@
+# Raw input CSVs (build-time inputs to preprocess*.py).
+# These can exceed GitHub's 100 MB per-file hard limit.
+# Regenerate the .js data files locally with:
+#   python preprocess.py
+#   python preprocess-afrr.py
+ast_afrr_data.csv
+main_data_with_imbalance.csv
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only
+.claude/settings.local.json

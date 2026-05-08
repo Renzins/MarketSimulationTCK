@@ -5,6 +5,7 @@ Covers:
 
   A. DATA INTEGRITY
      - Baltic aggregations are exact sums of LV + EE + LT
+     - LV imbalance volume equals imbalance_volume_lv from CSV
      - Spread = mFRR_SA − DA, agrees with CSV
      - NaN handling: April rows present, p_imb is null where the source said NaN
      - Timestamps: offsets monotonic, ts(i) = start + offset[i] · 15 min
@@ -33,6 +34,14 @@ Covers:
      - Naive L1 + L2 figures
      - Counts: ISPs short, total shortfall MWh
 
+  F. aFRR DATA (when data-afrr.js is present)
+     - data-afrr.js keys present, length matches main data n
+     - n_total ≤ 225 (15-min × 60 sec / 4-sec resolution)
+     - n_pos ≤ n_total, n_neg ≤ n_total, n_any ≤ n_total
+     - max(n_pos, n_neg) ≤ n_any ≤ n_pos + n_neg (set algebra)
+     - ISPs before 2025-05-01 have n_total = 0 (aFRR data starts then)
+     - For 30 random ISPs: per-ISP counts equal direct count from CSV slice
+
 Run:  python tests.py
 Exit code 0 = all green; >0 = N failures.
 """
@@ -56,6 +65,18 @@ if sys.stdout.encoding != "utf-8":
 BASE = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE, "main_data_with_imbalance.csv")
 DATA_JS_PATH = os.path.join(BASE, "data.js")
+AFRR_CSV_PATH = os.path.join(BASE, "ast_afrr_data.csv")
+DATA_AFRR_JS_PATH = os.path.join(BASE, "data-afrr.js")
+# Per-slot price file is now CHUNKED. The meta file is tiny; the chunks
+# (data-afrr-prices-001.js, ...-002.js, ...) each hold a slice of the
+# parallel arrays. Tests load all chunks and concatenate, so they see the
+# same shape the in-browser loader produces at runtime.
+DATA_AFRR_PRICES_META_PATH = os.path.join(BASE, "data-afrr-prices-meta.js")
+import glob as _glob
+
+_DATA_AFRR_PRICES_CHUNK_PATHS = sorted(
+    _glob.glob(os.path.join(BASE, "data-afrr-prices-[0-9][0-9][0-9].js"))
+)
 
 # Tolerance for float comparisons (€ totals can drift by sub-cent due to rounding).
 EUR_TOL = 1.0
@@ -710,6 +731,289 @@ def test_da_forecast_nonneg():
 
 
 # =============================================================================
+#  F. aFRR DATA INTEGRITY (only if data-afrr.js exists)
+# =============================================================================
+HAS_AFRR = os.path.exists(DATA_AFRR_JS_PATH)
+if HAS_AFRR:
+    print("Loading data-afrr.js…")
+    with open(DATA_AFRR_JS_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    AFRR = json.loads(text[text.index("{") : text.rindex("}") + 1])
+    print(
+        f"  data-afrr.js: n = {AFRR['n']}, range = {AFRR['afrr_start_iso']} → {AFRR['afrr_end_iso']}"
+    )
+else:
+    print("data-afrr.js not found — skipping aFRR tests.")
+    AFRR = None
+
+
+def test_lv_imb_vol_equals_csv_lv():
+    """lv_imb_vol[i] in data.js must equal imbalance_volume_lv from CSV."""
+    if "lv_imb_vol" not in DATA:
+        raise AssertionError("data.js is missing lv_imb_vol — re-run preprocess.py")
+    lv = np.asarray(DATA["lv_imb_vol"])
+    rng = np.random.default_rng(50)
+    sample = rng.choice(DATA["n"], size=200, replace=False)
+    for i in sample:
+        ts = DATA_TS[i]
+        row = CSV_BY_TS.loc[ts]
+        expected = row["imbalance_volume_lv"]
+        assert abs(lv[i] - expected) <= 0.01, (
+            f"Row {i} ts={ts}: lv_imb_vol={lv[i]:.3f} but expected {expected:.3f}"
+        )
+
+
+def test_afrr_data_schema():
+    """data-afrr.js must have all required keys and matching length."""
+    if not HAS_AFRR:
+        return
+    for k in ["n", "afrr_start_iso", "afrr_end_iso", "n_total", "n_pos", "n_neg", "n_any"]:
+        assert k in AFRR, f"data-afrr.js missing key '{k}'"
+    n = AFRR["n"]
+    assert n == DATA["n"], f"aFRR n={n} mismatches main data n={DATA['n']}"
+    for k in ["n_total", "n_pos", "n_neg", "n_any"]:
+        assert len(AFRR[k]) == n, f"aFRR '{k}' length {len(AFRR[k])} ≠ {n}"
+
+
+def test_afrr_count_invariants():
+    """For every ISP: max(n_pos,n_neg) ≤ n_any ≤ n_total ≤ 225 ; n_any ≤ n_pos+n_neg."""
+    if not HAS_AFRR:
+        return
+    n_total = np.asarray(AFRR["n_total"])
+    n_pos = np.asarray(AFRR["n_pos"])
+    n_neg = np.asarray(AFRR["n_neg"])
+    n_any = np.asarray(AFRR["n_any"])
+    assert n_total.max() <= 225, f"n_total > 225 found (max {n_total.max()})"
+    assert (n_pos <= n_total).all(), "n_pos > n_total in some row"
+    assert (n_neg <= n_total).all(), "n_neg > n_total in some row"
+    assert (n_any <= n_total).all(), "n_any > n_total in some row"
+    assert (np.maximum(n_pos, n_neg) <= n_any).all(), (
+        "max(n_pos,n_neg) > n_any in some row"
+    )
+    # Set algebra: |A∪B| ≤ |A|+|B| ; with non-negative ints this is always true,
+    # so we additionally check |A∪B| = |A|+|B| - |A∩B| ≥ max(|A|,|B|) (already done above)
+    assert (n_any <= n_pos + n_neg).all(), "n_any > n_pos + n_neg in some row"
+
+
+def test_afrr_pre_may2025_is_zero():
+    """ISPs before 2025-05-01 (when aFRR data starts) must have n_total = 0."""
+    if not HAS_AFRR:
+        return
+    n_total = np.asarray(AFRR["n_total"])
+    cutoff = pd.Timestamp("2025-05-01 00:00:00")
+    pre_mask = DATA_TS < cutoff
+    n_pre = pre_mask.sum()
+    n_pre_with_data = (n_total[pre_mask] > 0).sum()
+    assert n_pre_with_data == 0, (
+        f"{n_pre_with_data} of {n_pre} ISPs before 2025-05-01 have aFRR data — should be 0"
+    )
+
+
+def test_afrr_aggregation_correctness():
+    """For 30 random ISPs WITH aFRR data, the per-ISP counts in data-afrr.js
+    must match a direct count from the source CSV (chunk-read the slice)."""
+    if not HAS_AFRR or not os.path.exists(AFRR_CSV_PATH):
+        return
+    n_total = np.asarray(AFRR["n_total"])
+    rng = np.random.default_rng(60)
+    candidate_idxs = np.where(n_total > 0)[0]
+    sample = rng.choice(candidate_idxs, size=30, replace=False)
+    # Read the CSV in chunks, building the slices we care about
+    target_ranges = []
+    for i in sample:
+        ts0 = DATA_TS[i]
+        ts1 = ts0 + pd.Timedelta(minutes=15)
+        target_ranges.append((i, ts0, ts1))
+    # Single CSV read — this is slow (~3s) but only runs in the test pass
+    afrr_df = pd.read_csv(AFRR_CSV_PATH, dtype={"AST_POS": "float32", "AST_NEG": "float32"})
+    afrr_df["ts"] = pd.to_datetime(afrr_df["DATETIME_UTC"])
+    afrr_df["ts_naive"] = afrr_df["ts"].dt.tz_localize(None)
+    for i, ts0, ts1 in target_ranges:
+        slice_ = afrr_df[(afrr_df["ts_naive"] >= ts0) & (afrr_df["ts_naive"] < ts1)]
+        expected_total = len(slice_)
+        expected_pos = slice_["AST_POS"].notna().sum()
+        expected_neg = slice_["AST_NEG"].notna().sum()
+        expected_any = (slice_["AST_POS"].notna() | slice_["AST_NEG"].notna()).sum()
+        assert AFRR["n_total"][i] == expected_total, (
+            f"ISP {i}: n_total={AFRR['n_total'][i]} but CSV slice has {expected_total} rows"
+        )
+        assert AFRR["n_pos"][i] == expected_pos
+        assert AFRR["n_neg"][i] == expected_neg
+        assert AFRR["n_any"][i] == expected_any
+
+
+def test_afrr_n_total_typically_225():
+    """For ISPs in the aFRR window, the typical n_total should be 225 (4s × 225 = 15min)."""
+    if not HAS_AFRR:
+        return
+    n_total = np.asarray(AFRR["n_total"])
+    in_range = n_total > 0
+    median = int(np.median(n_total[in_range]))
+    assert median == 225, f"Expected median n_total = 225, got {median}"
+
+
+# =============================================================================
+#  G. aFRR PRICE-SPREAD FILES (chunked) — only if all chunks present
+# =============================================================================
+HAS_AFRR_PRICES = (
+    os.path.exists(DATA_AFRR_PRICES_META_PATH)
+    and len(_DATA_AFRR_PRICES_CHUNK_PATHS) > 0
+)
+if HAS_AFRR_PRICES:
+    print(
+        f"Loading chunked data-afrr-prices ({len(_DATA_AFRR_PRICES_CHUNK_PATHS)} chunks)…"
+    )
+    # Read meta first
+    with open(DATA_AFRR_PRICES_META_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    AFRR_PRICES_META_OBJ = json.loads(text[text.index("{") : text.rindex("}") + 1])
+    # Read each chunk and concatenate into a single dict matching the
+    # in-browser AFRR_PRICES shape. Chunks are read in lexicographic order,
+    # which is the same order the JS loader concatenates them.
+    isp_acc = []
+    spread_acc = []
+    for path in _DATA_AFRR_PRICES_CHUNK_PATHS:
+        with open(path, "r", encoding="utf-8") as f:
+            ctext = f.read()
+        chunk = json.loads(ctext[ctext.index("{") : ctext.rindex("}") + 1])
+        isp_acc.extend(chunk["isp_idx"])
+        spread_acc.extend(chunk["spread_x10"])
+    AFRR_PRICES_OBJ = {
+        "n_entries": AFRR_PRICES_META_OBJ["n_entries"],
+        "n_pos_entries": AFRR_PRICES_META_OBJ["n_pos_entries"],
+        "isp_idx": isp_acc,
+        "spread_x10": spread_acc,
+    }
+    print(
+        f"  reassembled {len(isp_acc):,} entries from "
+        f"{len(_DATA_AFRR_PRICES_CHUNK_PATHS)} chunks"
+    )
+else:
+    AFRR_PRICES_META_OBJ = None
+    AFRR_PRICES_OBJ = None
+
+
+def test_afrr_prices_schema():
+    """Reassembled price data has all required keys and parallel-array lengths match."""
+    if not HAS_AFRR_PRICES:
+        return
+    for k in ["n_entries", "n_pos_entries", "isp_idx", "spread_x10"]:
+        assert k in AFRR_PRICES_OBJ, f"reassembled price obj missing '{k}'"
+    n = AFRR_PRICES_OBJ["n_entries"]
+    assert len(AFRR_PRICES_OBJ["isp_idx"]) == n, (
+        f"isp_idx length {len(AFRR_PRICES_OBJ['isp_idx'])} != n_entries {n}"
+    )
+    assert len(AFRR_PRICES_OBJ["spread_x10"]) == n
+
+
+def test_afrr_prices_chunks_under_50mb():
+    """Each chunk file should be ≤ 50 MB so GitHub doesn't warn (or 100 MB hard-fail)."""
+    if not HAS_AFRR_PRICES:
+        return
+    GH_WARNING_MB = 50
+    for path in _DATA_AFRR_PRICES_CHUNK_PATHS:
+        sz_mb = os.path.getsize(path) / (1024 * 1024)
+        assert sz_mb < GH_WARNING_MB, (
+            f"{os.path.basename(path)} is {sz_mb:.1f} MB — GitHub warns above "
+            f"{GH_WARNING_MB} MB. Lower PRICES_CHUNK_TARGET_MB in preprocess-afrr.py."
+        )
+
+
+def test_afrr_prices_meta_n_chunks_matches_files():
+    """AFRR_PRICES_META.n_chunks must equal the number of chunk files on disk."""
+    if not HAS_AFRR_PRICES:
+        return
+    declared = AFRR_PRICES_META_OBJ["n_chunks"]
+    on_disk = len(_DATA_AFRR_PRICES_CHUNK_PATHS)
+    assert declared == on_disk, (
+        f"meta declares {declared} chunks but {on_disk} chunk files exist on disk"
+    )
+
+
+def test_afrr_prices_pos_neg_boundary():
+    """n_pos_entries must equal sum(n_pos), so the [0, n_pos) prefix is POS."""
+    if not HAS_AFRR_PRICES or not HAS_AFRR:
+        return
+    expected = int(sum(AFRR["n_pos"]))
+    got = AFRR_PRICES_OBJ["n_pos_entries"]
+    assert got == expected, (
+        f"n_pos_entries = {got:,}, expected sum(n_pos) = {expected:,}"
+    )
+    # And the remainder must equal sum(n_neg)
+    n_neg_in_file = AFRR_PRICES_OBJ["n_entries"] - got
+    expected_neg = int(sum(AFRR["n_neg"]))
+    assert n_neg_in_file == expected_neg, (
+        f"NEG-section length {n_neg_in_file:,}, expected sum(n_neg) = {expected_neg:,}"
+    )
+
+
+def test_afrr_prices_total_matches_counts():
+    """Total entries in price file == sum(n_pos + n_neg) from data-afrr.js.
+    (Each non-null direction-slot produces one entry; both-active contributes two.)"""
+    if not HAS_AFRR_PRICES or not HAS_AFRR:
+        return
+    expected = int(sum(AFRR["n_pos"]) + sum(AFRR["n_neg"]))
+    got = AFRR_PRICES_OBJ["n_entries"]
+    assert got == expected, (
+        f"price file has {got:,} entries, expected {expected:,} = sum(n_pos)+sum(n_neg)"
+    )
+
+
+def test_afrr_prices_isp_indices_in_range():
+    """Every ISP index in the price file must be in [0, n_isps)."""
+    if not HAS_AFRR_PRICES:
+        return
+    n = DATA["n"]
+    isp = np.asarray(AFRR_PRICES_OBJ["isp_idx"])
+    assert isp.min() >= 0
+    assert isp.max() < n
+
+
+def test_afrr_prices_only_active_isps():
+    """ISPs referenced by the price file must have n_total > 0 in data-afrr.js."""
+    if not HAS_AFRR_PRICES or not HAS_AFRR:
+        return
+    isp = np.asarray(AFRR_PRICES_OBJ["isp_idx"])
+    n_total = np.asarray(AFRR["n_total"])
+    referenced = np.unique(isp)
+    bad = referenced[n_total[referenced] == 0]
+    assert len(bad) == 0, (
+        f"{len(bad)} ISPs have entries in price file but n_total=0 in data-afrr.js"
+    )
+
+
+def test_afrr_prices_per_isp_count_matches():
+    """For 30 random ISPs, the count of price entries == n_pos[i] + n_neg[i]."""
+    if not HAS_AFRR_PRICES or not HAS_AFRR:
+        return
+    isp = np.asarray(AFRR_PRICES_OBJ["isp_idx"])
+    n_pos = np.asarray(AFRR["n_pos"])
+    n_neg = np.asarray(AFRR["n_neg"])
+    rng = np.random.default_rng(70)
+    candidates = np.where((n_pos + n_neg) > 0)[0]
+    sample = rng.choice(candidates, size=30, replace=False)
+    # Bincount only the sampled indices
+    for i in sample:
+        cnt = int(np.sum(isp == i))
+        expected = int(n_pos[i] + n_neg[i])
+        assert cnt == expected, (
+            f"ISP {i}: price file has {cnt} entries, expected {expected} = n_pos+n_neg"
+        )
+
+
+def test_afrr_prices_spread_sign_check():
+    """Sanity: spread = price - p_da. Verify on a few sampled entries by checking
+    that for the typical aFRR POS price (~117 EUR/MWh) and median DA (~85),
+    median spread is in a reasonable band (e.g. -200..+200 after merging POS/NEG)."""
+    if not HAS_AFRR_PRICES:
+        return
+    spread = np.asarray(AFRR_PRICES_OBJ["spread_x10"], dtype=np.float64) / 10.0
+    median = float(np.median(spread))
+    # POS-DA median ≈ +32, NEG-DA median ≈ -52, merged ≈ somewhere in between.
+    assert -100 < median < 100, f"Merged spread median {median:+.1f} out of plausible band"
+
+
+# =============================================================================
 #  Register & run
 # =============================================================================
 # A. Data integrity
@@ -749,6 +1053,27 @@ R.add("Baltic imbalance is zero-centred", test_baltic_imb_vol_zero_centered)
 R.add("data.js has all required columns + lengths", test_data_js_required_columns)
 R.add("Q_pot ≥ 0 and ≤ installed capacity", test_no_negative_q_pot)
 R.add("DA forecast ≥ 0 and ≤ capacity", test_da_forecast_nonneg)
+
+# F. aFRR data integrity (skipped automatically if data-afrr.js not present)
+R.add("lv_imb_vol equals CSV imbalance_volume_lv", test_lv_imb_vol_equals_csv_lv)
+if HAS_AFRR:
+    R.add("data-afrr.js schema is consistent with data.js", test_afrr_data_schema)
+    R.add("aFRR count invariants (n_total ≤ 225, n_any ≤ n_total, etc.)", test_afrr_count_invariants)
+    R.add("aFRR pre-2025-05-01 ISPs have n_total = 0", test_afrr_pre_may2025_is_zero)
+    R.add("aFRR per-ISP counts match direct CSV slice (30 random ISPs)", test_afrr_aggregation_correctness)
+    R.add("aFRR median n_total = 225 (15min × 60s / 4s)", test_afrr_n_total_typically_225)
+
+# G. aFRR price-spread file (large; only if data-afrr-prices.js exists)
+if HAS_AFRR_PRICES:
+    R.add("reassembled aFRR prices schema (parallel arrays, n_entries)", test_afrr_prices_schema)
+    R.add("each chunk file ≤ 50 MB (GitHub-friendly)", test_afrr_prices_chunks_under_50mb)
+    R.add("meta n_chunks matches number of chunk files on disk", test_afrr_prices_meta_n_chunks_matches_files)
+    R.add("n_pos_entries equals sum(n_pos); remainder equals sum(n_neg)", test_afrr_prices_pos_neg_boundary)
+    R.add("price entries == sum(n_pos)+sum(n_neg) from counts file", test_afrr_prices_total_matches_counts)
+    R.add("price file ISP indices are all in [0, n)", test_afrr_prices_isp_indices_in_range)
+    R.add("price file only references ISPs with n_total > 0", test_afrr_prices_only_active_isps)
+    R.add("per-ISP price-entry counts match n_pos+n_neg (30 random ISPs)", test_afrr_prices_per_isp_count_matches)
+    R.add("merged-spread median in plausible band (-100..+100 EUR/MWh)", test_afrr_prices_spread_sign_check)
 
 
 if __name__ == "__main__":
