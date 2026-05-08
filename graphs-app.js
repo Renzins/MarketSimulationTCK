@@ -684,7 +684,7 @@
     document.getElementById("g-afrr-prices-loading-status").textContent =
       "Fetching meta…";
 
-    const cacheVer = "?v=11";
+    const cacheVer = "?v=12";
     const tStart = performance.now();
 
     // Step 1 — load the tiny meta file
@@ -776,20 +776,46 @@
   // Re-render the 9 aFRR price/spread charts. The first 6 (signed-spread
   // 1-D boxes + heatmaps) honour `afrrState.direction` (all/pos/neg). The
   // last 3 (matched-by-DA |spread|) are always merged.
-  function updateAfrrPriceCharts() {
+  // Cache for the 3 matched-by-DA |spread| charts. They're direction-agnostic
+  // (use spread_w_all in the engine), so toggling direction must NOT
+  // invalidate this cache. Recompute only when window / daBins / mL / winsor
+  // bounds change.
+  let _afrrMatchedCache = null;
+  // Re-entrancy guard: direction-toggle clicks during a still-running render
+  // would otherwise interleave and cause flicker / wrong-titled charts.
+  let _afrrUpdateRunning = false;
+  let _afrrUpdatePending = false;
+
+  async function updateAfrrPriceCharts() {
     if (!afrrState.pricesLoaded || !AfrrSpreadEngine.isLoaded()) return;
+    if (_afrrUpdateRunning) { _afrrUpdatePending = true; return; }
+    _afrrUpdateRunning = true;
+    try {
+      do {
+        _afrrUpdatePending = false;
+        await _runAfrrUpdate();
+      } while (_afrrUpdatePending);
+    } finally {
+      _afrrUpdateRunning = false;
+    }
+  }
+
+  // Yield to the event loop so the browser can paint between charts. Keeps
+  // each main-thread task short enough that the "page unresponsive" dialog
+  // never triggers.
+  const _yieldUI = () => new Promise((r) => setTimeout(r, 0));
+
+  async function _runAfrrUpdate() {
     const t0 = performance.now();
     AfrrSpreadEngine.setBalticThresholds(afrrState.balticDeficit, afrrState.balticSurplus);
     const dir = afrrState.direction; // 'all' | 'pos' | 'neg'
-    // Winsorize per direction so each view's box plots have a tight Y range
-    AfrrSpreadEngine.maybeWinsorize(afrrState.winsorAfrrLo, afrrState.winsorAfrrHi, dir);
-
+    const wLo = afrrState.winsorAfrrLo;
+    const wHi = afrrState.winsorAfrrHi;
     const wB = afrrState.buckets.wind;
     const sB = afrrState.buckets.solar;
     const daB = afrrState.buckets.daBand;
     const mL = afrrState.buckets.matchedLevels;
 
-    // Direction-specific decoration for titles + Y-axis label
     const dirSuffix = dir === "all" ? "" : dir === "pos" ? " · POS only (↑)" : " · NEG only (↓)";
     const aFrrYLabel = dir === "all"
       ? "Spread: P_aFRR − P_DA (EUR/MWh)"
@@ -797,67 +823,118 @@
         ? "Spread: AST_POS − P_DA (EUR/MWh)"
         : "Spread: AST_NEG − P_DA (EUR/MWh)";
 
-    // 1-D box plots: spread by Baltic wind, surplus / deficit
-    const wSurp = AfrrSpreadEngine.spreadByAxisRegime("wind", "surplus", wB, dir);
-    const wDef = AfrrSpreadEngine.spreadByAxisRegime("wind", "deficit", wB, dir);
+    const progressEl = document.getElementById("g-afrr-progress");
+    let step = 0;
+    const TOTAL_STEPS = 9;
+    const setProg = (label) => {
+      step++;
+      if (progressEl) progressEl.textContent = `Rendering ${step}/${TOTAL_STEPS} — ${label}…`;
+    };
+
+    // ----- Winsor (direction-specific) -----
+    setProg("winsorising spreads");
+    await _yieldUI();
+    AfrrSpreadEngine.maybeWinsorize(wLo, wHi, dir);
+
+    // ----- Fused 6-chart pass (charts 1-6) -----
+    setProg("computing regime/axis box stats");
+    await _yieldUI();
+    const fused = AfrrSpreadEngine.spreadByAxisAllRegimes(wB, sB, dir);
+
+    // 1-D wind box plots
+    setProg("wind surplus");
+    await _yieldUI();
     GraphsCharts.drawSpreadByBucket(
-      "g-afrr-spread-wind-surplus", wSurp, "SURPLUS",
+      "g-afrr-spread-wind-surplus", fused.wind.surplus, "SURPLUS",
       "Baltic Day-Ahead Wind Forecast",
-      `SURPLUS — aFRR spread by Wind power${dirSuffix} (n=${wSurp.totalN.toLocaleString()})`,
+      `SURPLUS — aFRR spread by Wind power${dirSuffix} (n=${fused.wind.surplus.totalN.toLocaleString()})`,
       aFrrYLabel,
     );
+
+    setProg("wind deficit");
+    await _yieldUI();
     GraphsCharts.drawSpreadByBucket(
-      "g-afrr-spread-wind-deficit", wDef, "DEFICIT",
+      "g-afrr-spread-wind-deficit", fused.wind.deficit, "DEFICIT",
       "Baltic Day-Ahead Wind Forecast",
-      `DEFICIT — aFRR spread by Wind power${dirSuffix} (n=${wDef.totalN.toLocaleString()})`,
+      `DEFICIT — aFRR spread by Wind power${dirSuffix} (n=${fused.wind.deficit.totalN.toLocaleString()})`,
       aFrrYLabel,
     );
-    // 1-D box plots: spread by solar
-    const sSurp = AfrrSpreadEngine.spreadByAxisRegime("solar", "surplus", sB, dir);
-    const sDef = AfrrSpreadEngine.spreadByAxisRegime("solar", "deficit", sB, dir);
+
+    // 1-D solar box plots
+    setProg("solar surplus");
+    await _yieldUI();
     GraphsCharts.drawSpreadByBucket(
-      "g-afrr-spread-solar-surplus", sSurp, "SURPLUS",
+      "g-afrr-spread-solar-surplus", fused.solar.surplus, "SURPLUS",
       "Baltic Day-Ahead Solar Forecast",
-      `SURPLUS — aFRR spread by Solar power${dirSuffix} (n=${sSurp.totalN.toLocaleString()})`,
+      `SURPLUS — aFRR spread by Solar power${dirSuffix} (n=${fused.solar.surplus.totalN.toLocaleString()})`,
       aFrrYLabel,
     );
+
+    setProg("solar deficit");
+    await _yieldUI();
     GraphsCharts.drawSpreadByBucket(
-      "g-afrr-spread-solar-deficit", sDef, "DEFICIT",
+      "g-afrr-spread-solar-deficit", fused.solar.deficit, "DEFICIT",
       "Baltic Day-Ahead Solar Forecast",
-      `DEFICIT — aFRR spread by Solar power${dirSuffix} (n=${sDef.totalN.toLocaleString()})`,
+      `DEFICIT — aFRR spread by Solar power${dirSuffix} (n=${fused.solar.deficit.totalN.toLocaleString()})`,
       aFrrYLabel,
     );
+
     // 2-D heatmaps
-    const hDef = AfrrSpreadEngine.spreadByWindSolarRegime("deficit", wB, sB, dir);
-    const hSurp = AfrrSpreadEngine.spreadByWindSolarRegime("surplus", wB, sB, dir);
+    setProg("heatmap deficit");
+    await _yieldUI();
     GraphsCharts.drawWindSolarHeatmap(
-      "g-afrr-heatmap-deficit", hDef, "DEFICIT",
+      "g-afrr-heatmap-deficit", fused.heatmap.deficit, "DEFICIT",
       `DEFICIT — aFRR spread by Wind × Solar${dirSuffix} (${wB}×${sB} bins)`,
     );
+
+    setProg("heatmap surplus");
+    await _yieldUI();
     GraphsCharts.drawWindSolarHeatmap(
-      "g-afrr-heatmap-surplus", hSurp, "SURPLUS",
+      "g-afrr-heatmap-surplus", fused.heatmap.surplus, "SURPLUS",
       `SURPLUS — aFRR spread by Wind × Solar${dirSuffix} (${wB}×${sB} bins)`,
     );
-    // Matched-by-DA |spread| panels — INTENTIONALLY direction-agnostic
-    // (always merged) because they look at absolute spread anyway.
-    const mWind = AfrrSpreadEngine.absSpreadByWindMatchedByDABand(daB, mL);
-    const mSolar = AfrrSpreadEngine.absSpreadBySolarMatchedByDABand(daB, mL);
-    const mRenew = AfrrSpreadEngine.absSpreadByRenewablesMatchedByDABand(daB, mL);
+
+    // ----- Matched-by-DA |spread| (charts 7-9) — direction-agnostic -----
+    // Cache key intentionally OMITS direction so toggling all/pos/neg reuses
+    // the cached results and skips the heavy recomputation.
+    const win = Engine.getWindow();
+    const matchedKey = `${win.start}-${win.end}-${daB}-${mL}-${wLo}-${wHi}`;
+    let cache = _afrrMatchedCache;
+    let matchedFromCache = true;
+    if (!cache || cache.key !== matchedKey) {
+      matchedFromCache = false;
+      setProg("matched-by-DA (computing — first time / params changed)");
+      await _yieldUI();
+      AfrrSpreadEngine.maybeWinsorizeAll(wLo, wHi);
+      const mWind = AfrrSpreadEngine.absSpreadByWindMatchedByDABand(daB, mL);
+      await _yieldUI();
+      const mSolar = AfrrSpreadEngine.absSpreadBySolarMatchedByDABand(daB, mL);
+      await _yieldUI();
+      const mRenew = AfrrSpreadEngine.absSpreadByRenewablesMatchedByDABand(daB, mL);
+      cache = { key: matchedKey, mWind, mSolar, mRenew, daB, mL };
+      _afrrMatchedCache = cache;
+    } else {
+      setProg("matched-by-DA (cached — direction-agnostic)");
+    }
+    await _yieldUI();
     GraphsCharts.drawAbsSpreadMatchedPanels(
-      "g-afrr-matched-wind", mWind,
-      `|aFRR spread| by Wind Level — Matched by DA Price Band (${daB} panels × ${mL} levels)`,
+      "g-afrr-matched-wind", cache.mWind,
+      `|aFRR spread| by Wind Level — Matched by DA Price Band (${cache.daB} panels × ${cache.mL} levels)`,
     );
     GraphsCharts.drawAbsSpreadMatchedPanels(
-      "g-afrr-matched-solar", mSolar,
-      `|aFRR spread| by Solar Level — Matched by DA Price Band (${daB} panels × ${mL} levels)`,
+      "g-afrr-matched-solar", cache.mSolar,
+      `|aFRR spread| by Solar Level — Matched by DA Price Band (${cache.daB} panels × ${cache.mL} levels)`,
     );
     GraphsCharts.drawAbsSpreadMatchedPanels(
-      "g-afrr-matched-renew", mRenew,
-      `|aFRR spread| by Renewables Level — Matched by DA Price Band (${daB} panels × ${mL} levels)`,
+      "g-afrr-matched-renew", cache.mRenew,
+      `|aFRR spread| by Renewables Level — Matched by DA Price Band (${cache.daB} panels × ${cache.mL} levels)`,
     );
+
     const ms = Math.round(performance.now() - t0);
-    document.getElementById("g-afrr-progress").textContent =
-      `done in ${ms} ms (direction = ${dir})`;
+    if (progressEl) {
+      const cacheNote = matchedFromCache ? "; matched cached ✓" : "; matched recomputed";
+      progressEl.textContent = `done in ${ms} ms (direction = ${dir}${cacheNote})`;
+    }
   }
 
   function bindAfrrControls() {

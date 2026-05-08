@@ -20,7 +20,8 @@
       "Bash(awk '{printf \"%-40s %s\\\\n\", $9, $5}')",
       "Bash(awk '{print $5, $NF}')",
       "Bash(sort -k5 -h)",
-      "Bash(grep -E \"\\\\.csv$\")"
+      "Bash(grep -E \"\\\\.csv$\")",
+      "Bash(python -m pytest tests.py -x --tb=short)"
     ]
   }
 }

@@ -51,8 +51,10 @@
 const AfrrSpreadEngine = (() => {
   let D = null; // main Engine.getData() reference
   let P = null; // typed-array view of AFRR_PRICES
-  let spread_w = null; // winsorized spread copy
-  let cachedKey = null;
+  let spread_w = null;       // winsorized — DIRECTION-SPECIFIC (charts 1-6)
+  let spread_w_all = null;   // winsorized with direction='all' (charts 7-9, matched-by-DA)
+  let cachedKey = null;      // for spread_w
+  let cachedKeyAll = null;   // for spread_w_all
   // Quartile-bin labels are derived from the same wind / solar buckets the
   // mFRR section uses (per ISP), but each spread inherits its bin from its
   // ISP's wind/solar value at preprocess time — no per-slot wind/solar info
@@ -85,8 +87,10 @@ const AfrrSpreadEngine = (() => {
     };
     P.spread_raw = new Float32Array(P.n);
     for (let k = 0; k < P.n; k++) P.spread_raw[k] = P._spread_x10[k] / 10;
-    spread_w = new Float32Array(P.n); // winsorised buffer
+    spread_w = new Float32Array(P.n);     // direction-specific winsor
+    spread_w_all = new Float32Array(P.n); // 'all'-direction winsor (matched-by-DA)
     cachedKey = null;
+    cachedKeyAll = null;
     return true;
   }
 
@@ -109,46 +113,66 @@ const AfrrSpreadEngine = (() => {
   }
 
   // --------- winsorization ------------------------------------------------
-  // We winsorize per-direction so that each view (All / POS / NEG) has its
-  // own tight Y range. Cache key includes direction.
+  // Two buffers:
+  //   spread_w     — winsorized per current direction (charts 1-6)
+  //   spread_w_all — winsorized with direction='all' (matched-by-DA charts 7-9,
+  //                  which are direction-agnostic by design; using 'all' bounds
+  //                  keeps their values stable across direction toggles so the
+  //                  graphs-app cache layer can safely skip recomputation).
+  // Both use a 2-pass typed-array collection (count → allocate → fill) instead
+  // of a plain `[].push()` loop; this is several×× faster for ~4 M entries.
+
+  function _interp(sorted, idx) {
+    const a = Math.floor(idx);
+    const b = Math.ceil(idx);
+    return a === b ? sorted[a] : sorted[a] + (sorted[b] - sorted[a]) * (idx - a);
+  }
+
+  function _winsorizeRange(kStart, kEnd, win, pLow, pHigh, dest) {
+    // Pass 1: count entries inside window.
+    let n = 0;
+    for (let k = kStart; k < kEnd; k++) {
+      const i = P.isp_idx[k];
+      if (i >= win.start && i < win.end) n++;
+    }
+    if (n === 0) {
+      dest.set(P.spread_raw); // clip nothing
+      return;
+    }
+    // Pass 2: fill typed buffer.
+    const sorted = new Float32Array(n);
+    let off = 0;
+    for (let k = kStart; k < kEnd; k++) {
+      const i = P.isp_idx[k];
+      if (i >= win.start && i < win.end) sorted[off++] = P.spread_raw[k];
+    }
+    sorted.sort();
+    const lo = _interp(sorted, (pLow / 100) * (n - 1));
+    const hi = _interp(sorted, (pHigh / 100) * (n - 1));
+    for (let k = 0; k < P.n; k++) {
+      const v = P.spread_raw[k];
+      dest[k] = v < lo ? lo : v > hi ? hi : v;
+    }
+  }
+
   function maybeWinsorize(pLow, pHigh, direction = "all") {
     if (!P) return;
     const win = Engine.getWindow();
     const key = `${win.start}-${win.end}-${pLow}-${pHigh}-${direction}`;
     if (key === cachedKey) return;
     const [kStart, kEnd] = _dirRange(direction);
-    // Collect spreads that belong to ISPs in the window AND match the direction
-    const buf = [];
-    for (let k = kStart; k < kEnd; k++) {
-      const i = P.isp_idx[k];
-      if (i >= win.start && i < win.end) buf.push(P.spread_raw[k]);
-    }
-    if (buf.length === 0) {
-      // Fall back: clip nothing
-      for (let k = 0; k < P.n; k++) spread_w[k] = P.spread_raw[k];
-      cachedKey = key;
-      return;
-    }
-    const sorted = Float32Array.from(buf);
-    sorted.sort();
-    const interp = (idx) => {
-      const a = Math.floor(idx);
-      const b = Math.ceil(idx);
-      return a === b
-        ? sorted[a]
-        : sorted[a] + (sorted[b] - sorted[a]) * (idx - a);
-    };
-    const lo = interp((pLow / 100) * (sorted.length - 1));
-    const hi = interp((pHigh / 100) * (sorted.length - 1));
-    // Apply to all entries (we only iterate the relevant range later, but
-    // keeping the full array clipped means if direction is toggled we still
-    // have valid winsorized values everywhere — they'll get refreshed on
-    // the next maybeWinsorize call anyway).
-    for (let k = 0; k < P.n; k++) {
-      const v = P.spread_raw[k];
-      spread_w[k] = v < lo ? lo : v > hi ? hi : v;
-    }
+    _winsorizeRange(kStart, kEnd, win, pLow, pHigh, spread_w);
     cachedKey = key;
+  }
+
+  // Direction-independent winsor for matched-by-DA charts. Always uses 'all'.
+  function maybeWinsorizeAll(pLow, pHigh) {
+    if (!P) return;
+    const win = Engine.getWindow();
+    const key = `${win.start}-${win.end}-${pLow}-${pHigh}`;
+    if (key === cachedKeyAll) return;
+    _winsorizeRange(0, P.n, win, pLow, pHigh, spread_w_all);
+    cachedKeyAll = key;
   }
 
   // --------- core: collect spreads matching a regime + filter -------------
@@ -172,6 +196,8 @@ const AfrrSpreadEngine = (() => {
   }
 
   // --------- box-plot stats (re-implementation matching graphs-engine.js) -
+  // Accepts a Float32Array (sorted in place — caller must not reuse afterwards)
+  // or any array-like (which is copied into a Float32Array first).
   function boxStats(values) {
     if (values.length === 0) {
       return {
@@ -179,7 +205,7 @@ const AfrrSpreadEngine = (() => {
         mean: 0, std: 0, n: 0, outliers: [],
       };
     }
-    const arr = Float32Array.from(values);
+    const arr = values instanceof Float32Array ? values : Float32Array.from(values);
     arr.sort();
     const n = arr.length;
     const quant = (p) => {
@@ -256,10 +282,168 @@ const AfrrSpreadEngine = (() => {
     return N - 1;
   }
 
+  // --------- FUSED 6-chart pass (graphs 1-6) ------------------------------
+  // Produces all four 1-D regime/axis box-plot datasets AND both heatmap
+  // datasets in a SINGLE pair of passes over the price array (one to count
+  // entries per bucket, one to fill typed-array buckets), instead of the
+  // previous six independent passes.
+  //
+  // Returns:
+  //   {
+  //     wind:    { surplus: <BoxBucketResult>, deficit: <BoxBucketResult> },
+  //     solar:   { surplus: <BoxBucketResult>, deficit: <BoxBucketResult> },
+  //     heatmap: { surplus: <HeatmapResult>,    deficit: <HeatmapResult>    },
+  //   }
+  // where shapes match what spreadByAxisRegime / spreadByWindSolarRegime used
+  // to return individually, so the chart drawers don't need to change.
+  function spreadByAxisAllRegimes(windBins, solarBins, direction = "all") {
+    const win = Engine.getWindow();
+    const imb = D.baltic_imb_vol;
+    const wDA = D.baltic_wind_da;
+    const sDA = D.baltic_solar_da;
+
+    // --- Step 1: ISP-level edges, regime-restricted (cheap, 6 walks of 43k).
+    const wSurpVals = [], wDefVals = [];
+    const sSurpVals = [], sDefVals = [];
+    for (let i = win.start; i < win.end; i++) {
+      const iv = imb[i];
+      if (isNaN(iv)) continue;
+      if (iv >= _balticSurplus) {
+        wSurpVals.push(wDA[i]); sSurpVals.push(sDA[i]);
+      } else if (iv <= _balticDeficit) {
+        wDefVals.push(wDA[i]); sDefVals.push(sDA[i]);
+      }
+    }
+    const eWindSurp = quantileEdges(wSurpVals, windBins, "MW");
+    const eWindDef  = quantileEdges(wDefVals,  windBins, "MW");
+    const eSolarSurp = quantileEdges(sSurpVals, solarBins, "MW");
+    const eSolarDef  = quantileEdges(sDefVals,  solarBins, "MW");
+
+    // --- Step 2: Pre-classify each ISP's regime and bin indices. Looking
+    // these up via Uint8Arrays in the hot loop is ~10× faster than the
+    // float-compare + binary search per entry.
+    const N = imb.length;
+    // ispRegime[i]: 0 = neither, 1 = surplus, 2 = deficit
+    const ispRegime = new Uint8Array(N);
+    // For surplus ISPs: wind/solar bin indices using surplus edges.
+    // For deficit ISPs: wind/solar bin indices using deficit edges.
+    const ispWBin = new Uint8Array(N);
+    const ispSBin = new Uint8Array(N);
+    for (let i = win.start; i < win.end; i++) {
+      const iv = imb[i];
+      if (isNaN(iv)) continue;
+      if (iv >= _balticSurplus) {
+        ispRegime[i] = 1;
+        ispWBin[i] = binIndex(wDA[i], eWindSurp.edges);
+        ispSBin[i] = binIndex(sDA[i], eSolarSurp.edges);
+      } else if (iv <= _balticDeficit) {
+        ispRegime[i] = 2;
+        ispWBin[i] = binIndex(wDA[i], eWindDef.edges);
+        ispSBin[i] = binIndex(sDA[i], eSolarDef.edges);
+      }
+    }
+
+    const [kStart, kEnd] = _dirRange(direction);
+
+    // --- Step 3: Pass 1 — count entries per bucket.
+    const cntWS = new Int32Array(windBins),  cntWD = new Int32Array(windBins);
+    const cntSS = new Int32Array(solarBins), cntSD = new Int32Array(solarBins);
+    const cntHS = new Int32Array(windBins * solarBins);
+    const cntHD = new Int32Array(windBins * solarBins);
+    for (let k = kStart; k < kEnd; k++) {
+      const i = P.isp_idx[k];
+      if (i < win.start || i >= win.end) continue;
+      const r = ispRegime[i];
+      if (r === 0) continue;
+      const wB = ispWBin[i];
+      const sB = ispSBin[i];
+      if (r === 1) {
+        cntWS[wB]++; cntSS[sB]++; cntHS[sB * windBins + wB]++;
+      } else {
+        cntWD[wB]++; cntSD[sB]++; cntHD[sB * windBins + wB]++;
+      }
+    }
+
+    // --- Step 4: Allocate typed-array buckets sized to the counts.
+    const alloc = (counts) => {
+      const out = new Array(counts.length);
+      for (let i = 0; i < counts.length; i++) out[i] = new Float32Array(counts[i]);
+      return out;
+    };
+    const wsBuf = alloc(cntWS), wdBuf = alloc(cntWD);
+    const ssBuf = alloc(cntSS), sdBuf = alloc(cntSD);
+    const hsBuf = alloc(cntHS), hdBuf = alloc(cntHD);
+    // Per-bucket write offsets.
+    const offWS = new Int32Array(windBins),  offWD = new Int32Array(windBins);
+    const offSS = new Int32Array(solarBins), offSD = new Int32Array(solarBins);
+    const offHS = new Int32Array(windBins * solarBins);
+    const offHD = new Int32Array(windBins * solarBins);
+
+    // --- Step 5: Pass 2 — fill the buckets.
+    for (let k = kStart; k < kEnd; k++) {
+      const i = P.isp_idx[k];
+      if (i < win.start || i >= win.end) continue;
+      const r = ispRegime[i];
+      if (r === 0) continue;
+      const wB = ispWBin[i];
+      const sB = ispSBin[i];
+      const sw = spread_w[k];
+      if (r === 1) {
+        wsBuf[wB][offWS[wB]++] = sw;
+        ssBuf[sB][offSS[sB]++] = sw;
+        const hi = sB * windBins + wB;
+        hsBuf[hi][offHS[hi]++] = sw;
+      } else {
+        wdBuf[wB][offWD[wB]++] = sw;
+        sdBuf[sB][offSD[sB]++] = sw;
+        const hi = sB * windBins + wB;
+        hdBuf[hi][offHD[hi]++] = sw;
+      }
+    }
+
+    // --- Step 6: Compute box stats per bucket (sort happens in place).
+    const sumI32 = (arr) => {
+      let s = 0;
+      for (let i = 0; i < arr.length; i++) s += arr[i];
+      return s;
+    };
+    const reshapeHm = (bufs) => {
+      const cells = new Array(solarBins);
+      for (let s = 0; s < solarBins; s++) {
+        cells[s] = new Array(windBins);
+        for (let w = 0; w < windBins; w++) {
+          cells[s][w] = boxStats(bufs[s * windBins + w]);
+        }
+      }
+      return cells;
+    };
+
+    return {
+      wind: {
+        surplus: { labels: eWindSurp.labels, edges: eWindSurp.edges,
+                   boxes: wsBuf.map(boxStats), totalN: sumI32(cntWS) },
+        deficit: { labels: eWindDef.labels,  edges: eWindDef.edges,
+                   boxes: wdBuf.map(boxStats), totalN: sumI32(cntWD) },
+      },
+      solar: {
+        surplus: { labels: eSolarSurp.labels, edges: eSolarSurp.edges,
+                   boxes: ssBuf.map(boxStats), totalN: sumI32(cntSS) },
+        deficit: { labels: eSolarDef.labels,  edges: eSolarDef.edges,
+                   boxes: sdBuf.map(boxStats), totalN: sumI32(cntSD) },
+      },
+      heatmap: {
+        surplus: { wind: eWindSurp, solar: eSolarSurp, cells: reshapeHm(hsBuf) },
+        deficit: { wind: eWindDef,  solar: eSolarDef,  cells: reshapeHm(hdBuf) },
+      },
+    };
+  }
+
   // --------- 1-D bucketed box stats (graphs 1-4) --------------------------
   // axis: 'wind' | 'solar'; regime: 'surplus' | 'deficit'
   // direction: 'all' | 'pos' | 'neg'
   // Each price entry's bin is determined by its ISP's wind/solar value.
+  // (Kept for back-compat / direct callers; the active app path now uses
+  //  spreadByAxisAllRegimes which fuses all 6 charts into one pair of passes.)
   function spreadByAxisRegime(axis, regime, nBins, direction = "all") {
     const win = Engine.getWindow();
     const valArr = axis === "wind" ? D.baltic_wind_da : D.baltic_solar_da;
@@ -335,38 +519,64 @@ const AfrrSpreadEngine = (() => {
 
   // --------- |spread| matched by DA price band (graph 7-9) ----------------
   // levelFn(i) returns the level value (wind / solar / wind+solar) for ISP i.
+  // Uses spread_w_all (direction-independent winsor) so results are stable
+  // across direction toggles — letting the caller cache them.
   function absSpreadMatchedByDA(daBins, levels, levelFn, levelUnit = "MW") {
     const win = Engine.getWindow();
+    const N = D.baltic_imb_vol.length;
     // Edges
-    const daIspVals = [];
-    const levelIspVals = [];
-    for (let i = win.start; i < win.end; i++) {
-      // No regime filter — this view is across the whole window
-      daIspVals.push(D.p_da[i]);
-      levelIspVals.push(levelFn(i));
+    const daIspVals = new Float32Array(win.end - win.start);
+    const levelIspVals = new Float32Array(win.end - win.start);
+    for (let i = win.start, j = 0; i < win.end; i++, j++) {
+      daIspVals[j] = D.p_da[i];
+      levelIspVals[j] = levelFn(i);
     }
     const DA = quantileEdges(daIspVals, daBins, "€");
     const L = quantileEdges(levelIspVals, levels, levelUnit);
-    const panels = Array.from({ length: daBins }, (_, b) => ({
-      daLabel: DA.labels[b],
-      boxesByLevel: Array.from({ length: levels }, () => []),
-    }));
+
+    // Pre-compute (DA bin, level bin) per ISP into Uint8Arrays. With daBins
+    // and levels both ≤ 5 in the UI this fits comfortably.
+    const dBin = new Uint8Array(N);
+    const lBin = new Uint8Array(N);
+    for (let i = win.start; i < win.end; i++) {
+      dBin[i] = binIndex(D.p_da[i], DA.edges);
+      lBin[i] = binIndex(levelFn(i), L.edges);
+    }
+
+    // Pass 1: count entries per (DA, level) cell.
+    const cnt = new Int32Array(daBins * levels);
     for (let k = 0; k < P.n; k++) {
       const i = P.isp_idx[k];
       if (i < win.start || i >= win.end) continue;
-      const dB = binIndex(D.p_da[i], DA.edges);
-      const lB = binIndex(levelFn(i), L.edges);
-      panels[dB].boxesByLevel[lB].push(Math.abs(spread_w[k]));
+      cnt[dBin[i] * levels + lBin[i]]++;
+    }
+
+    // Allocate typed-array buckets sized to the counts.
+    const buf = new Array(daBins * levels);
+    for (let idx = 0; idx < buf.length; idx++) buf[idx] = new Float32Array(cnt[idx]);
+    const off = new Int32Array(daBins * levels);
+
+    // Pass 2: fill with absolute spread (using direction-independent winsor).
+    const src = spread_w_all;
+    for (let k = 0; k < P.n; k++) {
+      const i = P.isp_idx[k];
+      if (i < win.start || i >= win.end) continue;
+      const idx = dBin[i] * levels + lBin[i];
+      buf[idx][off[idx]++] = Math.abs(src[k]);
+    }
+
+    const panels = new Array(daBins);
+    for (let b = 0; b < daBins; b++) {
+      const boxes = new Array(levels);
+      for (let l = 0; l < levels; l++) boxes[l] = boxStats(buf[b * levels + l]);
+      panels[b] = { daLabel: DA.labels[b], boxes };
     }
     return {
       daLabels: DA.labels,
       daEdges: DA.edges,
       levelLabels: L.labels,
       levelEdges: L.edges,
-      panels: panels.map((p) => ({
-        daLabel: p.daLabel,
-        boxes: p.boxesByLevel.map(boxStats),
-      })),
+      panels,
     };
   }
   function absSpreadByWindMatchedByDABand(daBins, levels) {
@@ -389,8 +599,10 @@ const AfrrSpreadEngine = (() => {
     init,
     setBalticThresholds,
     maybeWinsorize,
-    spreadByAxisRegime,
-    spreadByWindSolarRegime,
+    maybeWinsorizeAll,
+    spreadByAxisRegime,        // legacy single-chart API (unused by app, kept for tests)
+    spreadByWindSolarRegime,   // legacy single-chart API
+    spreadByAxisAllRegimes,    // FUSED — produces the 6 regime/axis charts in 2 passes
     absSpreadMatchedByDA,
     absSpreadByWindMatchedByDABand,
     absSpreadBySolarMatchedByDABand,
