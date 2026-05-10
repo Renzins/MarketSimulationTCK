@@ -38,6 +38,7 @@
 //   isLoaded()                                 — true if AFRR_PRICES global exists
 //   init()                                     — wrap the global into typed arrays
 //   maybeWinsorize(pLo, pHi)                   — winsorize spreads within window
+//   setDayTypeFilter(filter)                   — "all" | "workday" | "weekend-holiday"
 //   spreadByAxisRegime(axis, regime, n)        — 1-D bucketed box stats (mirrors GraphsEngine)
 //   spreadByWindSolarRegime(regime, w, s)      — 2-D heatmap stats
 //   absSpreadMatchedByDA(daBins, levels, fn)   — 5-panel grouped boxes (any level fn)
@@ -112,6 +113,23 @@ const AfrrSpreadEngine = (() => {
     cachedKey = null; // because regimes change which entries enter winsor
   }
 
+  // ---------- day-type filter --------------------------------------------
+  // Mirrors GraphsEngine / AfrrEngine. Reads Engine.getData().dayTypeMask.
+  // Affects ISP-level edge derivation, pre-classification, and winsor
+  // percentiles (so a "workday only" view's box bounds aren't dragged by
+  // weekend / holiday outliers). Cache key invalidation is handled via the
+  // _dayTypeFilter portion of each cache key — no manual invalidation here.
+  let _dayTypeFilter = "all";
+  function setDayTypeFilter(filter) {
+    _dayTypeFilter = filter || "all";
+  }
+  function _acceptsDay(i) {
+    if (_dayTypeFilter === "all") return true;
+    const v = D.dayTypeMask[i];
+    if (_dayTypeFilter === "workday") return v === 0;
+    return v !== 0; // 'weekend-holiday'
+  }
+
   // --------- winsorization ------------------------------------------------
   // Two buffers:
   //   spread_w     — winsorized per current direction (charts 1-6)
@@ -129,22 +147,22 @@ const AfrrSpreadEngine = (() => {
   }
 
   function _winsorizeRange(kStart, kEnd, win, pLow, pHigh, dest) {
-    // Pass 1: count entries inside window.
+    // Pass 1: count entries inside window AND matching the day-type filter.
     let n = 0;
     for (let k = kStart; k < kEnd; k++) {
       const i = P.isp_idx[k];
-      if (i >= win.start && i < win.end) n++;
+      if (i >= win.start && i < win.end && _acceptsDay(i)) n++;
     }
     if (n === 0) {
       dest.set(P.spread_raw); // clip nothing
       return;
     }
-    // Pass 2: fill typed buffer.
+    // Pass 2: fill typed buffer (same filter).
     const sorted = new Float32Array(n);
     let off = 0;
     for (let k = kStart; k < kEnd; k++) {
       const i = P.isp_idx[k];
-      if (i >= win.start && i < win.end) sorted[off++] = P.spread_raw[k];
+      if (i >= win.start && i < win.end && _acceptsDay(i)) sorted[off++] = P.spread_raw[k];
     }
     sorted.sort();
     const lo = _interp(sorted, (pLow / 100) * (n - 1));
@@ -158,7 +176,7 @@ const AfrrSpreadEngine = (() => {
   function maybeWinsorize(pLow, pHigh, direction = "all") {
     if (!P) return;
     const win = Engine.getWindow();
-    const key = `${win.start}-${win.end}-${pLow}-${pHigh}-${direction}`;
+    const key = `${win.start}-${win.end}-${pLow}-${pHigh}-${direction}-${_dayTypeFilter}`;
     if (key === cachedKey) return;
     const [kStart, kEnd] = _dirRange(direction);
     _winsorizeRange(kStart, kEnd, win, pLow, pHigh, spread_w);
@@ -169,7 +187,7 @@ const AfrrSpreadEngine = (() => {
   function maybeWinsorizeAll(pLow, pHigh) {
     if (!P) return;
     const win = Engine.getWindow();
-    const key = `${win.start}-${win.end}-${pLow}-${pHigh}`;
+    const key = `${win.start}-${win.end}-${pLow}-${pHigh}-${_dayTypeFilter}`;
     if (key === cachedKeyAll) return;
     _winsorizeRange(0, P.n, win, pLow, pHigh, spread_w_all);
     cachedKeyAll = key;
@@ -303,9 +321,13 @@ const AfrrSpreadEngine = (() => {
     const sDA = D.baltic_solar_da;
 
     // --- Step 1: ISP-level edges, regime-restricted (cheap, 6 walks of 43k).
+    // Day-type filter narrows the contributing ISPs so that bin boundaries
+    // describe the workday (or weekend+holiday) distribution rather than
+    // the full window's.
     const wSurpVals = [], wDefVals = [];
     const sSurpVals = [], sDefVals = [];
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       const iv = imb[i];
       if (isNaN(iv)) continue;
       if (iv >= _balticSurplus) {
@@ -330,6 +352,10 @@ const AfrrSpreadEngine = (() => {
     const ispWBin = new Uint8Array(N);
     const ispSBin = new Uint8Array(N);
     for (let i = win.start; i < win.end; i++) {
+      // ispRegime defaults to 0 ("neither") — leave it that way for ISPs
+      // filtered out by day-type, so the price-entry passes below skip
+      // them via the existing `r === 0` early-out.
+      if (!_acceptsDay(i)) continue;
       const iv = imb[i];
       if (isNaN(iv)) continue;
       if (iv >= _balticSurplus) {
@@ -454,6 +480,7 @@ const AfrrSpreadEngine = (() => {
     // edges — they describe the wind/solar distribution of qualifying ISPs.
     const ispVals = [];
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       const iv = imb[i];
       if (isNaN(iv)) continue;
       if (regime === "surplus" && iv < _balticSurplus) continue;
@@ -470,6 +497,7 @@ const AfrrSpreadEngine = (() => {
     for (let k = kStart; k < kEnd; k++) {
       const i = P.isp_idx[k];
       if (i < win.start || i >= win.end) continue;
+      if (!_acceptsDay(i)) continue;
       const iv = imb[i];
       if (isNaN(iv)) continue;
       if (regime === "surplus" && iv < _balticSurplus) continue;
@@ -490,6 +518,7 @@ const AfrrSpreadEngine = (() => {
     const wIspVals = [];
     const sIspVals = [];
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       const iv = imb[i];
       if (isNaN(iv)) continue;
       if (regime === "surplus" && iv < _balticSurplus) continue;
@@ -506,6 +535,7 @@ const AfrrSpreadEngine = (() => {
     for (let k = kStart; k < kEnd; k++) {
       const i = P.isp_idx[k];
       if (i < win.start || i >= win.end) continue;
+      if (!_acceptsDay(i)) continue;
       const iv = imb[i];
       if (isNaN(iv)) continue;
       if (regime === "surplus" && iv < _balticSurplus) continue;
@@ -524,21 +554,37 @@ const AfrrSpreadEngine = (() => {
   function absSpreadMatchedByDA(daBins, levels, levelFn, levelUnit = "MW") {
     const win = Engine.getWindow();
     const N = D.baltic_imb_vol.length;
-    // Edges
-    const daIspVals = new Float32Array(win.end - win.start);
-    const levelIspVals = new Float32Array(win.end - win.start);
-    for (let i = win.start, j = 0; i < win.end; i++, j++) {
-      daIspVals[j] = D.p_da[i];
-      levelIspVals[j] = levelFn(i);
+    // Edges — only ISPs matching the day-type filter contribute. Allocate
+    // to the max possible length and trim with subarray() before passing
+    // into quantileEdges (it accepts any iterable / typed-array).
+    const maxLen = win.end - win.start;
+    const daIspVals = new Float32Array(maxLen);
+    const levelIspVals = new Float32Array(maxLen);
+    // ispAccept[i] = 1 if this ISP passes the day-type filter; the
+    // price-entry passes below use this flag to drop entries belonging to
+    // filtered-out ISPs (instead of polluting the (0,0) cell with their
+    // default-zero bin indices).
+    const ispAccept = new Uint8Array(N);
+    let ispCount = 0;
+    for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
+      ispAccept[i] = 1;
+      daIspVals[ispCount] = D.p_da[i];
+      levelIspVals[ispCount] = levelFn(i);
+      ispCount++;
     }
-    const DA = quantileEdges(daIspVals, daBins, "€");
-    const L = quantileEdges(levelIspVals, levels, levelUnit);
+    const daSlice = ispCount === maxLen ? daIspVals : daIspVals.subarray(0, ispCount);
+    const lvlSlice = ispCount === maxLen ? levelIspVals : levelIspVals.subarray(0, ispCount);
+    const DA = quantileEdges(daSlice, daBins, "€");
+    const L = quantileEdges(lvlSlice, levels, levelUnit);
 
-    // Pre-compute (DA bin, level bin) per ISP into Uint8Arrays. With daBins
-    // and levels both ≤ 5 in the UI this fits comfortably.
+    // Pre-compute (DA bin, level bin) per ACCEPTED ISP. Filtered-out ISPs
+    // keep dBin=lBin=0 (the array default) but ispAccept=0 prevents their
+    // price entries from feeding cell (0,0).
     const dBin = new Uint8Array(N);
     const lBin = new Uint8Array(N);
     for (let i = win.start; i < win.end; i++) {
+      if (!ispAccept[i]) continue;
       dBin[i] = binIndex(D.p_da[i], DA.edges);
       lBin[i] = binIndex(levelFn(i), L.edges);
     }
@@ -548,6 +594,7 @@ const AfrrSpreadEngine = (() => {
     for (let k = 0; k < P.n; k++) {
       const i = P.isp_idx[k];
       if (i < win.start || i >= win.end) continue;
+      if (!ispAccept[i]) continue;
       cnt[dBin[i] * levels + lBin[i]]++;
     }
 
@@ -561,6 +608,7 @@ const AfrrSpreadEngine = (() => {
     for (let k = 0; k < P.n; k++) {
       const i = P.isp_idx[k];
       if (i < win.start || i >= win.end) continue;
+      if (!ispAccept[i]) continue;
       const idx = dBin[i] * levels + lBin[i];
       buf[idx][off[idx]++] = Math.abs(src[k]);
     }
@@ -598,6 +646,7 @@ const AfrrSpreadEngine = (() => {
     isLoaded,
     init,
     setBalticThresholds,
+    setDayTypeFilter,
     maybeWinsorize,
     maybeWinsorizeAll,
     spreadByAxisRegime,        // legacy single-chart API (unused by app, kept for tests)

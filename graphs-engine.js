@@ -19,6 +19,7 @@
 //   init()                                  — wrap baltic columns into Float32Arrays
 //   maybeWinsorizeSpread(pLo, pHi)          — recompute spread_w within current window
 //   setRegimeThresholds(deficit, surplus)   — module-level pair read by regimeIndices()
+//   setDayTypeFilter(filter)                — "all" | "workday" | "weekend-holiday"
 //   regimeIndices(regime)                   — global ISP indices in the regime
 //   quantileEdges(values, n, unit)          — compute n+1 quantile edges + labels
 //   boxStats(values)                        — {min, q1, median, q3, max, mean, std, n, outliers}
@@ -67,13 +68,16 @@ const GraphsEngine = (() => {
   }
 
   // Compute the same winsor as Engine but on `spread`. Window is taken from
-  // the shared Engine state.
+  // the shared Engine state. Percentile bounds are derived ONLY from ISPs
+  // that match the current day-type filter — so a "workdays only" view
+  // doesn't get its y-axis stretched by weekend / holiday outliers.
   function maybeWinsorizeSpread(pLow, pHigh) {
     const win = Engine.getWindow();
-    const key = `${win.start}-${win.end}-${pLow}-${pHigh}`;
+    const key = `${win.start}-${win.end}-${pLow}-${pHigh}-${_dayTypeFilter}`;
     if (key === cachedKey) return;
     const buf = [];
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       const v = spread[i];
       if (!isNaN(v)) buf.push(v);
     }
@@ -116,10 +120,27 @@ const GraphsEngine = (() => {
     _deficitThr = deficitThr;
     _surplusThr = surplusThr;
   }
+  // ---------- day-type filter --------------------------------------------
+  // Reads Engine.getData().dayTypeMask[i] — built once at Engine.init().
+  //   "all"             — every ISP qualifies (default; pre-feature behaviour).
+  //   "workday"         — only Mon–Fri minus public holidays (mask[i] === 0).
+  //   "weekend-holiday" — only Sat/Sun OR a public holiday (mask[i] !== 0).
+  // Affects: regimeIndices, absSpreadMatchedByDA, and the winsor cache key.
+  let _dayTypeFilter = "all";
+  function setDayTypeFilter(filter) {
+    _dayTypeFilter = filter || "all";
+  }
+  function _acceptsDay(i) {
+    if (_dayTypeFilter === "all") return true;
+    const v = D.dayTypeMask[i];
+    if (_dayTypeFilter === "workday") return v === 0;
+    return v !== 0; // 'weekend-holiday'
+  }
   function regimeIndices(regime) {
     const win = Engine.getWindow();
     const out = [];
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       const iv = D.baltic_imb_vol[i];
       if (isNaN(iv)) continue;
       if (regime === "surplus" && iv >= _surplusThr) out.push(i);
@@ -280,6 +301,7 @@ const GraphsEngine = (() => {
     const win = Engine.getWindow();
     const allIdx = [];
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       if (!isNaN(spread_w[i])) allIdx.push(i);
     }
     if (allIdx.length === 0) {
@@ -338,6 +360,7 @@ const GraphsEngine = (() => {
     init,
     maybeWinsorizeSpread,
     setRegimeThresholds,
+    setDayTypeFilter,
     regimeIndices,
     quantileEdges,
     boxStats,

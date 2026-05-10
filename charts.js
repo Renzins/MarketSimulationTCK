@@ -86,29 +86,85 @@ const Charts = (() => {
 
     const ts = new Array(N);
     const da = new Array(N);
-    const up = new Array(N);
-    const dn = new Array(N);
+    // mFRR active MW per ISP (post |P_mfrr|≥1 gate). The perISP.Q_up /
+    // Q_dn arrays carry total OFFERED volume (mFRR + aFRR) — split here
+    // so the time-series bars can render mFRR-only and aFRR-only stacks
+    // separately. mFRR active = total minus the aFRR offered portion at
+    // the s split. We don't store mFRR active in perISP, so derive from
+    // ratios: with s constant across ISPs the mFRR offered fraction is
+    // round(s × total) / total; but s is single-valued so we can use
+    // per-ISP Q_up_afrr_disp (dispatched) for the aFRR bar height and
+    // (Q_up - Q_up_afrr_offered) ≈ mFRR offered for the mFRR bar — the
+    // simpler approach is: aFRR DISPATCHED MW (already gated + scaled)
+    // for the aFRR bar; mFRR ACTIVE MW = (Q_up - Q_up_afrr_offered) when
+    // mFRR cleared, else 0. We have Q_*_afrr_disp directly.
+    // Per-ISP arrays. Most are direct lookups; the mFRR-active and
+    // aFRR-offered/dispatched arrays are derived from the engine's
+    // per-ISP outputs + the s parameter, so the tooltip and the bar
+    // heights both stay in sync with simulate().
+    const upMfrrActive = new Array(N); // mFRR-up MW that fired this ISP
+    const dnMfrrActive = new Array(N); // negative-signed for the bar
+    const upAfrrOffered = new Array(N); // aFRR-up MW we ROUTED to aFRR
+    const dnAfrrOffered = new Array(N);
+    const upAfrrDisp = new Array(N); // dispatched (avg) MW = offered × n_pos/225
+    const dnAfrrDisp = new Array(N); // negative-signed for the bar
     const pot = new Array(N);
     const f_arr = new Array(N);
     const id_arr = new Array(N);
     const pda_arr = new Array(N);
     const pmfrr_arr = new Array(N);
     const pimb_arr = new Array(N);
+    const apos_arr = new Array(N);
+    const aneg_arr = new Array(N);
+    const npos_arr = new Array(N);
+    const nneg_arr = new Array(N);
     const rev = new Array(N);
     const short = new Array(N);
+    const sUpParam =
+      params && params.s_up != null ? Math.max(0, Math.min(1, params.s_up)) : 1;
+    const sDnParam =
+      params && params.s_dn != null ? Math.max(0, Math.min(1, params.s_dn)) : 1;
     for (let k = 0; k < N; k++) {
       const i = clampedStart + k; // global ISP index
       const k_p = i - winStart; // perISP-array index
       ts[k] = Engine.tsAt(i);
       da[k] = simResult.perISP.Q_da_sold[k_p];
-      up[k] = simResult.perISP.Q_up[k_p];
-      dn[k] = -simResult.perISP.Q_dn[k_p]; // negative bar (visual)
+      // Reconstruct the OFFERED split via the same round-and-remainder
+      // engine.simulate uses (per direction), so the visualised offers
+      // match exactly even when s_up != s_dn.
+      const Q_up_offer = simResult.perISP.Q_up[k_p];
+      const Q_dn_offer = simResult.perISP.Q_dn[k_p];
+      const Q_up_mfrr = Math.round(sUpParam * Q_up_offer);
+      const Q_dn_mfrr = Math.round(sDnParam * Q_dn_offer);
+      const Q_up_afrr = Q_up_offer - Q_up_mfrr;
+      const Q_dn_afrr = Q_dn_offer - Q_dn_mfrr;
+      const isUp = D.p_mfrr[i] >= 1;
+      const isDn = D.p_mfrr[i] <= -1;
+      upMfrrActive[k] = isUp ? Q_up_mfrr : 0;
+      dnMfrrActive[k] = -(isDn ? Q_dn_mfrr : 0);
+      upAfrrOffered[k] = Q_up_afrr;
+      dnAfrrOffered[k] = Q_dn_afrr;
+      upAfrrDisp[k] = simResult.perISP.Q_up_afrr_disp
+        ? simResult.perISP.Q_up_afrr_disp[k_p]
+        : 0;
+      dnAfrrDisp[k] = -(simResult.perISP.Q_dn_afrr_disp
+        ? simResult.perISP.Q_dn_afrr_disp[k_p]
+        : 0);
       pot[k] = D.q_pot[i];
       f_arr[k] = D.da_forecast[i];
       id_arr[k] = D.id_forecast[i];
       pda_arr[k] = D.p_da[i];
       pmfrr_arr[k] = D.p_mfrr[i];
       pimb_arr[k] = D.p_imb[i];
+      apos_arr[k] = D.avg_p_pos ? D.avg_p_pos[i] : 0;
+      aneg_arr[k] = D.avg_p_neg ? D.avg_p_neg[i] : 0;
+      // Use FAVOURABLE counts so the tooltip's "% of ISP" matches the
+      // dispatched MW reported alongside it (engine.js scales by
+      // n_*_fav/225 too). Falls back to n_pos / n_neg when an older
+      // data file lacks the favourable arrays — engine.js wires the
+      // fallback in init().
+      npos_arr[k] = D.afrr_n_pos_fav ? D.afrr_n_pos_fav[i] : 0;
+      nneg_arr[k] = D.afrr_n_neg_fav ? D.afrr_n_neg_fav[i] : 0;
       rev[k] = simResult.perISP.revenue[k_p];
       short[k] = simResult.perISP.Q_short[k_p];
     }
@@ -153,42 +209,79 @@ const Charts = (() => {
       ];
       s += section("DA market", daLines);
 
-      // --- Balancing (only if something fired) ---
-      const upMW = up[k];
-      const dnMW = -dn[k];
-      const balLines = [];
-      if (upMW > 0.5) {
-        balLines.push(
-          `<span style="color:#3fb950">▲ mFRR-up</span>: <b>${upMW.toFixed(0)} MW</b> @ ${fmtPrice(pmfrr_arr[k])}`,
+      // --- mFRR (only if something fired) ---
+      const upMfrrMW = upMfrrActive[k];
+      const dnMfrrMW = -dnMfrrActive[k];
+      const mfrrLines = [];
+      const upMfrrRev = upMfrrMW * pmfrr_arr[k] * 0.25;
+      const dnMfrrRev = -dnMfrrMW * pmfrr_arr[k] * 0.25;
+      if (upMfrrMW > 0.5) {
+        mfrrLines.push(
+          `<span style="color:#3fb950">▲ mFRR-up</span>: <b>${upMfrrMW.toFixed(0)} MW</b> @ ${fmtPrice(pmfrr_arr[k])}`,
         );
-        balLines.push(
-          `mFRR-up rev: <b>${fmtEUR(upMW * pmfrr_arr[k] * 0.25)}</b>`,
+        mfrrLines.push(`mFRR-up rev: <b>${fmtEUR(upMfrrRev)}</b>`);
+      } else if (dnMfrrMW > 0.5) {
+        mfrrLines.push(
+          `<span style="color:#f85149">▼ mFRR-dn</span>: <b>${dnMfrrMW.toFixed(0)} MW</b> @ ${fmtPrice(pmfrr_arr[k])}`,
         );
-      } else if (dnMW > 0.5) {
-        balLines.push(
-          `<span style="color:#f85149">▼ mFRR-dn</span>: <b>${dnMW.toFixed(0)} MW</b> @ ${fmtPrice(pmfrr_arr[k])}`,
-        );
-        balLines.push(
-          `mFRR-dn rev: <b>${fmtEUR(-dnMW * pmfrr_arr[k] * 0.25)}</b>`,
-        );
+        mfrrLines.push(`mFRR-dn rev: <b>${fmtEUR(dnMfrrRev)}</b>`);
       } else {
-        // Distinguish: market didn't clear vs. we had no offer to place
         const pmf = pmfrr_arr[k];
         if (pmf > -1 && pmf < 1) {
-          balLines.push(
+          mfrrLines.push(
             `<span style="color:#7d8590">— no clearing (P_mFRR ${fmtPrice(pmf)} inside ±1 dead band)</span>`,
           );
         } else if (pmf >= 1) {
-          balLines.push(
-            `<span style="color:#7d8590">— mFRR-up cleared @ ${fmtPrice(pmf)} but we placed no offer</span>`,
+          mfrrLines.push(
+            `<span style="color:#7d8590">— mFRR-up cleared @ ${fmtPrice(pmf)} but no mFRR offer placed (s_up = ${sUpParam.toFixed(2)})</span>`,
           );
         } else {
-          balLines.push(
-            `<span style="color:#7d8590">— mFRR-dn cleared @ ${fmtPrice(pmf)} but we had no DA position to curtail</span>`,
+          mfrrLines.push(
+            `<span style="color:#7d8590">— mFRR-dn cleared @ ${fmtPrice(pmf)} but no mFRR offer placed</span>`,
           );
         }
       }
-      s += section("Balancing", balLines);
+      s += section("mFRR market", mfrrLines);
+
+      // --- aFRR (per-direction, gated by profitability) ---
+      // Revenue uses the AVERAGED price × Q_offered × 0.25 — which equals
+      // integrating the 4-second slot prices directly (NaN slots → 0).
+      // Dispatched MW (n_pos/225 × Q_offered) is shown so the user can
+      // see "how much of the ISP did the system actually use us for".
+      const upAfrrOffer = upAfrrOffered[k];
+      const dnAfrrOffer = dnAfrrOffered[k];
+      const upAfrrDispMW = upAfrrDisp[k];
+      const dnAfrrDispMW = -dnAfrrDisp[k];
+      const upAfrrRev = apos_arr[k] > 0 ? upAfrrOffer * apos_arr[k] * 0.25 : 0;
+      const dnAfrrRev = aneg_arr[k] < 0 ? -dnAfrrOffer * aneg_arr[k] * 0.25 : 0;
+      if (upAfrrOffer > 0 || dnAfrrOffer > 0) {
+        const afrrLines = [];
+        if (upAfrrOffer > 0) {
+          if (apos_arr[k] > 0) {
+            afrrLines.push(
+              `<span style="color:#56d364">△ aFRR-up</span>: <b>${upAfrrOffer.toFixed(0)} MW</b> offered, dispatched ${upAfrrDispMW.toFixed(2)} MW (${((npos_arr[k] / 225) * 100).toFixed(0)} % of ISP) @ avg ${fmtPrice(apos_arr[k])}`,
+            );
+            afrrLines.push(`aFRR-up rev: <b>${fmtEUR(upAfrrRev)}</b>`);
+          } else {
+            afrrLines.push(
+              `<span style="color:#7d8590">— aFRR-up: ${upAfrrOffer.toFixed(0)} MW available but avg_p_pos = ${fmtPrice(apos_arr[k])} ≤ 0 (not bid)</span>`,
+            );
+          }
+        }
+        if (dnAfrrOffer > 0) {
+          if (aneg_arr[k] < 0) {
+            afrrLines.push(
+              `<span style="color:#fa7970">▽ aFRR-dn</span>: <b>${dnAfrrOffer.toFixed(0)} MW</b> offered, dispatched ${dnAfrrDispMW.toFixed(2)} MW (${((nneg_arr[k] / 225) * 100).toFixed(0)} % of ISP) @ avg ${fmtPrice(aneg_arr[k])}`,
+            );
+            afrrLines.push(`aFRR-dn rev: <b>${fmtEUR(dnAfrrRev)}</b>`);
+          } else {
+            afrrLines.push(
+              `<span style="color:#7d8590">— aFRR-dn: ${dnAfrrOffer.toFixed(0)} MW available but avg_p_neg = ${fmtPrice(aneg_arr[k])} ≥ 0 (not bid)</span>`,
+            );
+          }
+        }
+        s += section("aFRR market", afrrLines);
+      }
 
       // --- Imbalance (L2 only, only if shortfall) ---
       if (level === 2 && short[k] > 0.01) {
@@ -212,6 +305,11 @@ const Charts = (() => {
     });
 
     // ---- Visible traces (no hover - hover comes from dedicated trace) ----
+    // Four bars/areas now: mFRR-up + aFRR-up (positive y) and mFRR-dn +
+    // aFRR-dn (negative y). Stacked via barmode:'relative' so the user
+    // can see the mFRR vs aFRR composition at a glance. aFRR bars use
+    // the DISPATCHED MW (offered × n_*/225) so 30-%-active ISPs show a
+    // 30 %-tall bar — making "when aFRR fired and when not" visible.
     let traces;
     if (useBars) {
       traces = [
@@ -226,18 +324,34 @@ const Charts = (() => {
         },
         {
           x: ts,
-          y: up,
+          y: upMfrrActive,
           type: "bar",
           name: "mFRR-up (MW)",
-          marker: { color: "rgba(63,185,80,0.75)" },
+          marker: { color: "rgba(63,185,80,0.85)" },
           hoverinfo: "skip",
         },
         {
           x: ts,
-          y: dn,
+          y: upAfrrDisp,
+          type: "bar",
+          name: "aFRR-up dispatched (MW avg)",
+          marker: { color: "rgba(86,211,100,0.55)" },
+          hoverinfo: "skip",
+        },
+        {
+          x: ts,
+          y: dnMfrrActive,
           type: "bar",
           name: "mFRR-dn (MW)",
-          marker: { color: "rgba(248,81,73,0.75)" },
+          marker: { color: "rgba(248,81,73,0.85)" },
+          hoverinfo: "skip",
+        },
+        {
+          x: ts,
+          y: dnAfrrDisp,
+          type: "bar",
+          name: "aFRR-dn dispatched (MW avg)",
+          marker: { color: "rgba(250,121,112,0.55)" },
           hoverinfo: "skip",
         },
       ];
@@ -253,7 +367,8 @@ const Charts = (() => {
         });
       }
     } else {
-      // Multi-week scattergl mode
+      // Multi-week scattergl mode. mFRR + aFRR overlap rather than stack
+      // (filled areas) — the legend distinguishes them by color.
       traces = [
         {
           x: ts,
@@ -266,7 +381,7 @@ const Charts = (() => {
         },
         {
           x: ts,
-          y: up,
+          y: upMfrrActive,
           type: "scattergl",
           mode: "lines",
           name: "mFRR-up (MW)",
@@ -277,13 +392,35 @@ const Charts = (() => {
         },
         {
           x: ts,
-          y: dn,
+          y: upAfrrDisp,
+          type: "scattergl",
+          mode: "lines",
+          name: "aFRR-up dispatched (MW)",
+          line: { color: "#56d364", width: 1.0, dash: "dot" },
+          fill: "tozeroy",
+          fillcolor: "rgba(86,211,100,0.18)",
+          hoverinfo: "skip",
+        },
+        {
+          x: ts,
+          y: dnMfrrActive,
           type: "scattergl",
           mode: "lines",
           name: "mFRR-dn (MW)",
           line: { color: "#f85149", width: 1.2 },
           fill: "tozeroy",
           fillcolor: "rgba(248,81,73,0.25)",
+          hoverinfo: "skip",
+        },
+        {
+          x: ts,
+          y: dnAfrrDisp,
+          type: "scattergl",
+          mode: "lines",
+          name: "aFRR-dn dispatched (MW)",
+          line: { color: "#fa7970", width: 1.0, dash: "dot" },
+          fill: "tozeroy",
+          fillcolor: "rgba(250,121,112,0.18)",
           hoverinfo: "skip",
         },
       ];
@@ -306,9 +443,16 @@ const Charts = (() => {
     let yMax = 0,
       yMin = 0;
     for (let k = 0; k < N; k++) {
-      const v = Math.max(da[k], up[k], pot[k] || 0);
+      // For bar mode the chart stacks mFRR + aFRR (relative barmode),
+      // so the visible top is da + upMfrr + upAfrr (loose upper bound).
+      const v = Math.max(
+        da[k],
+        upMfrrActive[k] + upAfrrDisp[k],
+        pot[k] || 0,
+      );
       if (v > yMax) yMax = v;
-      if (dn[k] < yMin) yMin = dn[k];
+      const lower = dnMfrrActive[k] + dnAfrrDisp[k]; // both already negative
+      if (lower < yMin) yMin = lower;
     }
     const hoverY = new Array(N).fill(yMax * 1.05 || 1);
     traces.push({
@@ -325,7 +469,10 @@ const Charts = (() => {
 
     const dayCount = (ts[N - 1] - ts[0]) / 86400000;
     const layout = Object.assign({}, PLOTLY_LAYOUT_DEFAULTS, {
-      barmode: "overlay",
+      // Relative barmode stacks bars with the same sign (mFRR-up + aFRR-up
+      // form one positive stack; mFRR-dn + aFRR-dn form one negative
+      // stack). The DA line and Q_pot line stay overlaid on top.
+      barmode: "relative",
       yaxis: {
         ...PLOTLY_LAYOUT_DEFAULTS.yaxis,
         title: "MW",
@@ -354,6 +501,10 @@ const Charts = (() => {
   }
 
   // ------------ MONTHLY BARS --------------------------------------------
+  // Five stacks per month (six if you count L2 cost stacks): DA, mFRR-up,
+  // mFRR-dn, aFRR-up, aFRR-dn. Each market and direction is its own
+  // colour so the user can see month-to-month which markets actually
+  // contribute, and which would be zeroed by the s split.
   function drawMonthly(targetId, level, monthly) {
     const months = monthly.map((m) => m.month);
     const traces = [
@@ -366,17 +517,31 @@ const Charts = (() => {
       },
       {
         x: months,
-        y: monthly.map((m) => m.up),
+        y: monthly.map((m) => m.up_mfrr),
         type: "bar",
         name: "mFRR-up",
         marker: { color: "#3fb950" },
       },
       {
         x: months,
-        y: monthly.map((m) => m.dn),
+        y: monthly.map((m) => m.up_afrr),
+        type: "bar",
+        name: "aFRR-up",
+        marker: { color: "#56d364" },
+      },
+      {
+        x: months,
+        y: monthly.map((m) => m.dn_mfrr),
         type: "bar",
         name: "mFRR-dn",
         marker: { color: "#f85149" },
+      },
+      {
+        x: months,
+        y: monthly.map((m) => m.dn_afrr),
+        type: "bar",
+        name: "aFRR-dn",
+        marker: { color: "#fa7970" },
       },
     ];
     if (level === 2) {

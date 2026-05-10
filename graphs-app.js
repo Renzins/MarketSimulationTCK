@@ -65,6 +65,11 @@
     winsorMfrrHi: 90,
     deficitThr: -30, // baltic_imb_vol ≤ this → deficit
     surplusThr: 30, // baltic_imb_vol ≥ this → surplus
+    // Day-type filter: "all" | "weekend-holiday" | "workday".
+    // "all" preserves the pre-feature behaviour (no filter); the other
+    // two read Engine.getData().dayTypeMask, computed once at init from
+    // ISO timestamps + the date-holidays plugin.
+    dayType: "all",
     buckets: {
       wind: 4,
       solar: 4,
@@ -128,6 +133,23 @@
             <li><b>−30 / +30 (default):</b> ignores small noise around zero.</li>
             <li><b>0 / 0:</b> every non-zero ISP counts, no neutral band.</li>
             <li><b>−100 / +100:</b> only large imbalances qualify; smaller datasets per regime.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="control">
+        <label>Day type filter</label>
+        <div class="day-type-toggle g-day-type-toggle">
+          <button type="button" class="btn small preset${state.dayType === "all" ? " active" : ""}" data-day-type="all">All days</button>
+          <button type="button" class="btn small preset${state.dayType === "weekend-holiday" ? " active" : ""}" data-day-type="weekend-holiday">Weekends + holidays</button>
+          <button type="button" class="btn small preset${state.dayType === "workday" ? " active" : ""}" data-day-type="workday">Workdays only</button>
+        </div>
+        <div class="param-desc">
+          <p>Restricts every chart to ISPs of the chosen day type. Public-holiday detection runs through the <code>date-holidays</code> plugin for Latvia, Estonia and Lithuania — a date counts as a holiday if <em>any</em> of the three considers it a public holiday. Quantile bin boundaries and winsorisation percentiles are recomputed from the filtered subset.</p>
+          <ul class="extremes">
+            <li><b>All days (default):</b> no day-type filter.</li>
+            <li><b>Weekends + holidays:</b> Sat/Sun and public holidays only.</li>
+            <li><b>Workdays only:</b> Mon–Fri minus public holidays.</li>
           </ul>
         </div>
       </div>
@@ -248,6 +270,10 @@
       const { start, end } = rangeToIdx(state.sim.from, state.sim.to);
       Engine.setWindow(start, end);
       GraphsEngine.setRegimeThresholds(state.deficitThr, state.surplusThr);
+      GraphsEngine.setDayTypeFilter(state.dayType);
+      // setDayTypeFilter must run BEFORE maybeWinsorizeSpread — the winsor
+      // cache key includes the filter, so toggling between day types
+      // forces a fresh percentile derivation against the filtered subset.
       GraphsEngine.maybeWinsorizeSpread(state.winsorMfrrLo, state.winsorMfrrHi);
 
       const wB = state.buckets.wind;
@@ -398,6 +424,22 @@
       slider.addEventListener("input", (e) => onSet(e.target.value));
       num.addEventListener("change", (e) => onSet(e.target.value));
     }
+    // Day-type toggle (mFRR section). Same interaction shape as the
+    // existing direction-toggle — click to set, with one button .active.
+    document
+      .querySelectorAll(".g-day-type-toggle .preset[data-day-type]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const newType = btn.dataset.dayType;
+          if (state.dayType === newType) return;
+          state.dayType = newType;
+          document
+            .querySelectorAll(".g-day-type-toggle .preset[data-day-type]")
+            .forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          scheduleUpdate();
+        });
+      });
     // Recompute (also clears cache)
     document.getElementById("g-recompute").addEventListener("click", updateAll);
   }
@@ -440,6 +482,10 @@
       daBand: 5,
       matchedLevels: 3,
     },
+    // Day-type filter: independent from the mFRR section's so the user can
+    // e.g. analyse aFRR on workdays only while leaving the mFRR view
+    // unfiltered. Same 3 states / same semantics as state.dayType.
+    dayType: "all",
     // Lazy-load state for the 86 MB per-slot price file
     pricesLoaded: false,
     pricesLoading: false,
@@ -551,6 +597,23 @@
         </div>
       </div>
 
+      <div class="control">
+        <label>Day type filter</label>
+        <div class="day-type-toggle g-afrr-day-type-toggle">
+          <button type="button" class="btn small preset${afrrState.dayType === "all" ? " active" : ""}" data-day-type="all">All days</button>
+          <button type="button" class="btn small preset${afrrState.dayType === "weekend-holiday" ? " active" : ""}" data-day-type="weekend-holiday">Weekends + holidays</button>
+          <button type="button" class="btn small preset${afrrState.dayType === "workday" ? " active" : ""}" data-day-type="workday">Workdays only</button>
+        </div>
+        <div class="param-desc">
+          <p>Restricts every aFRR chart (activation bars, divergence, price/spread plots) to ISPs of the chosen day type. Public-holiday detection runs through the <code>date-holidays</code> plugin for Latvia, Estonia and Lithuania — a date counts as a holiday if <em>any</em> of the three considers it a public holiday. Independent from the mFRR section's filter.</p>
+          <ul class="extremes">
+            <li><b>All days (default):</b> no day-type filter.</li>
+            <li><b>Weekends + holidays:</b> Sat/Sun and public holidays only.</li>
+            <li><b>Workdays only:</b> Mon–Fri minus public holidays.</li>
+          </ul>
+        </div>
+      </div>
+
       <!-- Bucket counts for aFRR PRICE / SPREAD charts -->
       <div class="control">
         <label for="g-afrr-buck-wind">Wind buckets<span class="unit">bins</span></label>
@@ -617,6 +680,7 @@
       AfrrEngine.setLvThresholds(afrrState.lvDeficit, afrrState.lvSurplus);
       AfrrEngine.setBalticThresholds(afrrState.balticDeficit, afrrState.balticSurplus);
       AfrrEngine.setRestOfBalticThresholds(afrrState.restDeficit, afrrState.restSurplus);
+      AfrrEngine.setDayTypeFilter(afrrState.dayType);
 
       const lvResult = AfrrEngine.activationRateByRegime("lv");
       const balticResult = AfrrEngine.activationRateByRegime("baltic");
@@ -808,6 +872,7 @@
   async function _runAfrrUpdate() {
     const t0 = performance.now();
     AfrrSpreadEngine.setBalticThresholds(afrrState.balticDeficit, afrrState.balticSurplus);
+    AfrrSpreadEngine.setDayTypeFilter(afrrState.dayType);
     const dir = afrrState.direction; // 'all' | 'pos' | 'neg'
     const wLo = afrrState.winsorAfrrLo;
     const wHi = afrrState.winsorAfrrHi;
@@ -896,9 +961,11 @@
 
     // ----- Matched-by-DA |spread| (charts 7-9) — direction-agnostic -----
     // Cache key intentionally OMITS direction so toggling all/pos/neg reuses
-    // the cached results and skips the heavy recomputation.
+    // the cached results and skips the heavy recomputation. The day-type
+    // filter IS part of the key — switching workdays/weekends changes the
+    // bin edges and the spread sample, so the cached panels would be wrong.
     const win = Engine.getWindow();
-    const matchedKey = `${win.start}-${win.end}-${daB}-${mL}-${wLo}-${wHi}`;
+    const matchedKey = `${win.start}-${win.end}-${daB}-${mL}-${wLo}-${wHi}-${afrrState.dayType}`;
     let cache = _afrrMatchedCache;
     let matchedFromCache = true;
     if (!cache || cache.key !== matchedKey) {
@@ -1020,6 +1087,23 @@
     };
     restDef.addEventListener("change", onRest);
     restSur.addEventListener("change", onRest);
+    // Day-type toggle (aFRR section). Independent from the mFRR side.
+    // scheduleAfrrUpdate re-runs both the activation bars and (if loaded)
+    // the price/spread charts via the existing chain.
+    document
+      .querySelectorAll(".g-afrr-day-type-toggle .preset[data-day-type]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const newType = btn.dataset.dayType;
+          if (afrrState.dayType === newType) return;
+          afrrState.dayType = newType;
+          document
+            .querySelectorAll(".g-afrr-day-type-toggle .preset[data-day-type]")
+            .forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          scheduleAfrrUpdate();
+        });
+      });
     // Bucket counts (price charts only) — same pattern as the mFRR section
     for (const key of ["wind", "solar", "daBand", "matchedLevels"]) {
       const slider = document.getElementById(`g-afrr-buck-${key}`);
@@ -1073,13 +1157,25 @@
   // Cleared on every render to avoid duplicate listeners. Each tab's update
   // fires when it's activated (the engine window is shared, so we need to
   // re-pin it whenever we switch to a tab).
+  //
+  // Resize fix: aFRR activation bars are pre-rendered ~200 ms after page
+  // load (see updateAfrr below) into a panel that's still display:none —
+  // Plotly canvases get drawn at 0×0 and `responsive:true` only fires on
+  // window resize, leaving them visibly broken until the user zoomed or
+  // resized. Forcing Plotly.Plots.resize on every chart in the newly-active
+  // panel re-measures against the now-visible container. Idempotent and
+  // safe on un-rendered charts (guarded via `_fullLayout`).
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
       const section = btn.dataset.section;
-      document.getElementById(`panel-${section}`).classList.add("active");
+      const panel = document.getElementById(`panel-${section}`);
+      panel.classList.add("active");
+      panel.querySelectorAll(".chart").forEach((div) => {
+        if (div._fullLayout) Plotly.Plots.resize(div);
+      });
       // Re-pin the engine window to whichever tab we just activated
       if (section === "afrr") {
         scheduleAfrrUpdate();

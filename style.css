@@ -274,6 +274,41 @@ main {
   font-size: 13px;
 }
 
+/* Day-type toggle (mFRR + aFRR Setup sections). Same shape as the
+   direction-toggle but lives inside a .control card alongside other
+   labelled inputs. flex-wrap so the three buttons collapse onto two
+   rows on narrow viewports rather than overflowing. */
+.day-type-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.day-type-toggle .btn.preset {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* Winsor cap live-preview spans next to each percentile input. The text
+   updates after every Engine.maybeWinsorize call to reflect the current
+   clip values (e.g. "(≤ -23.4 €/MWh)"). */
+.winsor-row {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.winsor-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.winsor-cap {
+  font-size: 11px;
+  color: var(--muted, #9aa5b1);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .controls-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));

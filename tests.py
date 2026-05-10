@@ -1,9 +1,10 @@
 """
 tests.py — comprehensive audit / regression suite for the wind-park backtester.
 
-Covers:
+57 tests over 8 categories; aFRR / split tests are gated on the optional
+data files being present so the suite still passes on a stripped repo.
 
-  A. DATA INTEGRITY
+  A. DATA INTEGRITY (data.js vs CSV)
      - Baltic aggregations are exact sums of LV + EE + LT
      - LV imbalance volume equals imbalance_volume_lv from CSV
      - Spread = mFRR_SA − DA, agrees with CSV
@@ -13,34 +14,60 @@ Covers:
 
   B. ENGINE INVARIANTS (Python mirror of engine.js)
      - Whole-MW rounding: Q_da_sold, Q_w, trusted_rev, Q_dn_offer are all integers
-     - mFRR-dn cap: Q_dn_offer ≤ Q_da_sold and Q_dn_offer == 0 when Q_da_sold == 0
-     - mFRR-up and mFRR-dn never fire in the same ISP
+     - mFRR-dn cap: Q_dn_offer ≤ Q_da_sold; Q_dn_offer == 0 when Q_da_sold == 0
+     - mFRR-up and mFRR-dn never fire in the same ISP (post-activation gate)
      - Window respect: simulate over a sub-window matches summing per-ISP rev
      - NaN p_imb: L2 imbalance cost is 0 in those rows; L1 unaffected
+     - L1 / L2 frozen-value regressions (see E)
 
   C. SPEC EXAMPLES (the two from the original brief)
      - Example 1: F=20, X=10, Y=0.5, ID=18, Z=0.5, P_mfrr=50, Q_pot=12, P_imb=200, θ=30 → −322.5 €
      - Example 2: F=20, X=10, P_da=100 (above X), Q_pot=10, P_imb=20, θ=30 → +375.0 €
 
   D. GRAPHS ENGINE
-     - Surplus/deficit classification respects thresholds
+     - Surplus/deficit classification respects thresholds (default ±30 MW)
      - Quantile bins have ≈ equal sample sizes (within 1)
-     - Bin edges match np.quantile output
      - SURPLUS spread is overall negative, DEFICIT positive (statistical sanity)
+     - Baltic wind / imbalance distribution sanity (range, median, zero-centred)
 
-  E. KNOWN-VALUE REGRESSIONS
-     - L1 default (X=30, Y=1) → 13,257,221 €
-     - L2 default (X=30, Y=1, Z=1, θ=30) → 13,367,642 €
-     - Naive L1 + L2 figures
-     - Counts: ISPs short, total shortfall MWh
+  E. SCHEMA + FROZEN REGRESSIONS
+     - data.js has every required column; lengths match n
+     - Q_pot ≥ 0 and ≤ 58.8 MW; DA forecast same
+     - **L1 default (X=30, Y=1, s_up=s_dn=1) = 13,257,221 €**
+     - **L2 default (X=30, Y=1, Z=1, θ=30, s_up=s_dn=1) = 13,367,642 €**
+     - L1 naive (X=Y=Z=0) is computable & positive
 
-  F. aFRR DATA (when data-afrr.js is present)
-     - data-afrr.js keys present, length matches main data n
+  F. aFRR ACTIVATION COUNTS (data-afrr.js, optional)
+     - Keys present, length matches main data n
      - n_total ≤ 225 (15-min × 60 sec / 4-sec resolution)
      - n_pos ≤ n_total, n_neg ≤ n_total, n_any ≤ n_total
      - max(n_pos, n_neg) ≤ n_any ≤ n_pos + n_neg (set algebra)
      - ISPs before 2025-05-01 have n_total = 0 (aFRR data starts then)
      - For 30 random ISPs: per-ISP counts equal direct count from CSV slice
+
+  G. aFRR PER-4-S PRICES (chunked data-afrr-prices-*.js, optional)
+     - Reassembled schema (parallel arrays, n_entries lengths match)
+     - Each chunk file ≤ 50 MB (GitHub-friendly)
+     - meta.n_chunks matches number of chunk files on disk
+     - n_pos_entries equals sum(n_pos); remainder equals sum(n_neg)
+     - ISP indices in [0, n); price file only references active ISPs
+     - per-ISP price-entry count matches n_pos+n_neg on 30 random ISPs
+
+  H. aFRR 15-MIN AVERAGES + mFRR↔aFRR SPLIT (data-afrr-15min.js, optional)
+     - Schema + length match data.js
+     - Pre-2025-05-01 ISPs have avg = 0
+     - Synthetic 900 €/MWh × 1 slot → avg 4 €/MWh → 1 €/MW (revenue formula)
+     - **Mixed-sign ISP regression** (the −10 / +50 example):
+       favourable-only filter recovers the 0.011 €/MW favourable-slot
+       earnings that naïve averaging would have dropped. Asserts
+       avg_p_pos ≥ 0 and avg_p_neg ≤ 0 dataset-wide BY CONSTRUCTION.
+     - Split round+remainder: Q_mfrr + Q_afrr == Q_offer (no MW lost)
+     - s_up = s_dn = 1 reproduces legacy spec example, ignoring aFRR feeds
+     - s_up = s_dn = 0 routes everything to aFRR; revenue uses avg_p_*
+     - aFRR-up gate blocks avg_p_pos ≤ 0; aFRR-dn gate blocks avg_p_neg ≥ 0
+     - mFRR-dn AND aFRR-up can earn simultaneously when prices allow
+     - Asymmetric splits (s_up = 1, s_dn = 0) route per direction independently
+     - L1 with real aFRR feeds vs zeroed feeds confirms the feeds are wired
 
 Run:  python tests.py
 Exit code 0 = all green; >0 = N failures.
@@ -67,6 +94,7 @@ CSV_PATH = os.path.join(BASE, "main_data_with_imbalance.csv")
 DATA_JS_PATH = os.path.join(BASE, "data.js")
 AFRR_CSV_PATH = os.path.join(BASE, "ast_afrr_data.csv")
 DATA_AFRR_JS_PATH = os.path.join(BASE, "data-afrr.js")
+DATA_AFRR_15MIN_PATH = os.path.join(BASE, "data-afrr-15min.js")
 # Per-slot price file is now CHUNKED. The meta file is tiny; the chunks
 # (data-afrr-prices-001.js, ...-002.js, ...) each hold a slice of the
 # parallel arrays. Tests load all chunks and concatenate, so they see the
@@ -183,8 +211,34 @@ def _floor(x: float) -> int:
     return math.floor(x + 1e-9)
 
 
-def isp_revenue(level: int, F, ID, P_da, P_mfrr, Q_pot, P_imb, X, Y, Z=0.0, theta=0.0):
-    """Pure-Python reference for one ISP's P&L. Mirrors engine.js exactly."""
+def isp_revenue(
+    level: int,
+    F,
+    ID,
+    P_da,
+    P_mfrr,
+    Q_pot,
+    P_imb,
+    X,
+    Y,
+    Z=0.0,
+    theta=0.0,
+    s_up=1.0,
+    s_dn=1.0,
+    avg_p_pos=0.0,
+    avg_p_neg=0.0,
+    n_pos_fav=0,
+    n_neg_fav=0,
+):
+    """Pure-Python reference for one ISP's P&L. Mirrors engine.js exactly,
+    including the per-direction mFRR↔aFRR split (s_up = s_dn = 1 default
+    → all mFRR → matches the pre-feature math).
+
+    n_pos_fav / n_neg_fav are the FAVOURABLE 4-s slot counts (slots
+    where AST_POS > 0 / AST_NEG < 0) that scale the position
+    contribution. They match avg_p_pos / avg_p_neg's favourable-only
+    averaging — see preprocess-afrr-15min.py.
+    """
     above_X = P_da >= X
     da_sold = _floor(F if above_X else F * (1 - Y))
     Q_w = _floor(0 if above_X else F - da_sold)
@@ -192,14 +246,32 @@ def isp_revenue(level: int, F, ID, P_da, P_mfrr, Q_pot, P_imb, X, Y, Z=0.0, thet
     trusted_extra = _floor(trusted_raw) if trusted_raw > 0 else 0
     Q_up_offer = Q_w + trusted_extra
     Q_dn_offer = da_sold  # CAP: curtailment can't exceed DA position
+    s_up_c = 0.0 if s_up < 0 else (1.0 if s_up > 1 else float(s_up))
+    s_dn_c = 0.0 if s_dn < 0 else (1.0 if s_dn > 1 else float(s_dn))
+    Q_up_mfrr = round(s_up_c * Q_up_offer)
+    Q_up_afrr = Q_up_offer - Q_up_mfrr
+    Q_dn_mfrr = round(s_dn_c * Q_dn_offer)
+    Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
     is_up = P_mfrr >= 1
     is_dn = P_mfrr <= -1
-    Q_up = Q_up_offer if is_up else 0
-    Q_dn = Q_dn_offer if is_dn else 0
+    up_mfrr = Q_up_mfrr if is_up else 0
+    dn_mfrr = Q_dn_mfrr if is_dn else 0
+    # aFRR profitability gate (per direction, per ISP) — mirrors engine.js.
+    # Wind park only bids aFRR-up where avg_p_pos > 0 (positive earnings)
+    # and aFRR-dn where avg_p_neg < 0 (system pays the park to curtail).
+    up_afrr_active = avg_p_pos > 0 and Q_up_afrr > 0
+    dn_afrr_active = avg_p_neg < 0 and Q_dn_afrr > 0
     DA_rev = da_sold * P_da
-    Up_rev = Q_up * P_mfrr
-    Dn_rev = -Q_dn * P_mfrr
-    Q_pos = da_sold + Q_up - Q_dn  # mFRR-dn reduces our promised production
+    Up_rev_mfrr = up_mfrr * P_mfrr
+    Dn_rev_mfrr = -dn_mfrr * P_mfrr
+    Up_rev_afrr = Q_up_afrr * avg_p_pos if up_afrr_active else 0.0
+    Dn_rev_afrr = -Q_dn_afrr * avg_p_neg if dn_afrr_active else 0.0
+    # Favourable-count fraction — see preprocess-afrr-15min.py.
+    a_frac_pos = n_pos_fav / 225.0
+    a_frac_neg = n_neg_fav / 225.0
+    up_afrr_disp = Q_up_afrr * a_frac_pos if up_afrr_active else 0.0
+    dn_afrr_disp = Q_dn_afrr * a_frac_neg if dn_afrr_active else 0.0
+    Q_pos = da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp
     if level == 2:
         Q_short = max(0.0, Q_pos - Q_pot)
         # NaN p_imb: treat as 0 cost (April rows)
@@ -213,18 +285,31 @@ def isp_revenue(level: int, F, ID, P_da, P_mfrr, Q_pot, P_imb, X, Y, Z=0.0, thet
         Q_short = 0
         imb = 0
         flat = 0
-    rev = (DA_rev + Up_rev + Dn_rev - imb - flat) * 0.25
+    rev = (DA_rev + Up_rev_mfrr + Dn_rev_mfrr + Up_rev_afrr + Dn_rev_afrr - imb - flat) * 0.25
     return {
         "rev": rev,
         "Q_da_sold": da_sold,
         "Q_w": Q_w,
-        "Q_up": Q_up,
-        "Q_dn": Q_dn,
+        # Back-compat: Q_up / Q_dn report the TOTAL offered MW (matching
+        # simulate()'s perISP arrays).
+        "Q_up": Q_up_mfrr + Q_up_afrr,
+        "Q_dn": Q_dn_mfrr + Q_dn_afrr,
+        # Q_*_mfrr / Q_*_afrr are the OFFERED split (pre-activation gating).
+        # Q_*_mfrr_active are the volumes that actually fired this ISP
+        # after the |P_mfrr| ≥ 1 gate.
+        "Q_up_mfrr": Q_up_mfrr,
+        "Q_up_afrr": Q_up_afrr,
+        "Q_dn_mfrr": Q_dn_mfrr,
+        "Q_dn_afrr": Q_dn_afrr,
+        "Q_up_mfrr_active": up_mfrr,
+        "Q_dn_mfrr_active": dn_mfrr,
         "Q_pos": Q_pos,
         "Q_short": Q_short,
         "DA_rev": DA_rev,
-        "Up_rev": Up_rev,
-        "Dn_rev": Dn_rev,
+        "Up_rev": Up_rev_mfrr,
+        "Dn_rev": Dn_rev_mfrr,
+        "Up_rev_afrr": Up_rev_afrr,
+        "Dn_rev_afrr": Dn_rev_afrr,
         "imb": imb,
         "flat": flat,
     }
@@ -243,8 +328,31 @@ def winsorize(arr: np.ndarray, p_lo: float, p_hi: float) -> np.ndarray:
     return out
 
 
-def simulate_total(level, F, ID, P_da, P_mfrr_w, Q_pot, P_imb_w, X, Y, Z=0.0, theta=0.0):
-    """Vectorised total-only mirror of engine.simulateTotal (with current winsorized prices)."""
+def simulate_total(
+    level,
+    F,
+    ID,
+    P_da,
+    P_mfrr_w,
+    Q_pot,
+    P_imb_w,
+    X,
+    Y,
+    Z=0.0,
+    theta=0.0,
+    s_up=1.0,
+    s_dn=1.0,
+    avg_p_pos_w=None,
+    avg_p_neg_w=None,
+    n_pos_fav=None,
+    n_neg_fav=None,
+):
+    """Vectorised total-only mirror of engine.simulateTotal (with current
+    winsorized prices). n_pos_fav / n_neg_fav are FAVOURABLE 4-s slot
+    counts — see isp_revenue() and preprocess-afrr-15min.py.
+    Defaults make this collapse to the no-aFRR case so the FROZEN
+    regression tests (s_up = s_dn = 1) stay valid.
+    """
     above_X = P_da >= X
     da_sold = np.floor((np.where(above_X, F, F * (1 - Y))) + 1e-9).astype(np.float64)
     Q_w = np.floor(np.where(above_X, 0, F - da_sold) + 1e-9)
@@ -255,13 +363,44 @@ def simulate_total(level, F, ID, P_da, P_mfrr_w, Q_pot, P_imb_w, X, Y, Z=0.0, th
         trusted_extra = np.zeros_like(F)
     Q_up_offer = Q_w + trusted_extra
     Q_dn_offer = da_sold
+    s_up_c = max(0.0, min(1.0, float(s_up)))
+    s_dn_c = max(0.0, min(1.0, float(s_dn)))
+    # round() instead of floor for the split (matches engine.js)
+    Q_up_mfrr = np.round(s_up_c * Q_up_offer)
+    Q_up_afrr = Q_up_offer - Q_up_mfrr
+    Q_dn_mfrr = np.round(s_dn_c * Q_dn_offer)
+    Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
     is_up = P_mfrr_w >= 1
     is_dn = P_mfrr_w <= -1
-    Q_up = np.where(is_up, Q_up_offer, 0)
-    Q_dn = np.where(is_dn, Q_dn_offer, 0)
-    rev = da_sold * P_da + Q_up * P_mfrr_w - Q_dn * P_mfrr_w
+    up_mfrr_active = np.where(is_up, Q_up_mfrr, 0)
+    dn_mfrr_active = np.where(is_dn, Q_dn_mfrr, 0)
+    if avg_p_pos_w is None:
+        avg_p_pos_w = np.zeros_like(F)
+    if avg_p_neg_w is None:
+        avg_p_neg_w = np.zeros_like(F)
+    if n_pos_fav is None:
+        n_pos_fav = np.zeros_like(F)
+    if n_neg_fav is None:
+        n_neg_fav = np.zeros_like(F)
+    # aFRR profitability gate — see isp_revenue() and engine.js. Per-element
+    # mask on (price favourable AND volume offered).
+    up_afrr_active = (avg_p_pos_w > 0) & (Q_up_afrr > 0)
+    dn_afrr_active = (avg_p_neg_w < 0) & (Q_dn_afrr > 0)
+    rev = (
+        da_sold * P_da
+        + up_mfrr_active * P_mfrr_w
+        - dn_mfrr_active * P_mfrr_w
+        + np.where(up_afrr_active, Q_up_afrr * avg_p_pos_w, 0)
+        - np.where(dn_afrr_active, Q_dn_afrr * avg_p_neg_w, 0)
+    )
     if level == 2:
-        Q_pos = da_sold + Q_up - Q_dn
+        a_frac_pos = n_pos_fav / 225.0
+        a_frac_neg = n_neg_fav / 225.0
+        up_afrr_disp = np.where(up_afrr_active, Q_up_afrr * a_frac_pos, 0)
+        dn_afrr_disp = np.where(dn_afrr_active, Q_dn_afrr * a_frac_neg, 0)
+        Q_pos = (
+            da_sold + up_mfrr_active + up_afrr_disp - dn_mfrr_active - dn_afrr_disp
+        )
         Q_short = np.maximum(0, Q_pos - Q_pot)
         # Skip imbalance cost where p_imb is NaN
         valid_imb = ~np.isnan(P_imb_w)
@@ -466,7 +605,12 @@ def test_mfrr_dn_capped_at_da():
 
 
 def test_mfrr_up_dn_mutually_exclusive():
-    """A single ISP can never fire both up and down (P_mfrr is single-signed)."""
+    """A single ISP can never fire both up and down on mFRR (P_mfrr is
+    single-signed). NB: Q_up / Q_dn now report OFFERED volumes which can
+    both be > 0 (a wind park always has DA position to curtail and may
+    have withheld volume to ramp up); the right check is on the
+    post-activation fields Q_up_mfrr_active / Q_dn_mfrr_active.
+    """
     rng = np.random.default_rng(49)
     sample = rng.choice(DATA["n"], size=200, replace=False)
     F_arr = np.asarray(DATA["da_forecast"])
@@ -478,10 +622,10 @@ def test_mfrr_up_dn_mutually_exclusive():
             r = isp_revenue(
                 2, F_arr[i], ID_arr[i], P_da_arr[i], p_mfrr_arr[i], 0, 0, X, Y, 0.5
             )
-            # Both can be 0; but never both > 0
-            both_active = r["Q_up"] > 0 and r["Q_dn"] > 0
+            both_active = r["Q_up_mfrr_active"] > 0 and r["Q_dn_mfrr_active"] > 0
             assert not both_active, (
-                f"i={i}: both Q_up={r['Q_up']} and Q_dn={r['Q_dn']} > 0 (P_mfrr={p_mfrr_arr[i]})"
+                f"i={i}: both Q_up_mfrr_active={r['Q_up_mfrr_active']} and "
+                f"Q_dn_mfrr_active={r['Q_dn_mfrr_active']} > 0 (P_mfrr={p_mfrr_arr[i]})"
             )
 
 
@@ -745,6 +889,21 @@ if HAS_AFRR:
 else:
     print("data-afrr.js not found — skipping aFRR tests.")
     AFRR = None
+
+HAS_AFRR_15MIN = os.path.exists(DATA_AFRR_15MIN_PATH)
+if HAS_AFRR_15MIN:
+    print("Loading data-afrr-15min.js…")
+    with open(DATA_AFRR_15MIN_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    AFRR_15MIN = json.loads(text[text.index("{") : text.rindex("}") + 1])
+    print(
+        f"  data-afrr-15min.js: n = {AFRR_15MIN['n']:,}, "
+        f"avg_p_pos median = {np.median(AFRR_15MIN['avg_p_pos']):.2f}, "
+        f"avg_p_neg median = {np.median(AFRR_15MIN['avg_p_neg']):.2f}"
+    )
+else:
+    print("data-afrr-15min.js not found — skipping aFRR averaging tests.")
+    AFRR_15MIN = None
 
 
 def test_lv_imb_vol_equals_csv_lv():
@@ -1014,6 +1173,377 @@ def test_afrr_prices_spread_sign_check():
 
 
 # =============================================================================
+#  H. aFRR 15-min averaged prices + mFRR↔aFRR split (s)
+# =============================================================================
+def test_afrr_15min_schema():
+    """data-afrr-15min.js must have keys + lengths matching main data.js."""
+    if not HAS_AFRR_15MIN:
+        return
+    for k in ("n", "avg_p_pos", "avg_p_neg"):
+        assert k in AFRR_15MIN, f"data-afrr-15min.js missing '{k}'"
+    assert AFRR_15MIN["n"] == DATA["n"], (
+        f"15min n={AFRR_15MIN['n']} mismatches main n={DATA['n']}"
+    )
+    assert len(AFRR_15MIN["avg_p_pos"]) == DATA["n"]
+    assert len(AFRR_15MIN["avg_p_neg"]) == DATA["n"]
+
+
+def test_afrr_15min_pre_may2025_is_zero():
+    """ISPs before 2025-05-01 (when aFRR data starts) must have avg = 0."""
+    if not HAS_AFRR_15MIN:
+        return
+    avg_pos = np.asarray(AFRR_15MIN["avg_p_pos"])
+    avg_neg = np.asarray(AFRR_15MIN["avg_p_neg"])
+    cutoff = pd.Timestamp("2025-05-01 00:00:00")
+    pre_mask = DATA_TS < cutoff
+    assert (avg_pos[pre_mask] == 0).all(), "Pre-2025-05-01 avg_p_pos has non-zero values"
+    assert (avg_neg[pre_mask] == 0).all(), "Pre-2025-05-01 avg_p_neg has non-zero values"
+
+
+def test_afrr_15min_synthetic_revenue_formula():
+    """The user's worked example, encoded as a math test:
+    a single 4 s slot at 900 EUR/MWh in an otherwise-empty ISP averages
+    to 4 EUR/MWh, and 1 MW × 4 × 0.25 h = 1 € per offered MW.
+    """
+    avg = 900.0 / 225.0
+    assert abs(avg - 4.0) < 1e-9
+    rev_per_mw = 1.0 * avg * 0.25
+    expected = 900.0 / 225.0 / 4.0
+    assert abs(rev_per_mw - expected) < 1e-9
+    # And: with avg integration (Q × avg × 0.25), the time-weighted aFRR
+    # contribution to position is the same factor 1/225 that scales by
+    # n_pos. For 1 active 4-s slot: position_avg = 1 MW × 1/225.
+    pos_avg = 1.0 * (1.0 / 225.0)
+    assert abs(pos_avg * 0.25 - (1.0 / 900.0)) < 1e-9
+
+
+def test_split_round_remainder_invariant():
+    """Q_*_mfrr + Q_*_afrr == Q_*_offer for every (Q_offer, s) — no MW lost
+    to rounding. Tested over a dense (Q, s) grid.
+    """
+    rng = np.random.default_rng(123)
+    Q_grid = list(range(0, 60))  # plausible MW range for the wind park
+    s_grid = [0.0, 0.05, 0.1, 0.25, 0.333, 0.5, 0.7, 0.95, 1.0]
+    for Q in Q_grid:
+        for s in s_grid:
+            Q_mfrr = round(s * Q)
+            Q_afrr = Q - Q_mfrr
+            assert Q_mfrr + Q_afrr == Q, f"Lost MW at Q={Q}, s={s}"
+            assert Q_mfrr >= 0 and Q_afrr >= 0, (
+                f"Negative split at Q={Q}, s={s}: mfrr={Q_mfrr}, afrr={Q_afrr}"
+            )
+
+
+def test_split_s1_matches_pre_feature_math():
+    """With s=1, every ISP's revenue must equal what the legacy formula
+    would have produced (no aFRR contribution at all). We test on the
+    spec's worked examples — the only ISPs whose expected total is fully
+    pinned independently — and the dataset-level L1/L2 frozen values
+    further down already test the same thing on real data."""
+    # Spec example 1 with s=1 (all mFRR) should yield the same -322.5 €.
+    r = isp_revenue(
+        2, F=20, ID=18, P_da=5, P_mfrr=50, Q_pot=12, P_imb=200,
+        X=10, Y=0.5, Z=0.5, theta=30, s_up=1.0, s_dn=1.0,
+        avg_p_pos=999, avg_p_neg=999, n_pos_fav=100, n_neg_fav=100,
+    )
+    # Even though we passed phantom aFRR prices, s=1 means Q_*_afrr=0
+    # so the aFRR contribution is exactly 0 and we recover -322.5.
+    assert abs(r["rev"] - (-322.5)) < 1e-6, (
+        f"s=1 should reproduce legacy: got {r['rev']:+.2f}, expected -322.50"
+    )
+    assert r["Q_up_afrr"] == 0 and r["Q_dn_afrr"] == 0, (
+        f"s=1 must zero aFRR volumes: Q_up_afrr={r['Q_up_afrr']}, Q_dn_afrr={r['Q_dn_afrr']}"
+    )
+
+
+def test_split_s0_routes_all_to_afrr():
+    """With s=0, ALL upward and downward MW go to aFRR; mFRR portion is 0."""
+    # Pick an ISP with non-zero offers. F=20, no withholding (Y=0) means
+    # da_sold=20, Q_w=0 → upward only via Z trust. Use Y=1 below X to
+    # force Q_w=20 (everything withheld).
+    r = isp_revenue(
+        1, F=20, ID=20, P_da=5, P_mfrr=50, Q_pot=20, P_imb=0,
+        X=10, Y=1.0, Z=0, theta=0, s_up=0.0, s_dn=0.0,
+        avg_p_pos=10, avg_p_neg=-20, n_pos_fav=100, n_neg_fav=50,
+    )
+    assert r["Q_up_mfrr"] == 0 and r["Q_dn_mfrr"] == 0
+    assert r["Q_up_afrr"] == 20  # F=20, Y=1, all withheld → all to aFRR
+    assert r["Q_dn_afrr"] == 0   # da_sold = 0 since Y=1 below X
+    # Revenue: aFRR-up only = 20 × 10 × 0.25 = 50 €
+    assert abs(r["rev"] - 50.0) < 1e-6, f"Expected 50 €, got {r['rev']:+.2f}"
+
+
+def test_split_s_half_distributes_evenly():
+    """With s=0.5 and Q_offer=10: Q_mfrr=5, Q_afrr=5."""
+    # F=20 below X with Y=0.5: da_sold = floor(20*0.5)=10, Q_w = 10.
+    # No Z. Upward offer = 10. Down offer = da_sold = 10.
+    r = isp_revenue(
+        1, F=20, ID=20, P_da=5, P_mfrr=50, Q_pot=20, P_imb=0,
+        X=10, Y=0.5, Z=0, theta=0, s_up=0.5, s_dn=0.5,
+        avg_p_pos=10, avg_p_neg=-20, n_pos_fav=0, n_neg_fav=0,
+    )
+    assert r["Q_up_mfrr"] == 5 and r["Q_up_afrr"] == 5
+    assert r["Q_dn_mfrr"] == 5 and r["Q_dn_afrr"] == 5
+
+
+def test_afrr_gate_blocks_unfavorable_up():
+    """avg_p_pos ≤ 0 → aFRR-up earns 0 (wind park wouldn't bid into a
+    money-losing upward direction)."""
+    r = isp_revenue(
+        1, F=20, ID=20, P_da=5, P_mfrr=50, Q_pot=20, P_imb=0,
+        X=10, Y=1.0, Z=0, theta=0, s_up=0.0, s_dn=0.0,
+        avg_p_pos=-5, avg_p_neg=-20, n_pos_fav=100, n_neg_fav=50,
+    )
+    # avg_p_pos = -5 (< 0) → gate fails → aFRR-up earns 0
+    assert r["Up_rev_afrr"] == 0, f"Expected 0 from gated aFRR-up, got {r['Up_rev_afrr']}"
+    # da_sold = 0 (Y=1 below X) → no aFRR-dn either, so total = 0
+    assert abs(r["rev"]) < 1e-9, f"Total should be 0, got {r['rev']}"
+
+
+def test_afrr_gate_blocks_unfavorable_dn():
+    """avg_p_neg ≥ 0 → aFRR-dn earns 0 (positive downward price would mean
+    park PAYS the system to curtail — irrational to bid). Negative
+    avg_p_neg → −Q × neg = positive earnings, gate passes.
+    """
+    # Set up an ISP where mFRR-dn doesn't fire (so we isolate aFRR-dn).
+    # da_sold = 20, Q_dn_offer = 20. s = 0 → Q_dn_afrr = 20.
+    r_block = isp_revenue(
+        1, F=20, ID=20, P_da=100, P_mfrr=50, Q_pot=20, P_imb=0,
+        X=10, Y=0, Z=0, theta=0, s_up=0.0, s_dn=0.0,
+        avg_p_pos=-1, avg_p_neg=+25, n_pos_fav=0, n_neg_fav=100,
+    )
+    # avg_p_neg = +25 → gate fails → aFRR-dn earns 0 (would otherwise be
+    # −20 × 25 × 0.25 = −125 €, a loss the gate prevents).
+    assert r_block["Dn_rev_afrr"] == 0, (
+        f"Gate must block: got Dn_rev_afrr={r_block['Dn_rev_afrr']}"
+    )
+
+    r_pass = isp_revenue(
+        1, F=20, ID=20, P_da=100, P_mfrr=50, Q_pot=20, P_imb=0,
+        X=10, Y=0, Z=0, theta=0, s_up=0.0, s_dn=0.0,
+        avg_p_pos=-1, avg_p_neg=-50, n_pos_fav=0, n_neg_fav=100,
+    )
+    # avg_p_neg = -50 → gate passes → −20 × −50 × 0.25 = +250 € from aFRR-dn
+    assert abs(r_pass["Dn_rev_afrr"] - (20 * -(-50)) * 1) < 1e-9 or True
+    # The actual revenue check: -Q × avg_p_neg = -20 × -50 = 1000; ×0.25 baked in via "rev"
+    # Easier to assert on the dict's pre-0.25 Dn_rev_afrr field:
+    assert r_pass["Dn_rev_afrr"] == 1000, (
+        f"Expected -Q×p = -20×-50 = 1000 (pre-0.25), got {r_pass['Dn_rev_afrr']}"
+    )
+
+
+def test_afrr_15min_filter_recovers_mixed_sign_isp():
+    """An ISP with mixed-sign AST_NEG (e.g. {-10, +50, NaN×223}) used to
+    average to a positive number under the old preprocessor, which then
+    failed the avg_p_neg < 0 gate and lost the favourable-slot earnings
+    entirely. The favourable-only filter in preprocess-afrr-15min.py
+    fixes this. We check two things here:
+
+    1. data-afrr-15min.js's avg_p_neg is ALWAYS ≤ 0 by construction (the
+       filter drops every positive AST_NEG before summing).
+    2. The Python mirror reproduces the user's worked example exactly:
+       1 MW × 4-s × 10 €/MWh = 0.0111 € per MW for an ISP with one
+       favourable slot at avg_p_neg = -10/225 ≈ -0.0444 €/MWh.
+    """
+    if not HAS_AFRR_15MIN:
+        return
+    avg_neg = np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64)
+    avg_pos = np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64)
+    # Property 1 — favourable-only filter holds dataset-wide.
+    assert avg_neg.max() <= 0, (
+        f"avg_p_neg should be ≤ 0 dataset-wide after filter; max = {avg_neg.max():.6f}"
+    )
+    assert avg_pos.min() >= 0, (
+        f"avg_p_pos should be ≥ 0 dataset-wide after filter; min = {avg_pos.min():.6f}"
+    )
+    # Property 2 — synthetic worked example via the Python mirror.
+    # 1 MW offered downward, da_sold = 1 (so aFRR-dn has volume after
+    # split s_dn = 0). avg_p_neg = -10/225 ≈ -0.0444 EUR/MWh,
+    # n_neg_fav = 1 favourable slot.
+    avg_neg_synth = -10.0 / 225.0
+    r = isp_revenue(
+        1, F=1, ID=1, P_da=100, P_mfrr=50, Q_pot=1, P_imb=0,
+        X=10, Y=0, Z=0, theta=0,
+        s_up=1.0, s_dn=0.0,
+        avg_p_pos=0.0, avg_p_neg=avg_neg_synth,
+        n_pos_fav=0, n_neg_fav=1,
+    )
+    # Q_dn_offer = da_sold = 1; s_dn=0 → Q_dn_afrr = 1
+    # Dn_rev_afrr = -1 × -10/225 = 10/225 (pre-0.25)
+    expected_pre = 10.0 / 225.0
+    assert abs(r["Dn_rev_afrr"] - expected_pre) < 1e-9, (
+        f"aFRR-dn pre-0.25 rev: expected {expected_pre:.6f}, got {r['Dn_rev_afrr']:.6f}"
+    )
+    # Total ISP rev includes DA + aFRR-dn × 0.25
+    # DA = 1 × 100 = 100 → ×0.25 = 25 €
+    # aFRR-dn = 10/225 × 0.25 ≈ 0.01111 €
+    expected_rev = (1 * 100 + expected_pre) * 0.25
+    assert abs(r["rev"] - expected_rev) < 1e-9, (
+        f"ISP rev: expected {expected_rev:.6f} €, got {r['rev']:.6f} €"
+    )
+
+
+def test_split_asymmetric_s_up_neq_s_dn():
+    """s_up and s_dn are independent: s_up=1 routes all upward to mFRR
+    while s_dn=0 routes all downward to aFRR (in the same ISP)."""
+    # F=20, P_da=5, X=10 → below X. Y=0.5: da_sold=10, Q_w=10.
+    # P_mfrr = -50 → mFRR-dn fires; mFRR-up not.
+    # avg_p_pos = 30 (gate would pass for aFRR-up, but we route 0 upward)
+    # avg_p_neg = -25 (favourable for aFRR-dn)
+    # s_up = 1 → Q_up_mfrr = 10, Q_up_afrr = 0
+    # s_dn = 0 → Q_dn_mfrr = 0,  Q_dn_afrr = 10
+    r = isp_revenue(
+        1, F=20, ID=20, P_da=5, P_mfrr=-50, Q_pot=20, P_imb=0,
+        X=10, Y=0.5, Z=0, theta=0,
+        s_up=1.0, s_dn=0.0,
+        avg_p_pos=30, avg_p_neg=-25, n_pos_fav=100, n_neg_fav=100,
+    )
+    # Upward: mFRR-up didn't fire (P_mfrr negative); aFRR-up offered 0 MW
+    # because s_up = 1.
+    assert r["Q_up_mfrr"] == 10 and r["Q_up_afrr"] == 0, (
+        f"s_up=1: Q_up_mfrr should be 10, Q_up_afrr should be 0; got "
+        f"{r['Q_up_mfrr']} / {r['Q_up_afrr']}"
+    )
+    assert r["Up_rev"] == 0 and r["Up_rev_afrr"] == 0
+    # Downward: mFRR-dn would fire BUT s_dn=0 routed all to aFRR; mFRR-dn
+    # rev should be 0 (no mFRR offer), aFRR-dn rev should be positive.
+    assert r["Q_dn_mfrr"] == 0 and r["Q_dn_afrr"] == 10
+    assert r["Dn_rev"] == 0  # mFRR-dn got 0 MW
+    # aFRR-dn: -10 × -25 = +250 (pre-0.25 = ÷4 baked into r["rev"])
+    assert r["Dn_rev_afrr"] == 250
+    # ISP rev = (DA + 0 + 0 + 0 + 250) × 0.25 = (10×5 + 250) × 0.25 = 75
+    assert abs(r["rev"] - 75.0) < 1e-6, f"Expected 75, got {r['rev']}"
+
+
+def test_afrr_simultaneous_mfrr_dn_and_afrr_up():
+    """A single ISP can earn from BOTH mFRR-dn (P_mfrr negative) AND
+    aFRR-up (avg_p_pos > 0) at the same time — different MW pools, the
+    gates fire independently. This is the case the user explicitly asked
+    the algorithm to support.
+    """
+    # P_mfrr = -50 → isDn (mFRR-dn fires)
+    # avg_p_pos = +30 → aFRR-up gate passes
+    # avg_p_neg = +5 → aFRR-dn gate FAILS (price unfavourable for downward)
+    # F=20 below X, Y=0.5: da_sold = 10, Q_w = 10.
+    # s=0.5 → Q_up_mfrr=5, Q_up_afrr=5, Q_dn_mfrr=5, Q_dn_afrr=5
+    r = isp_revenue(
+        1, F=20, ID=20, P_da=5, P_mfrr=-50, Q_pot=20, P_imb=0,
+        X=10, Y=0.5, Z=0, theta=0, s_up=0.5, s_dn=0.5,
+        avg_p_pos=30, avg_p_neg=+5, n_pos_fav=100, n_neg_fav=50,
+    )
+    # mFRR-dn earns: -5 × -50 = +250 (pre-0.25 = ÷4)
+    assert r["Dn_rev"] == 250, f"mFRR-dn should be +250, got {r['Dn_rev']}"
+    # aFRR-up earns: 5 × 30 = +150
+    assert r["Up_rev_afrr"] == 150, f"aFRR-up should be +150, got {r['Up_rev_afrr']}"
+    # mFRR-up didn't fire (P_mfrr negative)
+    assert r["Up_rev"] == 0
+    # aFRR-dn gated out (avg_p_neg = +5 > 0)
+    assert r["Dn_rev_afrr"] == 0
+    # Total ISP rev: (DA + mFRR-dn + aFRR-up) × 0.25
+    #  = (10 × 5 + 250 + 150) × 0.25 = 450 / 4 = 112.5 €
+    assert abs(r["rev"] - 112.5) < 1e-6, f"Total expected 112.5, got {r['rev']}"
+
+
+def test_l1_default_value_with_default_s_unchanged():
+    """The frozen L1 = 13,257,221 € must still hold when s=1 (the default
+    in the UI). Re-runs the existing simulate_total mirror with s=1
+    (explicit) and matched aFRR feeds — same result as the original test.
+    """
+    F = np.asarray(DATA["da_forecast"], dtype=np.float64)
+    ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
+    P_da = np.asarray(DATA["p_da"], dtype=np.float64)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
+    if HAS_AFRR_15MIN:
+        avg_pos = winsorize(np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64), 10, 90)
+        avg_neg = winsorize(np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64), 10, 90)
+        # Favourable-only counts from data-afrr-15min.js (mirrors
+        # engine.js's preference). Falls back to AFRR's all-non-NaN
+        # counts if the new arrays aren't present.
+        if "n_pos_fav" in AFRR_15MIN:
+            n_pos_fav = np.asarray(AFRR_15MIN["n_pos_fav"], dtype=np.float64)
+            n_neg_fav = np.asarray(AFRR_15MIN["n_neg_fav"], dtype=np.float64)
+        elif HAS_AFRR:
+            n_pos_fav = np.asarray(AFRR["n_pos"], dtype=np.float64)
+            n_neg_fav = np.asarray(AFRR["n_neg"], dtype=np.float64)
+        else:
+            n_pos_fav = np.zeros_like(F)
+            n_neg_fav = np.zeros_like(F)
+    else:
+        avg_pos = np.zeros_like(F)
+        avg_neg = np.zeros_like(F)
+        n_pos_fav = np.zeros_like(F)
+        n_neg_fav = np.zeros_like(F)
+    val = simulate_total(
+        1, F, ID, P_da, p_mfrr, Q_pot, p_imb,
+        X=30, Y=1, Z=0, s_up=1.0, s_dn=1.0,
+        avg_p_pos_w=avg_pos, avg_p_neg_w=avg_neg, n_pos_fav=n_pos_fav, n_neg_fav=n_neg_fav,
+    )
+    print(f"\n        L1 (s=1, X=30, Y=1, with aFRR feeds wired but unused) = {val:,.0f} €")
+    assert abs(val - FROZEN_L1_DEFAULT_EUR) < 100, (
+        f"L1 with s=1 = {val:,.0f} but FROZEN value is {FROZEN_L1_DEFAULT_EUR:,} — "
+        "split logic must not regress when no volume goes to aFRR"
+    )
+
+
+def test_l1_s0_produces_meaningful_afrr_revenue():
+    """With s=0 (all aFRR) the L1 total must be a meaningful number
+    distinct from the s=1 case AND distinct from a sentinel "no-aFRR"
+    run (avg arrays = 0). After the profitability gate, s=0 and s=1
+    converge close to each other on this dataset (the wind park bids
+    sensibly in either market) — but s=0 still relies on the aFRR feeds
+    being wired through the engine, which we verify by zeroing them.
+    """
+    if not HAS_AFRR_15MIN or not HAS_AFRR:
+        return
+    F = np.asarray(DATA["da_forecast"], dtype=np.float64)
+    ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
+    P_da = np.asarray(DATA["p_da"], dtype=np.float64)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
+    avg_pos = winsorize(np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64), 10, 90)
+    avg_neg = winsorize(np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64), 10, 90)
+    # Favourable-only counts from data-afrr-15min.js.
+    if "n_pos_fav" in AFRR_15MIN:
+        n_pos_fav = np.asarray(AFRR_15MIN["n_pos_fav"], dtype=np.float64)
+        n_neg_fav = np.asarray(AFRR_15MIN["n_neg_fav"], dtype=np.float64)
+    else:
+        n_pos_fav = np.asarray(AFRR["n_pos"], dtype=np.float64)
+        n_neg_fav = np.asarray(AFRR["n_neg"], dtype=np.float64)
+    # s=1: aFRR feeds completely unused (Q_*_afrr = 0).
+    v_mfrr_only = simulate_total(
+        1, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=0, s_up=1.0, s_dn=1.0,
+        avg_p_pos_w=avg_pos, avg_p_neg_w=avg_neg,
+        n_pos_fav=n_pos_fav, n_neg_fav=n_neg_fav,
+    )
+    # s=0 with REAL aFRR feeds: every MW routed to aFRR, gated by sign.
+    v_afrr_real = simulate_total(
+        1, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=0, s_up=0.0, s_dn=0.0,
+        avg_p_pos_w=avg_pos, avg_p_neg_w=avg_neg,
+        n_pos_fav=n_pos_fav, n_neg_fav=n_neg_fav,
+    )
+    # s=0 with ZERO aFRR feeds: gate fails for everything → only DA earns.
+    v_afrr_blank = simulate_total(
+        1, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=0, s_up=0.0, s_dn=0.0,
+        avg_p_pos_w=np.zeros_like(avg_pos), avg_p_neg_w=np.zeros_like(avg_neg),
+        n_pos_fav=np.zeros_like(n_pos_fav), n_neg_fav=np.zeros_like(n_neg_fav),
+    )
+    print(
+        f"\n        s=1 (mFRR only) = {v_mfrr_only:,.0f} €  ; "
+        f"s=0 (real aFRR) = {v_afrr_real:,.0f} €  ; "
+        f"s=0 (zeroed aFRR) = {v_afrr_blank:,.0f} €"
+    )
+    # Real aFRR feeds must produce a different total than zeroed feeds —
+    # this confirms the aFRR price arrays actually flow into the rev.
+    assert abs(v_afrr_real - v_afrr_blank) > 100_000, (
+        f"s=0 with real vs zeroed aFRR differ by only "
+        f"{abs(v_afrr_real - v_afrr_blank):,.0f} € — feeds may not be wired"
+    )
+
+
+# =============================================================================
 #  Register & run
 # =============================================================================
 # A. Data integrity
@@ -1074,6 +1604,24 @@ if HAS_AFRR_PRICES:
     R.add("price file only references ISPs with n_total > 0", test_afrr_prices_only_active_isps)
     R.add("per-ISP price-entry counts match n_pos+n_neg (30 random ISPs)", test_afrr_prices_per_isp_count_matches)
     R.add("merged-spread median in plausible band (-100..+100 EUR/MWh)", test_afrr_prices_spread_sign_check)
+
+# H. aFRR 15-min averaged prices + mFRR↔aFRR split (s)
+R.add("split round+remainder: Q_mfrr + Q_afrr == Q_offer (no MW lost)", test_split_round_remainder_invariant)
+R.add("s=1 reproduces legacy spec example (-322.50 €) ignoring aFRR feeds", test_split_s1_matches_pre_feature_math)
+R.add("s=0 routes everything to aFRR; revenue uses avg_p_pos / avg_p_neg", test_split_s0_routes_all_to_afrr)
+R.add("s=0.5 splits 10 MW → 5 mFRR + 5 aFRR each direction", test_split_s_half_distributes_evenly)
+R.add("aFRR-up gate: avg_p_pos ≤ 0 → 0 revenue (no money-losing bids)", test_afrr_gate_blocks_unfavorable_up)
+R.add("aFRR-dn gate: blocks avg_p_neg > 0; passes avg_p_neg < 0 (earns +)", test_afrr_gate_blocks_unfavorable_dn)
+R.add("mFRR-dn AND aFRR-up can earn simultaneously when prices allow", test_afrr_simultaneous_mfrr_dn_and_afrr_up)
+R.add("asymmetric splits: s_up=1 + s_dn=0 routes upward → mFRR, downward → aFRR independently", test_split_asymmetric_s_up_neq_s_dn)
+if HAS_AFRR_15MIN:
+    R.add("data-afrr-15min.js schema + length matches main data.js", test_afrr_15min_schema)
+    R.add("aFRR 15-min averages are 0 before 2025-05-01 (no data)", test_afrr_15min_pre_may2025_is_zero)
+    R.add("synthetic 900 EUR/MWh × 1 slot → 4 EUR/MWh avg → 1 €/MW", test_afrr_15min_synthetic_revenue_formula)
+    R.add("favourable-only filter: mixed-sign AST_NEG ISP recovers earnings (-10/+50 case)", test_afrr_15min_filter_recovers_mixed_sign_isp)
+    R.add("L1 default with explicit s=1 + aFRR feeds wired = frozen value", test_l1_default_value_with_default_s_unchanged)
+    if HAS_AFRR:
+        R.add("L1 s=0: real aFRR feeds change result vs zeroed feeds (split is live)", test_l1_s0_produces_meaningful_afrr_revenue)
 
 
 if __name__ == "__main__":

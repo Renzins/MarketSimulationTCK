@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Graphs</title>
-    <link rel="stylesheet" href="style.css?v=12" />
+    <link rel="stylesheet" href="style.css?v=15" />
   </head>
   <body>
     <nav class="site-nav">
@@ -366,14 +366,30 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="data.js?v=12"></script>
-    <script src="data-afrr.js?v=12"></script>
-    <script src="engine.js?v=12"></script>
-    <script src="graphs-engine.js?v=12"></script>
-    <script src="graphs-charts.js?v=12"></script>
-    <script src="afrr-engine.js?v=12"></script>
-    <script src="afrr-charts.js?v=12"></script>
-    <script src="afrr-spread-engine.js?v=12"></script>
-    <script src="graphs-app.js?v=12"></script>
+    <!--
+      date-holidays plugin (UMD bundle, exposes window.Holidays). Drives the
+      day-type filter (workdays / weekends+holidays) by detecting public
+      holidays in LV / EE / LT. Loaded BEFORE engine.js so Engine.init can
+      build the dayTypeMask up front. If this CDN fails the holiday set
+      stays empty and the filter degrades to weekend-only — engine.js logs
+      a console.info in that case but keeps working.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/date-holidays@3.28.0/dist/umd.min.js"></script>
+    <script src="data.js?v=15"></script>
+    <script src="data-afrr.js?v=15"></script>
+    <!--
+      data-afrr-15min.js: per-ISP averaged AST_POS / AST_NEG (NaN→0, ÷225)
+      from preprocess-afrr-15min.py. Engine.init wraps it into typed arrays;
+      Graphs page doesn't currently use these prices but engine.js reads
+      them up front so the Backtester and Graphs share one engine init path.
+    -->
+    <script src="data-afrr-15min.js?v=15"></script>
+    <script src="engine.js?v=15"></script>
+    <script src="graphs-engine.js?v=15"></script>
+    <script src="graphs-charts.js?v=15"></script>
+    <script src="afrr-engine.js?v=15"></script>
+    <script src="afrr-charts.js?v=15"></script>
+    <script src="afrr-spread-engine.js?v=15"></script>
+    <script src="graphs-app.js?v=15"></script>
   </body>
 </html>

@@ -89,6 +89,34 @@
         ["25 / 75", "aggressive trimming"],
       ],
     },
+    w_afrr_pos: {
+      group: "setup",
+      label: "Winsorize aFRR upward (avg) price (percentiles)",
+      unit: "%",
+      isWinsor: true,
+      defaultLo: 10,
+      defaultHi: 90,
+      description:
+        "Caps the per-ISP averaged aFRR upward price (sum of AST_POS, NaN→0, ÷225) at the chosen percentiles. Only matters when s < 1 (any volume offered to aFRR).",
+      extremes: [
+        ["0 / 100", "no winsorization — extreme spike-ISPs retained"],
+        ["25 / 75", "aggressive trimming — middle 50 % only"],
+      ],
+    },
+    w_afrr_neg: {
+      group: "setup",
+      label: "Winsorize aFRR downward (avg) price (percentiles)",
+      unit: "%",
+      isWinsor: true,
+      defaultLo: 10,
+      defaultHi: 90,
+      description:
+        "Same idea on the aFRR downward (AST_NEG) average. Downward prices can be very negative — winsorization is especially relevant here.",
+      extremes: [
+        ["0 / 100", "no winsorization"],
+        ["25 / 75", "aggressive trimming"],
+      ],
+    },
     X: {
       group: "market",
       label: "DA price threshold X",
@@ -156,6 +184,40 @@
         ["θ = 100", "very risk-averse — discourages any over-promising"],
       ],
     },
+    s_up: {
+      group: "market",
+      label: "mFRR ↔ aFRR split — UPWARD (s_up)",
+      unit: "0–1",
+      min: 0,
+      max: 1,
+      sliderStep: 0.01,
+      numStep: 0.05,
+      decimals: 2,
+      description:
+        "Fraction of UPWARD offered MW routed to mFRR vs aFRR. Whole-MW market constraint preserved: Q_up_mfrr = round(s_up · Q_up_offer), Q_up_afrr = remainder. mFRR-up clears only on upside spikes (P_mfrr ≥ 1); aFRR-up earns whenever the per-ISP averaged AST_POS > 0.",
+      extremes: [
+        ["s_up = 1 (default)", "all upward volume to mFRR — matches the pre-feature behaviour"],
+        ["s_up = 0", "all upward volume to aFRR — earns averaged AST_POS continuously"],
+        ["0 < s_up < 1", "split: e.g. s_up = 0.7 → ~70 % mFRR-up, 30 % aFRR-up"],
+      ],
+    },
+    s_dn: {
+      group: "market",
+      label: "mFRR ↔ aFRR split — DOWNWARD (s_dn)",
+      unit: "0–1",
+      min: 0,
+      max: 1,
+      sliderStep: 0.01,
+      numStep: 0.05,
+      decimals: 2,
+      description:
+        "Fraction of DOWNWARD offered MW (curtailment of DA position) routed to mFRR vs aFRR. Independent from s_up because the per-direction price dynamics differ: mFRR-dn fires only when P_mfrr ≤ −1 (system pays park to curtail); aFRR-dn earns whenever the averaged AST_NEG < 0.",
+      extremes: [
+        ["s_dn = 1 (default)", "all downward volume to mFRR"],
+        ["s_dn = 0", "all downward volume to aFRR"],
+        ["0 < s_dn < 1", "split: e.g. s_dn = 0.5 → 50/50 between markets"],
+      ],
+    },
   };
 
   // Per-level configuration. naive = parameters used as the baseline that
@@ -164,31 +226,68 @@
   // top section; market keys in the (optimised) bottom section.
   const LEVEL_CONFIG = {
     1: {
-      paramKeys: ["sim_range", "w_mfrr", "w_imb", "X", "Y"],
-      naive: { X: 0, Y: 0, Z: 0 }, // only market params reset by Reset button
+      paramKeys: [
+        "sim_range",
+        "w_mfrr",
+        "w_imb",
+        "w_afrr_pos",
+        "w_afrr_neg",
+        "X",
+        "Y",
+        "s_up",
+        "s_dn",
+      ],
+      // naive = all withholding levers at their no-strategy values. The
+      // splits stay at the user's current setting so the "vs naïve" diff
+      // isolates the value of withholding (X/Y/Z), not market choice.
+      naive: { X: 0, Y: 0, Z: 0 },
       defaults: {
         X: 30,
         Y: 1.0,
+        s_up: 1.0,
+        s_dn: 1.0,
         w_mfrr_lo: 10,
         w_mfrr_hi: 90,
         w_imb_lo: 10,
         w_imb_hi: 90,
+        w_afrr_pos_lo: 10,
+        w_afrr_pos_hi: 90,
+        w_afrr_neg_lo: 10,
+        w_afrr_neg_hi: 90,
       },
       imbalanceDisabled: true,
       hasImbalance: false,
     },
     2: {
-      paramKeys: ["sim_range", "w_mfrr", "w_imb", "X", "Y", "Z", "theta_flat"],
+      paramKeys: [
+        "sim_range",
+        "w_mfrr",
+        "w_imb",
+        "w_afrr_pos",
+        "w_afrr_neg",
+        "X",
+        "Y",
+        "Z",
+        "theta_flat",
+        "s_up",
+        "s_dn",
+      ],
       naive: { X: 0, Y: 0, Z: 0 },
       defaults: {
         X: 30,
         Y: 1.0,
         Z: 1.0,
         theta_flat: 30,
+        s_up: 1.0,
+        s_dn: 1.0,
         w_mfrr_lo: 10,
         w_mfrr_hi: 90,
         w_imb_lo: 10,
         w_imb_hi: 90,
+        w_afrr_pos_lo: 10,
+        w_afrr_pos_hi: 90,
+        w_afrr_neg_lo: 10,
+        w_afrr_neg_hi: 90,
       },
       imbalanceDisabled: false,
       hasImbalance: true,
@@ -201,11 +300,15 @@
       { key: "DA", label: "DA revenue", type: "eur" },
       { key: "mFRR_up", label: "mFRR-up rev", type: "eur" },
       { key: "mFRR_dn", label: "mFRR-dn rev", type: "eur" },
+      { key: "aFRR_up", label: "aFRR-up rev", type: "eur" },
+      { key: "aFRR_dn", label: "aFRR-dn rev", type: "eur" },
     ],
     2: [
       { key: "DA", label: "DA revenue", type: "eur" },
       { key: "mFRR_up", label: "mFRR-up rev", type: "eur" },
       { key: "mFRR_dn", label: "mFRR-dn rev", type: "eur" },
+      { key: "aFRR_up", label: "aFRR-up rev", type: "eur" },
+      { key: "aFRR_dn", label: "aFRR-dn rev", type: "eur" },
       { key: "imb", label: "Imbalance cost", type: "eur-cost" },
       { key: "flat", label: "Flat penalty", type: "eur-cost" },
     ],
@@ -214,12 +317,16 @@
     1: [
       { key: "up", label: "ISPs with mFRR-up", type: "int" },
       { key: "dn", label: "ISPs with mFRR-dn", type: "int" },
-      { key: "wasted", label: "Withheld w/o activation", type: "int", help: "Below X, withheld but mFRR price between −1 and +1 — energy earns nothing." },
+      { key: "upAfrr", label: "ISPs with aFRR-up", type: "int", help: "ISPs where avg_p_pos > 0 AND we routed volume to aFRR (s < 1) — wind park bid into upward and earned." },
+      { key: "dnAfrr", label: "ISPs with aFRR-dn", type: "int", help: "ISPs where avg_p_neg < 0 AND we routed volume to aFRR — system paid the park to curtail." },
+      { key: "wasted", label: "Withheld w/o activation", type: "int", help: "Below X, withheld but neither mFRR cleared nor aFRR was profitable — energy earns nothing." },
     ],
     2: [
       { key: "up", label: "ISPs with mFRR-up", type: "int" },
       { key: "dn", label: "ISPs with mFRR-dn", type: "int" },
-      { key: "wasted", label: "Withheld w/o activation", type: "int", help: "Below X, withheld but no mFRR clearing — energy earns nothing." },
+      { key: "upAfrr", label: "ISPs with aFRR-up", type: "int", help: "ISPs where avg_p_pos > 0 AND we routed volume to aFRR (s < 1) — wind park bid into upward and earned." },
+      { key: "dnAfrr", label: "ISPs with aFRR-dn", type: "int", help: "ISPs where avg_p_neg < 0 AND we routed volume to aFRR — system paid the park to curtail." },
+      { key: "wasted", label: "Withheld w/o activation", type: "int", help: "Below X, withheld but neither market activated profitably — energy earns nothing." },
       { key: "short", label: "ISPs with shortfall", type: "int" },
       { key: "shortMWh", label: "Total shortfall (MWh)", type: "mwh" },
       { key: "shortAvg", label: "Avg cost / short ISP", type: "eur" },
@@ -317,6 +424,9 @@
     }
 
     // ---- winsor card ----
+    // Two cap-preview spans show the live percentile-derived clip values
+    // (e.g. "≤ −23 €/MWh" / "≥ 234 €/MWh"), updated by updateWinsorCaps()
+    // after every Engine.maybeWinsorize call.
     if (def.isWinsor) {
       const disabled =
         key === "w_imb" && cfg.imbalanceDisabled ? "disabled" : "";
@@ -325,10 +435,16 @@
       return `
         <div class="control winsor">
           <label>${def.label}</label>
-          <div class="slider-row two">
-            <input type="number" id="${idBase}-lo" value="${lo}" min="0" max="50" step="1" ${disabled}>
+          <div class="slider-row two winsor-row">
+            <span class="winsor-input">
+              <input type="number" id="${idBase}-lo" value="${lo}" min="0" max="50" step="1" ${disabled}>
+              <span class="winsor-cap" id="${idBase}-cap-lo">(…)</span>
+            </span>
             <span>/</span>
-            <input type="number" id="${idBase}-hi" value="${hi}" min="50" max="100" step="1" ${disabled}>
+            <span class="winsor-input">
+              <input type="number" id="${idBase}-hi" value="${hi}" min="50" max="100" step="1" ${disabled}>
+              <span class="winsor-cap" id="${idBase}-cap-hi">(…)</span>
+            </span>
           </div>
           <div class="param-desc">
             <p>${def.description}${cfg.imbalanceDisabled && key === "w_imb" ? " <em>Disabled in Level 1.</em>" : ""}</p>
@@ -408,6 +524,40 @@
     return Math.round(v).toLocaleString("en-US") + " MWh";
   }
 
+  // Format a winsor cap value (EUR/MWh) for the live preview span. Big
+  // numbers get thousand separators, small ones get 1 dp.
+  function fmtCap(v) {
+    if (!isFinite(v)) return "—";
+    const abs = Math.abs(v);
+    if (abs >= 1000) return Math.round(v).toLocaleString("en-US");
+    if (abs >= 100) return v.toFixed(0);
+    return v.toFixed(1);
+  }
+
+  // Update the "(≤ X €/MWh)" / "(≥ Y €/MWh)" preview spans next to every
+  // winsor input in the given level. Called after Engine.maybeWinsorize.
+  // Map from PARAM_DEFS key → bounds object key on the maybeWinsorize result.
+  function updateWinsorCaps(level, bounds) {
+    const map = [
+      ["w_mfrr", bounds && bounds.mfrrBounds],
+      ["w_imb", bounds && bounds.imbBounds],
+      ["w_afrr_pos", bounds && bounds.afrrPosBounds],
+      ["w_afrr_neg", bounds && bounds.afrrNegBounds],
+    ];
+    for (const [key, b] of map) {
+      const loEl = document.getElementById(`l${level}-${key}-cap-lo`);
+      const hiEl = document.getElementById(`l${level}-${key}-cap-hi`);
+      if (!loEl || !hiEl) continue;
+      if (!b) {
+        loEl.textContent = "(…)";
+        hiEl.textContent = "(…)";
+        continue;
+      }
+      loEl.textContent = `(≤ ${fmtCap(b.lo)} €/MWh)`;
+      hiEl.textContent = `(≥ ${fmtCap(b.hi)} €/MWh)`;
+    }
+  }
+
   function isoDate(d) {
     return d.toISOString().substring(0, 10);
   }
@@ -457,10 +607,28 @@
     const sim_range = state[level].simRange;
     const { start: winStart, end: winEnd } = rangeToIdx(sim_range.from, sim_range.to);
     Engine.setWindow(winStart, winEnd);
-    Engine.maybeWinsorize(p.w_mfrr_lo, p.w_mfrr_hi, p.w_imb_lo, p.w_imb_hi);
+    const bounds = Engine.maybeWinsorize(
+      p.w_mfrr_lo,
+      p.w_mfrr_hi,
+      p.w_imb_lo,
+      p.w_imb_hi,
+      p.w_afrr_pos_lo,
+      p.w_afrr_pos_hi,
+      p.w_afrr_neg_lo,
+      p.w_afrr_neg_hi,
+    );
+    updateWinsorCaps(level, bounds);
 
-    // 2. Always recompute naive at current θ_flat (and current window).
-    const naive = Engine.simulateTotal(level, 0, 0, 0, p.theta_flat || 0);
+    // 2. Always recompute naive at current θ_flat AND current splits.
+    const naive = Engine.simulateTotal(
+      level,
+      0,
+      0,
+      0,
+      p.theta_flat || 0,
+      p.s_up == null ? 1 : p.s_up,
+      p.s_dn == null ? 1 : p.s_dn,
+    );
     const sim = Engine.simulate(level, p);
     state[level].lastSim = sim;
     state[level].lastNaive = naive;
@@ -491,6 +659,8 @@
       let v;
       if (col.key === "up") v = fmtInt(sim.counts.up);
       else if (col.key === "dn") v = fmtInt(sim.counts.dn);
+      else if (col.key === "upAfrr") v = fmtInt(sim.counts.upAfrr || 0);
+      else if (col.key === "dnAfrr") v = fmtInt(sim.counts.dnAfrr || 0);
       else if (col.key === "wasted") v = fmtInt(sim.counts.wasted);
       else if (col.key === "short") v = fmtInt(sim.counts.short);
       else if (col.key === "shortMWh") v = fmtMWh(sim.totalShortMWh);
@@ -635,20 +805,40 @@
     btn.addEventListener("click", () => {
       btn.disabled = true;
       const p = state[level].params;
-      Engine.maybeWinsorize(p.w_mfrr_lo, p.w_mfrr_hi, p.w_imb_lo, p.w_imb_hi);
+      Engine.maybeWinsorize(
+        p.w_mfrr_lo,
+        p.w_mfrr_hi,
+        p.w_imb_lo,
+        p.w_imb_hi,
+        p.w_afrr_pos_lo,
+        p.w_afrr_pos_hi,
+        p.w_afrr_neg_lo,
+        p.w_afrr_neg_hi,
+      );
       const xs = [];
       for (let x = -100; x <= 300; x += 10) xs.push(x);
       const ys = [];
       for (let y = 0; y <= 1.0001; y += 0.05) ys.push(parseFloat(y.toFixed(2)));
+      // Per-direction split grids. The split parameters are 2-D in the
+      // sweep (s_up × s_dn) so the optimiser can pick asymmetric ratios.
+      // L1: 6 × 6 = 36 split combos (was 11). 41 × 21 × 36 ≈ 31 k → ~12 s.
+      // L2: 4 × 4 = 16 split combos. 41 × 21 × 11 × 16 ≈ 152 k → ~60 s.
+      const ssL1 = [0, 0.2, 0.4, 0.6, 0.8, 1.0];
+      const ssL2 = [0, 0.33, 0.67, 1.0];
       progEl.textContent = "computing…";
       if (level === 1) {
         setTimeout(() => {
           const t0 = performance.now();
-          const result = Engine.sweepLevel1(xs, ys);
+          const result = Engine.sweepLevel1(xs, ys, ssL1, ssL1);
           const ms = Math.round(performance.now() - t0);
-          progEl.textContent = `done in ${ms} ms — best at X=${result.best.X}, Y=${result.best.Y.toFixed(2)} → ${fmtEUR(result.best.revenue)}`;
+          progEl.textContent =
+            `done in ${ms} ms — best at X=${result.best.X}, Y=${result.best.Y.toFixed(2)},` +
+            ` s_up=${result.best.s_up.toFixed(2)}, s_dn=${result.best.s_dn.toFixed(2)}` +
+            ` → ${fmtEUR(result.best.revenue)}`;
           setSliderValue(1, "X", result.best.X);
           setSliderValue(1, "Y", result.best.Y);
+          setSliderValue(1, "s_up", result.best.s_up);
+          setSliderValue(1, "s_dn", result.best.s_dn);
           state[1].lastSweep = result;
           updateLevel(1);
           btn.disabled = false;
@@ -657,47 +847,69 @@
         const zs = [];
         for (let z = 0; z <= 1.0001; z += 0.1) zs.push(parseFloat(z.toFixed(1)));
         let xi = 0;
-        const grid = [];
+        // 5-D sweep over (X, Y, Z, s_up, s_dn). Only the running best is
+        // tracked — saving the full grid would cost > 50 MB at this
+        // resolution. The heatmap is redrawn on demand from simulateTotal
+        // and uses the CURRENT slider values for the un-pinned dimensions.
         let bestRev = -Infinity,
           bestX = 0,
           bestY = 0,
-          bestZ = 0;
+          bestZ = 0,
+          bestSup = 1,
+          bestSdn = 1;
         const tStart = performance.now();
         function runRow() {
           if (xi >= xs.length) {
             const ms = Math.round(performance.now() - tStart);
             const result = {
-              xs,
-              ys,
-              zs,
-              grid,
-              best: { X: bestX, Y: bestY, Z: bestZ, revenue: bestRev },
+              best: {
+                X: bestX,
+                Y: bestY,
+                Z: bestZ,
+                s_up: bestSup,
+                s_dn: bestSdn,
+                revenue: bestRev,
+              },
             };
-            progEl.textContent = `done in ${ms} ms — best at X=${bestX}, Y=${bestY.toFixed(2)}, Z=${bestZ.toFixed(2)} → ${fmtEUR(bestRev)}`;
+            progEl.textContent =
+              `done in ${ms} ms — best at X=${bestX}, Y=${bestY.toFixed(2)},` +
+              ` Z=${bestZ.toFixed(2)}, s_up=${bestSup.toFixed(2)},` +
+              ` s_dn=${bestSdn.toFixed(2)} → ${fmtEUR(bestRev)}`;
             setSliderValue(2, "X", bestX);
             setSliderValue(2, "Y", bestY);
             setSliderValue(2, "Z", bestZ);
+            setSliderValue(2, "s_up", bestSup);
+            setSliderValue(2, "s_dn", bestSdn);
             state[2].lastSweep = result;
             updateLevel(2);
             btn.disabled = false;
             return;
           }
-          const xRow = [];
           for (let yi = 0; yi < ys.length; yi++) {
-            const yRow = new Float64Array(zs.length);
             for (let zi = 0; zi < zs.length; zi++) {
-              const r = Engine.simulateTotal(2, xs[xi], ys[yi], zs[zi], p.theta_flat);
-              yRow[zi] = r;
-              if (r > bestRev) {
-                bestRev = r;
-                bestX = xs[xi];
-                bestY = ys[yi];
-                bestZ = zs[zi];
+              for (let ui = 0; ui < ssL2.length; ui++) {
+                for (let di = 0; di < ssL2.length; di++) {
+                  const r = Engine.simulateTotal(
+                    2,
+                    xs[xi],
+                    ys[yi],
+                    zs[zi],
+                    p.theta_flat,
+                    ssL2[ui],
+                    ssL2[di],
+                  );
+                  if (r > bestRev) {
+                    bestRev = r;
+                    bestX = xs[xi];
+                    bestY = ys[yi];
+                    bestZ = zs[zi];
+                    bestSup = ssL2[ui];
+                    bestSdn = ssL2[di];
+                  }
+                }
               }
             }
-            xRow.push(yRow);
           }
-          grid.push(xRow);
           xi++;
           progEl.textContent = `computing… ${Math.round((xi / xs.length) * 100)}%`;
           setTimeout(runRow, 0);
@@ -805,7 +1017,15 @@
         for (let xi = 0; xi < xs.length; xi++) {
           const row = new Float64Array(ys.length);
           for (let yi = 0; yi < ys.length; yi++) {
-            row[yi] = Engine.simulateTotal(level, xs[xi], ys[yi], p.Z || 0, p.theta_flat || 0);
+            row[yi] = Engine.simulateTotal(
+              level,
+              xs[xi],
+              ys[yi],
+              p.Z || 0,
+              p.theta_flat || 0,
+              p.s_up == null ? 1 : p.s_up,
+              p.s_dn == null ? 1 : p.s_dn,
+            );
           }
           grid.push(row);
         }
@@ -819,7 +1039,15 @@
         for (let xi = 0; xi < xs.length; xi++) {
           const row = new Float64Array(zs.length);
           for (let zi = 0; zi < zs.length; zi++) {
-            row[zi] = Engine.simulateTotal(2, xs[xi], p.Y, zs[zi], p.theta_flat);
+            row[zi] = Engine.simulateTotal(
+              2,
+              xs[xi],
+              p.Y,
+              zs[zi],
+              p.theta_flat,
+              p.s_up == null ? 1 : p.s_up,
+              p.s_dn == null ? 1 : p.s_dn,
+            );
           }
           grid.push(row);
         }
@@ -833,7 +1061,15 @@
         for (let yi = 0; yi < ys.length; yi++) {
           const row = new Float64Array(zs.length);
           for (let zi = 0; zi < zs.length; zi++) {
-            row[zi] = Engine.simulateTotal(2, p.X, ys[yi], zs[zi], p.theta_flat);
+            row[zi] = Engine.simulateTotal(
+              2,
+              p.X,
+              ys[yi],
+              zs[zi],
+              p.theta_flat,
+              p.s_up == null ? 1 : p.s_up,
+              p.s_dn == null ? 1 : p.s_dn,
+            );
           }
           grid.push(row);
         }

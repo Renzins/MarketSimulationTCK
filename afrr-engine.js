@@ -27,6 +27,7 @@
 //   init()                                  — wrap AFRR_DATA into Int16Arrays
 //   setLvThresholds(deficit, surplus)       — module-level pair for LV regime
 //   setBalticThresholds(deficit, surplus)   — module-level pair for Baltic regime
+//   setDayTypeFilter(filter)                — "all" | "workday" | "weekend-holiday"
 //   activationRateByRegime(level)           — { surplus: {...}, deficit: {...} }
 //                                             where level = "lv" | "baltic"
 
@@ -81,6 +82,20 @@ const AfrrEngine = (() => {
     _restSurplus = surplusThr;
   }
 
+  // ---------- day-type filter --------------------------------------------
+  // Mirrors GraphsEngine — same 3 states, same semantics. Reads
+  // Engine.getData().dayTypeMask, populated once at Engine.init().
+  let _dayTypeFilter = "all";
+  function setDayTypeFilter(filter) {
+    _dayTypeFilter = filter || "all";
+  }
+  function _acceptsDay(i) {
+    if (_dayTypeFilter === "all") return true;
+    const v = D.dayTypeMask[i];
+    if (_dayTypeFilter === "workday") return v === 0;
+    return v !== 0; // 'weekend-holiday'
+  }
+
   // --------- activation rate computation ---------------------------------
   // Each 4-second slot lands in EXACTLY ONE of four mutually-exclusive states:
   //   neither   — both AST_POS and AST_NEG are NaN  (no activation)
@@ -111,6 +126,7 @@ const AfrrEngine = (() => {
     let d = _emptyBucket();
 
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       // Skip ISPs that aren't covered by the aFRR data file
       const tot = A.n_total[i];
       if (tot === 0) continue;
@@ -195,6 +211,7 @@ const AfrrEngine = (() => {
     const a = _emptyBucket(); // case A: LV+ / rest−
     const b = _emptyBucket(); // case B: LV− / rest+
     for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
       const tot = A.n_total[i];
       if (tot === 0) continue;
       const lvVal = lv[i];
@@ -252,6 +269,7 @@ const AfrrEngine = (() => {
     setLvThresholds,
     setBalticThresholds,
     setRestOfBalticThresholds,
+    setDayTypeFilter,
     activationRateByRegime,
     activationRateByDivergence,
   };
