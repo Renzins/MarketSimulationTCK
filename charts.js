@@ -60,6 +60,67 @@ const Charts = (() => {
     return v.toLocaleString("en-US", { maximumFractionDigits: 2 }) + " €/MWh";
   }
 
+  // Tooltip colour palette — used by drawTimeSeries's per-ISP tooltip and
+  // the P&L breakdown equation. Picked to match the chart bar palette so
+  // the visual cues line up: green = upward / positive revenue, red =
+  // downward / cost, blue = MW (volume), yellow = €/MWh (price), orange =
+  // Q_pot (physical generation), grey = operators / asides.
+  const TT_COL = {
+    mw: "#58a6ff",
+    price: "#ffd166",
+    posRev: "#3fb950",
+    negRev: "#f85149",
+    pot: "#f0883e",
+    dim: "#7d8590",
+  };
+  function ttMW(v, signed) {
+    const sign = signed && v > 0 ? "+" : "";
+    return `<span style="color:${TT_COL.mw}">${sign}${fmtMW(v)}</span>`;
+  }
+  function ttPrice(v) {
+    return `<span style="color:${TT_COL.price}">${fmtPrice(v)}</span>`;
+  }
+  function ttRev(v, signed) {
+    const c = v >= 0 ? TT_COL.posRev : TT_COL.negRev;
+    const sign = signed && v >= 0 ? "+" : "";
+    return `<b style="color:${c}">${sign}${fmtEUR(v)}</b>`;
+  }
+  function ttPot(v) {
+    return `<span style="color:${TT_COL.pot}">${fmtMW(v)}</span>`;
+  }
+  // Build the P&L equation line: "150 + 30 − 24 = +156 €".
+  // terms is an array of numbers; only non-zero entries (|v| ≥ 0.5) are
+  // shown. Operators are dimmed; terms are coloured by sign; total is
+  // bolded.
+  function ttEquation(terms, total) {
+    const nonZero = terms.filter((v) => Math.abs(v) >= 0.5);
+    const totalCol = total >= 0 ? TT_COL.posRev : TT_COL.negRev;
+    const totalStr = `<b style="color:${totalCol};font-size:13px">${total >= 0 ? "+" : ""}${fmtEUR(total)}</b>`;
+    if (nonZero.length === 0) {
+      return `<span style="color:${TT_COL.dim}">0 =</span> ${totalStr}`;
+    }
+    const fmtTerm = (v) => {
+      const c = v >= 0 ? TT_COL.posRev : TT_COL.negRev;
+      const absStr = Math.round(Math.abs(v)).toLocaleString("en-US");
+      return `<span style="color:${c}">${absStr}</span>`;
+    };
+    let html = "";
+    for (let i = 0; i < nonZero.length; i++) {
+      const v = nonZero[i];
+      if (i === 0) {
+        html =
+          v >= 0
+            ? fmtTerm(v)
+            : `<span style="color:${TT_COL.dim}">−</span>${fmtTerm(v)}`;
+      } else {
+        const op = v >= 0 ? "+" : "−";
+        html += ` <span style="color:${TT_COL.dim}">${op}</span> ${fmtTerm(v)}`;
+      }
+    }
+    html += ` <span style="color:${TT_COL.dim}">=</span> ${totalStr}`;
+    return html;
+  }
+
   // ------------ TIME SERIES ---------------------------------------------
   // Renders DA-sold, mFRR up/down volumes, optionally Q_pot for level 2.
   // Single-trace tooltip strategy: ALL hover content is attached to a
@@ -108,6 +169,11 @@ const Charts = (() => {
     const dnAfrrOffered = new Array(N);
     const upAfrrDisp = new Array(N); // dispatched (avg) MW = offered × n_pos/225
     const dnAfrrDisp = new Array(N); // negative-signed for the bar
+    // S3 (Level-3 speculation) bars: oversold MW (positive y, green hatched)
+    // and the defensive-bid curtailment volume (negative y, red hatched).
+    // Both are 0 for L1/L2 and for L3 ISPs where S3 didn't trigger.
+    const s3Intraday = new Array(N);
+    const s3Curtail = new Array(N); // negative-signed
     const pot = new Array(N);
     const f_arr = new Array(N);
     const id_arr = new Array(N);
@@ -118,6 +184,9 @@ const Charts = (() => {
     const aneg_arr = new Array(N);
     const npos_arr = new Array(N);
     const nneg_arr = new Array(N);
+    // vwap_1h captured here so the tooltip's S3 section can reference it
+    // by chart-row index (the .map callback below has no `i` in scope).
+    const vwap_arr = new Array(N);
     const rev = new Array(N);
     const short = new Array(N);
     const sUpParam =
@@ -150,6 +219,12 @@ const Charts = (() => {
       dnAfrrDisp[k] = -(simResult.perISP.Q_dn_afrr_disp
         ? simResult.perISP.Q_dn_afrr_disp[k_p]
         : 0);
+      s3Intraday[k] = simResult.perISP.Q_s3_intraday
+        ? simResult.perISP.Q_s3_intraday[k_p]
+        : 0;
+      s3Curtail[k] = -(simResult.perISP.Q_s3_curtail
+        ? simResult.perISP.Q_s3_curtail[k_p]
+        : 0);
       pot[k] = D.q_pot[i];
       f_arr[k] = D.da_forecast[i];
       id_arr[k] = D.id_forecast[i];
@@ -165,6 +240,7 @@ const Charts = (() => {
       // fallback in init().
       npos_arr[k] = D.afrr_n_pos_fav ? D.afrr_n_pos_fav[i] : 0;
       nneg_arr[k] = D.afrr_n_neg_fav ? D.afrr_n_neg_fav[i] : 0;
+      vwap_arr[k] = D.vwap_1h ? D.vwap_1h[i] : NaN;
       rev[k] = simResult.perISP.revenue[k_p];
       short[k] = simResult.perISP.Q_short[k_p];
     }
@@ -190,22 +266,29 @@ const Charts = (() => {
       const stamp = `${dd}/${mm}/${yyyy} ${hh}:${mn}`;
       let s = `<b>${stamp} UTC</b><br>`;
 
+      // Accumulator for the per-ISP P&L equation rendered at the bottom.
+      // Only non-zero entries are shown ("DA + mFRR-up − imb = total").
+      const terms = [];
+
       // --- Forecast ---
-      const fcLines = [`DA forecast: ${fmtMW(f_arr[k])}`];
-      if (level === 2) {
+      const fcLines = [`DA forecast: ${ttMW(f_arr[k])}`];
+      if (level >= 2) {
         const rev_diff = id_arr[k] - f_arr[k];
+        const diffCol = rev_diff >= 0 ? TT_COL.posRev : TT_COL.negRev;
         const sign = rev_diff > 0 ? "+" : "";
         fcLines.push(
-          `ID forecast: ${fmtMW(id_arr[k])} <span style="color:#7d8590">(${sign}${rev_diff.toFixed(1)} MW)</span>`,
+          `ID forecast: ${ttMW(id_arr[k])} <span style="color:${TT_COL.dim}">(<span style="color:${diffCol}">${sign}${rev_diff.toFixed(1)}</span> MW)</span>`,
         );
-        fcLines.push(`Q_pot (actual): ${fmtMW(pot[k])}`);
+        fcLines.push(`Q_pot (actual): ${ttPot(pot[k])}`);
       }
       s += section("Forecast", fcLines);
 
       // --- DA market ---
+      const daRev = da[k] * pda_arr[k] * 0.25;
+      terms.push(daRev);
       const daLines = [
-        `Sold: <b>${da[k].toFixed(0)} MW</b> @ ${fmtPrice(pda_arr[k])}`,
-        `DA revenue: <b>${fmtEUR(da[k] * pda_arr[k] * 0.25)}</b>`,
+        `Sold: ${ttMW(da[k])} @ ${ttPrice(pda_arr[k])}`,
+        `DA revenue: ${ttRev(daRev)}`,
       ];
       s += section("DA market", daLines);
 
@@ -216,28 +299,30 @@ const Charts = (() => {
       const upMfrrRev = upMfrrMW * pmfrr_arr[k] * 0.25;
       const dnMfrrRev = -dnMfrrMW * pmfrr_arr[k] * 0.25;
       if (upMfrrMW > 0.5) {
+        terms.push(upMfrrRev);
         mfrrLines.push(
-          `<span style="color:#3fb950">▲ mFRR-up</span>: <b>${upMfrrMW.toFixed(0)} MW</b> @ ${fmtPrice(pmfrr_arr[k])}`,
+          `<span style="color:${TT_COL.posRev}">▲ mFRR-up</span>: ${ttMW(upMfrrMW)} @ ${ttPrice(pmfrr_arr[k])}`,
         );
-        mfrrLines.push(`mFRR-up rev: <b>${fmtEUR(upMfrrRev)}</b>`);
+        mfrrLines.push(`mFRR-up rev: ${ttRev(upMfrrRev)}`);
       } else if (dnMfrrMW > 0.5) {
+        terms.push(dnMfrrRev);
         mfrrLines.push(
-          `<span style="color:#f85149">▼ mFRR-dn</span>: <b>${dnMfrrMW.toFixed(0)} MW</b> @ ${fmtPrice(pmfrr_arr[k])}`,
+          `<span style="color:${TT_COL.negRev}">▼ mFRR-dn</span>: ${ttMW(dnMfrrMW)} @ ${ttPrice(pmfrr_arr[k])}`,
         );
-        mfrrLines.push(`mFRR-dn rev: <b>${fmtEUR(dnMfrrRev)}</b>`);
+        mfrrLines.push(`mFRR-dn rev: ${ttRev(dnMfrrRev)}`);
       } else {
         const pmf = pmfrr_arr[k];
         if (pmf > -1 && pmf < 1) {
           mfrrLines.push(
-            `<span style="color:#7d8590">— no clearing (P_mFRR ${fmtPrice(pmf)} inside ±1 dead band)</span>`,
+            `<span style="color:${TT_COL.dim}">— no clearing (P_mFRR ${ttPrice(pmf)} inside ±1 dead band)</span>`,
           );
         } else if (pmf >= 1) {
           mfrrLines.push(
-            `<span style="color:#7d8590">— mFRR-up cleared @ ${fmtPrice(pmf)} but no mFRR offer placed (s_up = ${sUpParam.toFixed(2)})</span>`,
+            `<span style="color:${TT_COL.dim}">— mFRR-up cleared @ ${ttPrice(pmf)} but no mFRR offer placed (s_up = ${sUpParam.toFixed(2)})</span>`,
           );
         } else {
           mfrrLines.push(
-            `<span style="color:#7d8590">— mFRR-dn cleared @ ${fmtPrice(pmf)} but no mFRR offer placed</span>`,
+            `<span style="color:${TT_COL.dim}">— mFRR-dn cleared @ ${ttPrice(pmf)} but no mFRR offer placed</span>`,
           );
         }
       }
@@ -258,49 +343,89 @@ const Charts = (() => {
         const afrrLines = [];
         if (upAfrrOffer > 0) {
           if (apos_arr[k] > 0) {
+            terms.push(upAfrrRev);
             afrrLines.push(
-              `<span style="color:#56d364">△ aFRR-up</span>: <b>${upAfrrOffer.toFixed(0)} MW</b> offered, dispatched ${upAfrrDispMW.toFixed(2)} MW (${((npos_arr[k] / 225) * 100).toFixed(0)} % of ISP) @ avg ${fmtPrice(apos_arr[k])}`,
+              `<span style="color:#56d364">△ aFRR-up</span>: ${ttMW(upAfrrOffer)} offered, dispatched ${ttMW(upAfrrDispMW)} (${((npos_arr[k] / 225) * 100).toFixed(0)} % of ISP) @ avg ${ttPrice(apos_arr[k])}`,
             );
-            afrrLines.push(`aFRR-up rev: <b>${fmtEUR(upAfrrRev)}</b>`);
+            afrrLines.push(`aFRR-up rev: ${ttRev(upAfrrRev)}`);
           } else {
             afrrLines.push(
-              `<span style="color:#7d8590">— aFRR-up: ${upAfrrOffer.toFixed(0)} MW available but avg_p_pos = ${fmtPrice(apos_arr[k])} ≤ 0 (not bid)</span>`,
+              `<span style="color:${TT_COL.dim}">— aFRR-up: ${ttMW(upAfrrOffer)} available but avg_p_pos = ${ttPrice(apos_arr[k])} ≤ 0 (not bid)</span>`,
             );
           }
         }
         if (dnAfrrOffer > 0) {
           if (aneg_arr[k] < 0) {
+            terms.push(dnAfrrRev);
             afrrLines.push(
-              `<span style="color:#fa7970">▽ aFRR-dn</span>: <b>${dnAfrrOffer.toFixed(0)} MW</b> offered, dispatched ${dnAfrrDispMW.toFixed(2)} MW (${((nneg_arr[k] / 225) * 100).toFixed(0)} % of ISP) @ avg ${fmtPrice(aneg_arr[k])}`,
+              `<span style="color:#fa7970">▽ aFRR-dn</span>: ${ttMW(dnAfrrOffer)} offered, dispatched ${ttMW(dnAfrrDispMW)} (${((nneg_arr[k] / 225) * 100).toFixed(0)} % of ISP) @ avg ${ttPrice(aneg_arr[k])}`,
             );
-            afrrLines.push(`aFRR-dn rev: <b>${fmtEUR(dnAfrrRev)}</b>`);
+            afrrLines.push(`aFRR-dn rev: ${ttRev(dnAfrrRev)}`);
           } else {
             afrrLines.push(
-              `<span style="color:#7d8590">— aFRR-dn: ${dnAfrrOffer.toFixed(0)} MW available but avg_p_neg = ${fmtPrice(aneg_arr[k])} ≥ 0 (not bid)</span>`,
+              `<span style="color:${TT_COL.dim}">— aFRR-dn: ${ttMW(dnAfrrOffer)} available but avg_p_neg = ${ttPrice(aneg_arr[k])} ≥ 0 (not bid)</span>`,
             );
           }
         }
         s += section("aFRR market", afrrLines);
       }
 
+      // --- S3 (Level-3 speculation), only if oversold this ISP ---
+      const s3X = s3Intraday[k];
+      if (s3X > 0.5) {
+        const vwap = vwap_arr[k];
+        const s3Lines = [];
+        const idRev = vwap * s3X * 0.25;
+        terms.push(idRev);
+        s3Lines.push(
+          `<span style="color:${TT_COL.posRev}">▲ ID oversell</span>: ${ttMW(s3X)} @ VWAP1H ${ttPrice(vwap)}`,
+        );
+        s3Lines.push(`Intraday rev: ${ttRev(idRev)}`);
+        const curtX = -s3Curtail[k];
+        if (curtX > 0.5) {
+          const pmfrr = pmfrr_arr[k];
+          const curtRev = curtX * (-pmfrr) * 0.25;
+          terms.push(curtRev);
+          // Defensive bid is a stop-loss: clears whenever p_mfrr ≤ bid_price.
+          // p_mfrr < 0 → grid pays the wind farm (windfall).
+          // p_mfrr > 0 → wind farm pays (capped at bid_price · X).
+          const label = pmfrr < 0
+            ? `▼ Defensive FIRED (windfall — grid paid us ${ttPrice(-pmfrr)})`
+            : `▼ Defensive FIRED (stop-loss — we paid ${ttPrice(pmfrr)})`;
+          s3Lines.push(
+            `<span style="color:${TT_COL.negRev}">${label}</span>: ${ttMW(curtX)} curtailed @ p_mfrr ${ttPrice(pmfrr)}`,
+          );
+          s3Lines.push(`Curtailment rev: ${ttRev(curtRev)}`);
+        } else {
+          s3Lines.push(
+            `<span style="color:${TT_COL.dim}">— Defensive bid not fired (settling at p_imb)</span>`,
+          );
+        }
+        s += section("S3 oversell", s3Lines);
+      }
+
       // --- Imbalance (L2 only, only if shortfall) ---
-      if (level === 2 && short[k] > 0.01) {
+      if (level >= 2 && short[k] > 0.01) {
         const imbCost = short[k] * pimb_arr[k] * 0.25;
         const flatCost = short[k] * theta * 0.25;
+        // Imbalance and flat penalty enter the equation as NEGATIVE terms.
+        terms.push(-imbCost);
+        if (theta > 0) terms.push(-flatCost);
         const imbLines = [
-          `Shortfall: <b>${fmtMW(short[k])}</b>`,
-          `P_imb: ${fmtPrice(pimb_arr[k])}`,
-          `Imbalance cost: <b style="color:#f85149">−${fmtEUR(imbCost)}</b>`,
+          `Shortfall: ${ttMW(short[k])}`,
+          `P_imb: ${ttPrice(pimb_arr[k])}`,
+          `Imbalance cost: ${ttRev(-imbCost)}`,
         ];
         if (theta > 0) {
-          imbLines.push(`Flat penalty (θ=${theta}): <b style="color:#f85149">−${fmtEUR(flatCost)}</b>`);
+          imbLines.push(`Flat penalty (θ=${theta}): ${ttRev(-flatCost)}`);
         }
         s += section("Imbalance", imbLines);
       }
 
-      // --- Total ---
-      const revColor = rev[k] >= 0 ? "#3fb950" : "#f85149";
-      s += `<b style="color:${revColor};font-size:13px">ISP P&L: ${rev[k] >= 0 ? "+" : ""}${fmtEUR(rev[k])}</b>`;
+      // --- Total — full P&L equation breakdown ---
+      // Each non-zero component appears, coloured by sign, joined with
+      // dim operators. Example: "150 + 30 − 24 = +156 €".
+      s += `<span style="color:${TT_COL.dim};font-size:10px;letter-spacing:.04em;text-transform:uppercase">ISP P&amp;L</span><br>${ttEquation(terms, rev[k])}`;
       return s;
     });
 
@@ -338,6 +463,19 @@ const Charts = (() => {
           marker: { color: "rgba(86,211,100,0.55)" },
           hoverinfo: "skip",
         },
+        // S3 intraday oversell — same green family, diagonal hatching to
+        // visually separate from mFRR/aFRR contributions.
+        {
+          x: ts,
+          y: s3Intraday,
+          type: "bar",
+          name: "S3 ID oversell (MW)",
+          marker: {
+            color: "rgba(63,185,80,0.85)",
+            pattern: { shape: "/", size: 6, solidity: 0.45 },
+          },
+          hoverinfo: "skip",
+        },
         {
           x: ts,
           y: dnMfrrActive,
@@ -354,8 +492,20 @@ const Charts = (() => {
           marker: { color: "rgba(250,121,112,0.55)" },
           hoverinfo: "skip",
         },
+        // S3 defensive curtailment — same red family, diagonal hatching.
+        {
+          x: ts,
+          y: s3Curtail,
+          type: "bar",
+          name: "S3 defensive curtail (MW)",
+          marker: {
+            color: "rgba(248,81,73,0.85)",
+            pattern: { shape: "/", size: 6, solidity: 0.45 },
+          },
+          hoverinfo: "skip",
+        },
       ];
-      if (level === 2) {
+      if (level >= 2) {
         traces.push({
           x: ts,
           y: pot,
@@ -401,6 +551,19 @@ const Charts = (() => {
           fillcolor: "rgba(86,211,100,0.18)",
           hoverinfo: "skip",
         },
+        // S3 intraday oversell — scattergl can't render diagonal hatching,
+        // so we use a distinct longdashdot pattern instead. Same green family.
+        {
+          x: ts,
+          y: s3Intraday,
+          type: "scattergl",
+          mode: "lines",
+          name: "S3 ID oversell (MW)",
+          line: { color: "#3fb950", width: 1.2, dash: "longdashdot" },
+          fill: "tozeroy",
+          fillcolor: "rgba(63,185,80,0.30)",
+          hoverinfo: "skip",
+        },
         {
           x: ts,
           y: dnMfrrActive,
@@ -423,8 +586,20 @@ const Charts = (() => {
           fillcolor: "rgba(250,121,112,0.18)",
           hoverinfo: "skip",
         },
+        // S3 defensive curtailment — distinct longdashdot pattern.
+        {
+          x: ts,
+          y: s3Curtail,
+          type: "scattergl",
+          mode: "lines",
+          name: "S3 defensive curtail (MW)",
+          line: { color: "#f85149", width: 1.2, dash: "longdashdot" },
+          fill: "tozeroy",
+          fillcolor: "rgba(248,81,73,0.30)",
+          hoverinfo: "skip",
+        },
       ];
-      if (level === 2) {
+      if (level >= 2) {
         traces.push({
           x: ts,
           y: pot,
@@ -443,15 +618,15 @@ const Charts = (() => {
     let yMax = 0,
       yMin = 0;
     for (let k = 0; k < N; k++) {
-      // For bar mode the chart stacks mFRR + aFRR (relative barmode),
-      // so the visible top is da + upMfrr + upAfrr (loose upper bound).
+      // For bar mode the chart stacks mFRR + aFRR + s3 (relative barmode),
+      // so the visible top is da + upMfrr + upAfrr + s3Intraday.
       const v = Math.max(
         da[k],
-        upMfrrActive[k] + upAfrrDisp[k],
+        upMfrrActive[k] + upAfrrDisp[k] + s3Intraday[k],
         pot[k] || 0,
       );
       if (v > yMax) yMax = v;
-      const lower = dnMfrrActive[k] + dnAfrrDisp[k]; // both already negative
+      const lower = dnMfrrActive[k] + dnAfrrDisp[k] + s3Curtail[k]; // all negative
       if (lower < yMin) yMin = lower;
     }
     const hoverY = new Array(N).fill(yMax * 1.05 || 1);
@@ -544,7 +719,7 @@ const Charts = (() => {
         marker: { color: "#fa7970" },
       },
     ];
-    if (level === 2) {
+    if (level >= 2) {
       traces.push({
         x: months,
         y: monthly.map((m) => -m.imb),
@@ -558,6 +733,40 @@ const Charts = (() => {
         type: "bar",
         name: "−flat penalty",
         marker: { color: "#f0883e" },
+      });
+    }
+    if (level === 3) {
+      // S3 contributions — same green/red colour family as mFRR but with
+      // diagonal-hatch pattern to set them apart visually.
+      traces.push({
+        x: months,
+        y: monthly.map((m) => m.s3_intraday || 0),
+        type: "bar",
+        name: "S3 ID sale",
+        marker: {
+          color: "#3fb950",
+          pattern: { shape: "/", size: 6, solidity: 0.45 },
+        },
+      });
+      traces.push({
+        x: months,
+        y: monthly.map((m) => m.s3_curtail || 0),
+        type: "bar",
+        name: "S3 curtail",
+        marker: {
+          color: "#f85149",
+          pattern: { shape: "/", size: 6, solidity: 0.45 },
+        },
+      });
+      traces.push({
+        x: months,
+        y: monthly.map((m) => -(m.s3_extra_cost || 0)),
+        type: "bar",
+        name: "−S3 extra imb",
+        marker: {
+          color: "#bc8cff",
+          pattern: { shape: "/", size: 6, solidity: 0.45 },
+        },
       });
     }
     const layout = Object.assign({}, PLOTLY_LAYOUT_DEFAULTS, {

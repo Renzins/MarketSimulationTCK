@@ -169,7 +169,11 @@
       ],
     },
     theta_flat: {
-      group: "market",
+      // Lives in Setup, not Market: it's NOT swept by the optimiser and
+      // NOT touched by "Reset to naïve" (cfg.naive only rolls back X/Y/Z).
+      // It bounds the analysis (cost model) rather than being a lever
+      // the optimiser searches over.
+      group: "setup",
       label: "Flat penalty θ",
       unit: "EUR/MWh shortfall",
       min: 0,
@@ -216,6 +220,94 @@
         ["s_dn = 1 (default)", "all downward volume to mFRR"],
         ["s_dn = 0", "all downward volume to aFRR"],
         ["0 < s_dn < 1", "split: e.g. s_dn = 0.5 → 50/50 between markets"],
+      ],
+    },
+    // -------- S3 (speculative intraday oversell) params, L3 only --------
+    // Set X_cap = 0 to disable S3 entirely while keeping the other settings.
+    s3_K: {
+      group: "oversell",
+      label: "Lookback window K",
+      unit: "ISPs",
+      min: 2,
+      max: 48,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "How many recent settled imbalance prices we average to estimate the next ISP's imbalance price. Small K (2–4) reacts fast but noisy; large K (12–24) stable but slow to detect regime changes.",
+      extremes: [
+        ["K = 2", "very reactive — picks up rapid regime changes but mean is noisy"],
+        ["K = 4 (default)", "covers the last hour (4 × 15 min)"],
+        ["K = 48", "very stable; 12 hours of history"],
+      ],
+    },
+    s3_S_min: {
+      group: "oversell",
+      label: "Minimum spread S_min",
+      unit: "EUR/MWh",
+      min: 0,
+      max: 200,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Trigger gate: only trade when (VWAP1H − rolling-mean imbalance) ≥ S_min. Below this, the expected profit per MW is too small to overcome friction and noise.",
+      extremes: [
+        ["S_min = 10", "loose — most ISPs trigger; lots of low-margin trades"],
+        ["S_min = 25 (default)", "balanced filter"],
+        ["S_min = 200", "very tight — only trade on extreme spreads"],
+      ],
+    },
+    s3_sigma_max: {
+      group: "oversell",
+      label: "Max volatility σ_max",
+      unit: "EUR/MWh",
+      min: 0,
+      max: 1000,
+      sliderStep: 5,
+      numStep: 5,
+      decimals: 0,
+      description:
+        "Stand-aside gate: skip the trade if rolling std of recent imbalance prices exceeds σ_max. Captures the intuition that the rolling mean is meaningless when prices have been chaotic.",
+      extremes: [
+        ["σ_max = 20", "very strict — only trade during very stable regimes"],
+        ["σ_max = 75 (default)", "moderate filter"],
+        ["σ_max = 1000", "effectively disabled — trade through any volatility"],
+      ],
+    },
+    s3_X_cap: {
+      group: "oversell",
+      label: "Volume cap X_cap",
+      unit: "MW",
+      min: 0,
+      max: 58,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Hard upper limit on the extra MW oversold in a single ISP. Strong signal → up to X_cap; weak signal → proportionally less (whole-MW floored). Setting X_cap = 0 disables the strategy entirely. Park capacity is 58.8 MW.",
+      extremes: [
+        ["X_cap = 0", "S3 disabled — L3 reverts to L2 behaviour"],
+        ["X_cap = 5 (default)", "modest position, safe in shallow markets"],
+        ["X_cap = 30+", "aggressive — significant price-impact risk in Baltic"],
+      ],
+    },
+    s3_M: {
+      group: "oversell",
+      label: "Defensive bid margin M",
+      unit: "EUR/MWh",
+      min: -50,
+      max: 100,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Sets the defensive mFRR-dn bid_price = VWAP1H + M. The bid acts as a STOP-LOSS: it clears whenever p_mfrr ≤ bid_price. p_mfrr < 0 → grid pays us (windfall); 0 < p_mfrr ≤ bid_price → we pay up to bid_price per MWh (capped loss vs imbalance). Higher M → looser stop, fires almost always but accepts higher curtailment costs; lower (or negative) M → tighter stop, fires only when curtailment is cheap/free or we get paid.",
+      extremes: [
+        ["M = −50", "tight stop — only accept curtailment when paid ≥ 50 below VWAP1H"],
+        ["M = 0", "bid right at VWAP1H — fires when curtailment is breakeven or better"],
+        ["M = 5 (default)", "small cushion above VWAP1H"],
+        ["M = 100", "very loose stop — fires almost always; max acceptable cost VWAP1H+100"],
       ],
     },
   };
@@ -292,6 +384,53 @@
       imbalanceDisabled: false,
       hasImbalance: true,
     },
+    // Level 3 = L2 + S3 (speculative intraday oversell). The S3 strategy
+    // lives in a third param group ("oversell"). Set s3_X_cap = 0 to
+    // disable S3 entirely (L3 then equals L2 mathematically).
+    3: {
+      paramKeys: [
+        "sim_range",
+        "w_mfrr",
+        "w_imb",
+        "w_afrr_pos",
+        "w_afrr_neg",
+        "X",
+        "Y",
+        "Z",
+        "theta_flat",
+        "s_up",
+        "s_dn",
+        "s3_K",
+        "s3_S_min",
+        "s3_sigma_max",
+        "s3_X_cap",
+        "s3_M",
+      ],
+      naive: { X: 0, Y: 0, Z: 0 },
+      defaults: {
+        X: 30,
+        Y: 1.0,
+        Z: 1.0,
+        theta_flat: 30,
+        s_up: 1.0,
+        s_dn: 1.0,
+        w_mfrr_lo: 10,
+        w_mfrr_hi: 90,
+        w_imb_lo: 10,
+        w_imb_hi: 90,
+        w_afrr_pos_lo: 10,
+        w_afrr_pos_hi: 90,
+        w_afrr_neg_lo: 10,
+        w_afrr_neg_hi: 90,
+        s3_K: 4,
+        s3_S_min: 25,
+        s3_sigma_max: 75,
+        s3_X_cap: 5,
+        s3_M: 5,
+      },
+      imbalanceDisabled: false,
+      hasImbalance: true,
+    },
   };
 
   // Decomposition table column definitions (per level).
@@ -312,6 +451,21 @@
       { key: "imb", label: "Imbalance cost", type: "eur-cost" },
       { key: "flat", label: "Flat penalty", type: "eur-cost" },
     ],
+    // L3 = L2 + S3 (intraday oversell + defensive mFRR-dn). The s3_extra_cost
+    // bundles the extra imbalance + flat penalty incurred specifically by
+    // the S3-induced shortfall (when the defensive bid doesn't fire).
+    3: [
+      { key: "DA", label: "DA revenue", type: "eur" },
+      { key: "mFRR_up", label: "mFRR-up rev", type: "eur" },
+      { key: "mFRR_dn", label: "mFRR-dn rev", type: "eur" },
+      { key: "aFRR_up", label: "aFRR-up rev", type: "eur" },
+      { key: "aFRR_dn", label: "aFRR-dn rev", type: "eur" },
+      { key: "s3_intraday", label: "S3 ID sale rev", type: "eur" },
+      { key: "s3_curtail", label: "S3 curtail rev", type: "eur" },
+      { key: "imb", label: "Imbalance cost", type: "eur-cost" },
+      { key: "flat", label: "Flat penalty", type: "eur-cost" },
+      { key: "s3_extra_cost", label: "S3 extra imb cost", type: "eur-cost" },
+    ],
   };
   const COUNT_COLUMNS = {
     1: [
@@ -330,6 +484,19 @@
       { key: "short", label: "ISPs with shortfall", type: "int" },
       { key: "shortMWh", label: "Total shortfall (MWh)", type: "mwh" },
       { key: "shortAvg", label: "Avg cost / short ISP", type: "eur" },
+    ],
+    // L3 — same as L2 plus two S3-specific counts.
+    3: [
+      { key: "up", label: "ISPs with mFRR-up", type: "int" },
+      { key: "dn", label: "ISPs with mFRR-dn", type: "int" },
+      { key: "upAfrr", label: "ISPs with aFRR-up", type: "int", help: "ISPs where avg_p_pos > 0 AND we routed volume to aFRR (s < 1) — wind park bid into upward and earned." },
+      { key: "dnAfrr", label: "ISPs with aFRR-dn", type: "int", help: "ISPs where avg_p_neg < 0 AND we routed volume to aFRR — system paid the park to curtail." },
+      { key: "wasted", label: "Withheld w/o activation", type: "int", help: "Below X, withheld but neither market activated profitably — energy earns nothing." },
+      { key: "short", label: "ISPs with shortfall", type: "int" },
+      { key: "shortMWh", label: "Total shortfall (MWh)", type: "mwh" },
+      { key: "shortAvg", label: "Avg cost / short ISP", type: "eur" },
+      { key: "s3Oversold", label: "ISPs with S3 oversell", type: "int", help: "ISPs where the S3 strategy passed all three gates (spread, sigma, ≥1 MW) and the wind park oversold on intraday." },
+      { key: "s3DefensiveFired", label: "S3 defensive fired", type: "int", help: "Of the S3-oversell ISPs, how many had p_mfrr ≤ −(VWAP1H+M) so the defensive bid cleared and the wind park was curtailed (windfall outcome)." },
     ],
   };
 
@@ -375,7 +542,7 @@
   //  STATE: per-level. Built from config defaults.
   // =====================================================================
   const state = {};
-  for (const lvl of [1, 2]) {
+  for (const lvl of [1, 2, 3]) {
     const cfg = LEVEL_CONFIG[lvl];
     state[lvl] = {
       params: { ...cfg.defaults },
@@ -477,10 +644,21 @@
     const cfg = LEVEL_CONFIG[level];
     const setupKeys = cfg.paramKeys.filter((k) => PARAM_DEFS[k].group === "setup");
     const marketKeys = cfg.paramKeys.filter((k) => PARAM_DEFS[k].group === "market");
-    const setupHtml = setupKeys.map((k) => paramCardHTML(level, k)).join("");
-    const marketHtml = marketKeys.map((k) => paramCardHTML(level, k)).join("");
-    document.getElementById(`l${level}-setup-params`).innerHTML = setupHtml;
-    document.getElementById(`l${level}-market-params`).innerHTML = marketHtml;
+    const oversellKeys = cfg.paramKeys.filter(
+      (k) => PARAM_DEFS[k].group === "oversell",
+    );
+    document.getElementById(`l${level}-setup-params`).innerHTML = setupKeys
+      .map((k) => paramCardHTML(level, k))
+      .join("");
+    document.getElementById(`l${level}-market-params`).innerHTML = marketKeys
+      .map((k) => paramCardHTML(level, k))
+      .join("");
+    // Oversell section is L3-only; the container element may not exist on
+    // L1 / L2 (only L3's HTML scaffolding renders it).
+    const overEl = document.getElementById(`l${level}-oversell-params`);
+    if (overEl) {
+      overEl.innerHTML = oversellKeys.map((k) => paramCardHTML(level, k)).join("");
+    }
     document.getElementById(`l${level}-reset`).textContent =
       level === 1 ? "⇄ Reset market params (Y=0)" : "⇄ Reset market params (Y=0, Z=0)";
   }
@@ -669,6 +847,9 @@
           sim.counts.short > 0
             ? fmtEUR((sim.breakdown.imb + sim.breakdown.flat) / sim.counts.short)
             : "0 €";
+      else if (col.key === "s3Oversold") v = fmtInt(sim.counts.s3Oversold || 0);
+      else if (col.key === "s3DefensiveFired")
+        v = fmtInt(sim.counts.s3DefensiveFired || 0);
       document.getElementById(`${prefix}-cnt-${col.key}`).textContent = v;
     }
 
@@ -844,6 +1025,9 @@
           btn.disabled = false;
         }, 30);
       } else {
+        // L2 + L3 share the same sweep (L3 = L2 math until speculation lands).
+        // Pass `level` through to simulateTotal so when L3's engine path
+        // diverges, this call site automatically picks up the new behaviour.
         const zs = [];
         for (let z = 0; z <= 1.0001; z += 0.1) zs.push(parseFloat(z.toFixed(1)));
         let xi = 0;
@@ -875,28 +1059,42 @@
               `done in ${ms} ms — best at X=${bestX}, Y=${bestY.toFixed(2)},` +
               ` Z=${bestZ.toFixed(2)}, s_up=${bestSup.toFixed(2)},` +
               ` s_dn=${bestSdn.toFixed(2)} → ${fmtEUR(bestRev)}`;
-            setSliderValue(2, "X", bestX);
-            setSliderValue(2, "Y", bestY);
-            setSliderValue(2, "Z", bestZ);
-            setSliderValue(2, "s_up", bestSup);
-            setSliderValue(2, "s_dn", bestSdn);
-            state[2].lastSweep = result;
-            updateLevel(2);
+            setSliderValue(level, "X", bestX);
+            setSliderValue(level, "Y", bestY);
+            setSliderValue(level, "Z", bestZ);
+            setSliderValue(level, "s_up", bestSup);
+            setSliderValue(level, "s_dn", bestSdn);
+            state[level].lastSweep = result;
+            updateLevel(level);
             btn.disabled = false;
             return;
           }
+          // Build S3 settings object once per row (constant within this sweep).
+          // The market-optimise sweep holds S3 params fixed at their current
+          // values — only X/Y/Z/s_up/s_dn vary here.
+          const s3Curr =
+            level === 3
+              ? {
+                  K: p.s3_K,
+                  S_min: p.s3_S_min,
+                  sigma_max: p.s3_sigma_max,
+                  X_cap: p.s3_X_cap,
+                  M: p.s3_M,
+                }
+              : null;
           for (let yi = 0; yi < ys.length; yi++) {
             for (let zi = 0; zi < zs.length; zi++) {
               for (let ui = 0; ui < ssL2.length; ui++) {
                 for (let di = 0; di < ssL2.length; di++) {
                   const r = Engine.simulateTotal(
-                    2,
+                    level,
                     xs[xi],
                     ys[yi],
                     zs[zi],
                     p.theta_flat,
                     ssL2[ui],
                     ssL2[di],
+                    s3Curr,
                   );
                   if (r > bestRev) {
                     bestRev = r;
@@ -916,6 +1114,72 @@
         }
         runRow();
       }
+    });
+  }
+
+  // =====================================================================
+  //  OVERSELL OPTIMISER (L3 only) — sweeps over (K, S_min, sigma_max, X_cap, M)
+  //  while holding market params fixed. Per Q7, this is a separate button
+  //  from the market optimiser so they can be tuned independently.
+  // =====================================================================
+  function bindOptimiseOversell(level) {
+    const btn = document.getElementById(`l${level}-optimise-oversell`);
+    if (!btn) return; // L3 only
+    const progEl = document.getElementById(`l${level}-progress-oversell`);
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      const p = state[level].params;
+      Engine.maybeWinsorize(
+        p.w_mfrr_lo,
+        p.w_mfrr_hi,
+        p.w_imb_lo,
+        p.w_imb_hi,
+        p.w_afrr_pos_lo,
+        p.w_afrr_pos_hi,
+        p.w_afrr_neg_lo,
+        p.w_afrr_neg_hi,
+      );
+      // Coarse grids — total ~10 k combos, ~15 s. Now covers wider ranges
+      // per user request (M down to -20 etc.); includes X_cap = 0 so the
+      // optimiser can pick "no S3" if that wins, and M = -50..30 so it can
+      // explore the windfall-only regime (tight stop) vs loose-stop regime.
+      const Ks = [2, 4, 6, 8, 12, 16, 24, 36];
+      const Smins = [0, 10, 20, 40, 80, 120];
+      const Sigmas = [50, 150, 300, 600, 1000];
+      const Xcaps = [0, 2, 5, 10, 20, 30];
+      const Ms = [-50, -20, -10, -5, 0, 5, 10, 20, 30];
+      progEl.textContent = "computing…";
+      setTimeout(() => {
+        const t0 = performance.now();
+        const result = Engine.sweepLevel3Oversell(
+          Ks,
+          Smins,
+          Sigmas,
+          Xcaps,
+          Ms,
+          {
+            X: p.X,
+            Y: p.Y,
+            Z: p.Z,
+            theta_flat: p.theta_flat,
+            s_up: p.s_up,
+            s_dn: p.s_dn,
+          },
+        );
+        const ms = Math.round(performance.now() - t0);
+        progEl.textContent =
+          `done in ${ms} ms — best at K=${result.best.K}, S_min=${result.best.S_min},` +
+          ` σ_max=${result.best.sigma_max}, X_cap=${result.best.X_cap}, M=${result.best.M}` +
+          ` → ${fmtEUR(result.best.revenue)}`;
+        setSliderValue(level, "s3_K", result.best.K);
+        setSliderValue(level, "s3_S_min", result.best.S_min);
+        setSliderValue(level, "s3_sigma_max", result.best.sigma_max);
+        setSliderValue(level, "s3_X_cap", result.best.X_cap);
+        setSliderValue(level, "s3_M", result.best.M);
+        state[level].lastSweepOversell = result;
+        updateLevel(level);
+        btn.disabled = false;
+      }, 30);
     });
   }
 
@@ -1011,6 +1275,18 @@
     for (let z = 0; z <= 1.0001; z += 0.05) zs.push(parseFloat(z.toFixed(2)));
     setTimeout(() => {
       const t0 = performance.now();
+      // L3 heatmap reflects the current S3 settings (sweep one of X/Y/Z
+      // at a time while everything else, including S3, stays fixed).
+      const s3Curr =
+        level === 3
+          ? {
+              K: p.s3_K,
+              S_min: p.s3_S_min,
+              sigma_max: p.s3_sigma_max,
+              X_cap: p.s3_X_cap,
+              M: p.s3_M,
+            }
+          : null;
       let grid, axisXs, axisYs, axisLabels, markX, markY;
       if (level === 1 || pair === "XY") {
         grid = [];
@@ -1025,6 +1301,7 @@
               p.theta_flat || 0,
               p.s_up == null ? 1 : p.s_up,
               p.s_dn == null ? 1 : p.s_dn,
+              s3Curr,
             );
           }
           grid.push(row);
@@ -1040,13 +1317,14 @@
           const row = new Float64Array(zs.length);
           for (let zi = 0; zi < zs.length; zi++) {
             row[zi] = Engine.simulateTotal(
-              2,
+              level,
               xs[xi],
               p.Y,
               zs[zi],
               p.theta_flat,
               p.s_up == null ? 1 : p.s_up,
               p.s_dn == null ? 1 : p.s_dn,
+              s3Curr,
             );
           }
           grid.push(row);
@@ -1062,13 +1340,14 @@
           const row = new Float64Array(zs.length);
           for (let zi = 0; zi < zs.length; zi++) {
             row[zi] = Engine.simulateTotal(
-              2,
+              level,
               p.X,
               ys[yi],
               zs[zi],
               p.theta_flat,
               p.s_up == null ? 1 : p.s_up,
               p.s_dn == null ? 1 : p.s_dn,
+              s3Curr,
             );
           }
           grid.push(row);
@@ -1087,14 +1366,14 @@
             setSliderValue(1, "X", xv);
             setSliderValue(1, "Y", yv);
           } else if (pair === "XY") {
-            setSliderValue(2, "X", xv);
-            setSliderValue(2, "Y", yv);
+            setSliderValue(level, "X", xv);
+            setSliderValue(level, "Y", yv);
           } else if (pair === "XZ") {
-            setSliderValue(2, "X", xv);
-            setSliderValue(2, "Z", yv);
+            setSliderValue(level, "X", xv);
+            setSliderValue(level, "Z", yv);
           } else {
-            setSliderValue(2, "Y", xv);
-            setSliderValue(2, "Z", yv);
+            setSliderValue(level, "Y", xv);
+            setSliderValue(level, "Z", yv);
           }
           updateLevel(level);
         });
@@ -1104,13 +1383,25 @@
   // =====================================================================
   //  TABS
   // =====================================================================
+  // Resize fix: Level 2 charts are pre-rendered ~200 ms after page load
+  // (see updateLevel(2) call at the bottom) into a panel that's still
+  // display:none — Plotly canvases get drawn at 0×0 and `responsive:true`
+  // only fires on window resize, so users had to zoom in/out for the
+  // chart to fill its space. Forcing Plotly.Plots.resize on every chart
+  // in the newly-active panel re-measures against the now-visible
+  // container. Idempotent and safe on un-rendered charts (guarded via
+  // `_fullLayout`). Same pattern as graphs-app.js's aFRR-bar fix.
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
       const level = parseInt(btn.dataset.level);
-      document.getElementById(`panel-${level}`).classList.add("active");
+      const panel = document.getElementById(`panel-${level}`);
+      panel.classList.add("active");
+      panel.querySelectorAll(".chart").forEach((div) => {
+        if (div._fullLayout) Plotly.Plots.resize(div);
+      });
       setTimeout(() => updateLevel(level), 30);
     });
   });
@@ -1118,12 +1409,13 @@
   // =====================================================================
   //  INIT
   // =====================================================================
-  for (const lvl of [1, 2]) {
+  for (const lvl of [1, 2, 3]) {
     renderParamCards(lvl);
     renderStatsTables(lvl);
     bindParamCards(lvl);
     bindReset(lvl);
     bindOptimise(lvl);
+    bindOptimiseOversell(lvl);
     bindDateNav(lvl);
   }
 
@@ -1135,7 +1427,13 @@
     .addEventListener("click", () =>
       computeAndDrawHeatmap(2, document.getElementById("l2-heatmap-pair").value),
     );
+  document
+    .getElementById("l3-show-heatmap")
+    .addEventListener("click", () =>
+      computeAndDrawHeatmap(3, document.getElementById("l3-heatmap-pair").value),
+    );
 
   updateLevel(1);
   setTimeout(() => updateLevel(2), 200);
+  setTimeout(() => updateLevel(3), 400);
 })();

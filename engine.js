@@ -105,6 +105,11 @@ const Engine = (() => {
       // p_imb may contain null (April lacks the imbalance-price source).
       // Engine treats NaN p_imb as zero imbalance cost in L2.
       p_imb_raw: _toFloat32WithNaN(rawData.p_imb),
+      // vwap_1h is the LV intraday 1h-VWAP. NaN where missing — L3's S3
+      // (speculative oversell) strategy skips those ISPs.
+      vwap_1h: Array.isArray(rawData.vwap_1h)
+        ? _toFloat32WithNaN(rawData.vwap_1h)
+        : new Float32Array(rawData.n).fill(NaN),
     };
     // Working buffers for winsorized prices (filled by maybeWinsorize)
     D.p_mfrr = new Float32Array(D.n);
@@ -178,6 +183,7 @@ const Engine = (() => {
     cachedImbBounds = { lo: 0, hi: 0 };
     cachedAfrrPosBounds = { lo: 0, hi: 0 };
     cachedAfrrNegBounds = { lo: 0, hi: 0 };
+    _s3RollingCache.clear();
     return D;
   }
 
@@ -307,6 +313,57 @@ const Engine = (() => {
   let cachedAfrrPosBounds = { lo: 0, hi: 0 };
   let cachedAfrrNegBounds = { lo: 0, hi: 0 };
 
+  // ---------- S3 (Level-3 speculative intraday oversell) rolling stats ----
+  // Computed from raw p_imb across the FULL dataset (not the sim window) —
+  // the rolling window looks back K ISPs from each H, which can cross the
+  // window boundary. Independent of winStart/winEnd, so cached forever.
+  // Keyed by K. NaN-aware: a window with <2 valid (non-NaN) values yields
+  // NaN mean/std at that ISP (the S3 evaluator treats that as "skip ISP").
+  // Sample std (ddof=1) per Q6.
+  const _s3RollingCache = new Map();
+  function _getS3Rolling(K) {
+    if (!D || K < 1) return null;
+    const key = K | 0;
+    const hit = _s3RollingCache.get(key);
+    if (hit) return hit;
+    const n = D.n;
+    const mean = new Float32Array(n);
+    const std = new Float32Array(n);
+    const src = D.p_imb_raw;
+    for (let i = 0; i < n; i++) {
+      if (i < key) {
+        mean[i] = NaN;
+        std[i] = NaN;
+        continue;
+      }
+      let sum = 0;
+      let cnt = 0;
+      for (let j = i - key; j < i; j++) {
+        const v = src[j];
+        if (!isNaN(v)) {
+          sum += v;
+          cnt++;
+        }
+      }
+      if (cnt < 2) {
+        mean[i] = NaN;
+        std[i] = NaN;
+        continue;
+      }
+      const m = sum / cnt;
+      let sq = 0;
+      for (let j = i - key; j < i; j++) {
+        const v = src[j];
+        if (!isNaN(v)) sq += (v - m) * (v - m);
+      }
+      mean[i] = m;
+      std[i] = Math.sqrt(sq / (cnt - 1));
+    }
+    const entry = { mean, std };
+    _s3RollingCache.set(key, entry);
+    return entry;
+  }
+
   function percentileValue(sorted, p) {
     const N = sorted.length;
     if (N === 0) return 0;
@@ -418,6 +475,19 @@ const Engine = (() => {
     const s_dn = params.s_dn == null ? 1 : params.s_dn;
     const sUpC = s_up < 0 ? 0 : s_up > 1 ? 1 : s_up;
     const sDnC = s_dn < 0 ? 0 : s_dn > 1 ? 1 : s_dn;
+    // ----- S3 (speculative intraday oversell) params -----
+    // Only active when level === 3 AND X_cap ≥ 1 AND K ≥ 1. Setting X_cap=0
+    // disables S3 entirely (UI convention; saves a toggle). L1/L2 always
+    // skip S3 because isL3 is false.
+    const isL3 = level === 3;
+    const s3K = (params.s3_K | 0) || 0;
+    const s3X_cap = (params.s3_X_cap | 0) || 0;
+    const s3Enabled = isL3 && s3X_cap >= 1 && s3K >= 1;
+    const s3S_min = +params.s3_S_min || 0;
+    const s3Sigma_max = +params.s3_sigma_max || 0;
+    const s3M = +params.s3_M || 0;
+    const s3Roll = s3Enabled ? _getS3Rolling(s3K) : null;
+
     const wLen = Math.max(0, winEnd - winStart);
     const Q_da_sold = new Float32Array(wLen);
     const Q_up = new Float32Array(wLen); // total upward volume offered (mFRR + aFRR)
@@ -428,6 +498,11 @@ const Engine = (() => {
     // < Q_*_afrr offered when the gate fails or the activation rate < 1.
     const Q_up_afrr_disp = new Float32Array(wLen);
     const Q_dn_afrr_disp = new Float32Array(wLen);
+    // S3 per-ISP volumes (positive ints in MW). Q_s3_intraday is the oversold
+    // amount; Q_s3_curtail is the same amount when the defensive bid fires
+    // (else 0). Charts show these as hatched green/red bars.
+    const Q_s3_intraday = new Float32Array(wLen);
+    const Q_s3_curtail = new Float32Array(wLen);
     const Q_short = new Float32Array(wLen);
     const revenue = new Float32Array(wLen);
     let sumDA = 0,
@@ -436,16 +511,22 @@ const Engine = (() => {
       sumUpAfrr = 0,
       sumDnAfrr = 0,
       sumImb = 0,
-      sumFlat = 0;
+      sumFlat = 0,
+      sumS3Intraday = 0,
+      sumS3Curtail = 0,
+      sumS3ExtraCost = 0;
     let nUp = 0,
       nDn = 0,
       nWasted = 0,
       nShort = 0,
       nUpAfrr = 0,
-      nDnAfrr = 0;
+      nDnAfrr = 0,
+      nS3Oversold = 0,
+      nS3DefensiveFired = 0;
     let totalShortMWh = 0;
     let nNegRevWarn = 0;
-    const isL2 = level === 2;
+    // L2 math also applies to L3 (which adds "speculation" on top).
+    const isL2 = level >= 2;
     for (let i = winStart; i < winEnd; i++) {
       const k = i - winStart;
       const F = D.da_forecast[i];
@@ -504,9 +585,58 @@ const Engine = (() => {
       const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * aFracNeg : 0;
       Q_up_afrr_disp[k] = up_afrr_disp;
       Q_dn_afrr_disp[k] = dn_afrr_disp;
-      const Q_pos = da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
+      const Q_pos_l2 = da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
+
+      // ----- S3 (Level-3 speculative intraday oversell) ---------------
+      // Evaluate the strategy's 3 gates (spread, sigma, ≥1 MW after floor).
+      // If all pass, add X_prop MW to position (intraday oversell) and submit
+      // a defensive mFRR-dn bid at vwap+M. Defensive fires iff p_mfrr ≤ -bid.
+      // When defensive fires, the curtailment offsets the oversell exactly
+      // (s3_delta_pos = 0). When it doesn't, position increases by X_prop
+      // and the extra shortfall is settled at p_imb (+ theta_flat).
+      // Uses WINSORIZED p_mfrr (D.p_mfrr) so the user's winsor settings
+      // affect S3 the same way they affect existing mFRR revenue.
+      let s3_X = 0;
+      let s3_fires = false;
+      let s3_intraday = 0;
+      let s3_curtail = 0;
+      if (s3Enabled) {
+        const P_ID_est = D.vwap_1h[i];
+        if (!isNaN(P_ID_est)) {
+          const P_imb_est = s3Roll.mean[i];
+          const P_imb_sigma = s3Roll.std[i];
+          if (!isNaN(P_imb_est) && !isNaN(P_imb_sigma)) {
+            const spread = P_ID_est - P_imb_est;
+            if (spread >= s3S_min && P_imb_sigma <= s3Sigma_max) {
+              const sig = (spread - s3S_min) / s3S_min;
+              const X_raw = s3X_cap * (sig < 1 ? sig : 1);
+              const X_prop = Math.floor(X_raw + 1e-9);
+              if (X_prop >= 1) {
+                const bid_price = P_ID_est + s3M;
+                // Defensive bid is a "stop-loss" mFRR-dn order:
+                // wind farm accepts being curtailed at any marginal price
+                // ≤ bid_price. Negative P_mfrr → grid pays the wind farm
+                // (windfall); positive P_mfrr ≤ bid_price → wind farm
+                // pays the grid, but cost is capped at bid_price · X.
+                // This caps the worst-case loss vs imbalance settlement.
+                s3_fires = P_mfrr <= bid_price;
+                s3_X = X_prop;
+                s3_intraday = X_prop * P_ID_est;
+                // Curtailment "revenue" is signed: −P_mfrr can be positive
+                // (we're paid) OR negative (we paid). Accumulated as-is in
+                // sumS3Curtail.
+                if (s3_fires) s3_curtail = X_prop * (-P_mfrr);
+              }
+            }
+          }
+        }
+      }
+      const s3_delta_pos = s3_fires ? 0 : s3_X;
+      const Q_pos = Q_pos_l2 + s3_delta_pos;
       const Q_pot = isL2 ? D.q_pot[i] : F;
+      const short_l2 = Q_pos_l2 > Q_pot ? Q_pos_l2 - Q_pot : 0;
       const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
+
       // ----- NaN p_imb handling -----
       // The Latvia imbalance-price source ran out at end-of-March 2026, so
       // ~6.8% of rows (mostly April) have NaN p_imb. We keep those rows in
@@ -516,14 +646,31 @@ const Engine = (() => {
       // if you point the sim window at April only.
       const P_imb_raw = isL2 ? D.p_imb[i] : 0;
       const P_imb_valid = isL2 ? !isNaN(P_imb_raw) : true;
-      const imb = isL2 && P_imb_valid ? short * P_imb_raw : 0;
-      const flat = isL2 && P_imb_valid ? short * theta_flat : 0;
+      // L2 portion of imb/flat (existing behaviour). For L3 with S3, the
+      // S3-induced extra shortfall settles at the same p_imb+theta but is
+      // attributed to S3 so the decomposition makes sense.
+      const imb = isL2 && P_imb_valid ? short_l2 * P_imb_raw : 0;
+      const flat = isL2 && P_imb_valid ? short_l2 * theta_flat : 0;
+      const s3_extra_short = short - short_l2; // ≥ 0
+      const s3_extra_cost =
+        isL2 && P_imb_valid ? s3_extra_short * (P_imb_raw + theta_flat) : 0;
       const rev =
-        (DA_rev + Up_rev_mfrr + Dn_rev_mfrr + up_afrr_rev_rate + dn_afrr_rev_rate - imb - flat) *
+        (DA_rev +
+          Up_rev_mfrr +
+          Dn_rev_mfrr +
+          up_afrr_rev_rate +
+          dn_afrr_rev_rate +
+          s3_intraday +
+          s3_curtail -
+          imb -
+          flat -
+          s3_extra_cost) *
         0.25;
       Q_da_sold[k] = da_sold;
       Q_up[k] = up_mfrr + Q_up_afrr;
       Q_dn[k] = dn_mfrr + Q_dn_afrr;
+      Q_s3_intraday[k] = s3_X;
+      Q_s3_curtail[k] = s3_fires ? s3_X : 0;
       Q_short[k] = short;
       revenue[k] = rev;
       sumDA += DA_rev * 0.25;
@@ -533,6 +680,9 @@ const Engine = (() => {
       sumDnAfrr += dn_afrr_rev_rate * 0.25;
       sumImb += imb * 0.25;
       sumFlat += flat * 0.25;
+      sumS3Intraday += s3_intraday * 0.25;
+      sumS3Curtail += s3_curtail * 0.25;
+      sumS3ExtraCost += s3_extra_cost * 0.25;
       // Counts: mFRR up vs dn are mutually exclusive per ISP (P_mfrr is
       // single-signed) — kept as before. aFRR up / dn are independent and
       // can BOTH fire in the same ISP (e.g. mFRR-dn + aFRR-up at the same
@@ -542,13 +692,26 @@ const Engine = (() => {
       else if (Q_w > 1e-6 && !upAfrrActive && !dnAfrrActive) nWasted++;
       if (upAfrrActive) nUpAfrr++;
       if (dnAfrrActive) nDnAfrr++;
+      if (s3_X > 0) {
+        nS3Oversold++;
+        if (s3_fires) nS3DefensiveFired++;
+      }
       if (short > 1e-6) {
         nShort++;
         totalShortMWh += short * 0.25;
       }
     }
     const total =
-      sumDA + sumUpMfrr + sumDnMfrr + sumUpAfrr + sumDnAfrr - sumImb - sumFlat;
+      sumDA +
+      sumUpMfrr +
+      sumDnMfrr +
+      sumUpAfrr +
+      sumDnAfrr +
+      sumS3Intraday +
+      sumS3Curtail -
+      sumImb -
+      sumFlat -
+      sumS3ExtraCost;
     return {
       windowStart: winStart,
       windowEnd: winEnd,
@@ -558,6 +721,8 @@ const Engine = (() => {
         Q_dn,
         Q_up_afrr_disp,
         Q_dn_afrr_disp,
+        Q_s3_intraday,
+        Q_s3_curtail,
         Q_short,
         revenue,
       },
@@ -568,8 +733,11 @@ const Engine = (() => {
         mFRR_dn: sumDnMfrr,
         aFRR_up: sumUpAfrr,
         aFRR_dn: sumDnAfrr,
+        s3_intraday: sumS3Intraday,
+        s3_curtail: sumS3Curtail,
         imb: sumImb,
         flat: sumFlat,
+        s3_extra_cost: sumS3ExtraCost,
       },
       counts: {
         up: nUp,
@@ -579,6 +747,8 @@ const Engine = (() => {
         wasted: nWasted,
         short: nShort,
         negRev: nNegRevWarn,
+        s3Oversold: nS3Oversold,
+        s3DefensiveFired: nS3DefensiveFired,
       },
       totalShortMWh,
     };
@@ -587,10 +757,23 @@ const Engine = (() => {
   // ---------- fast total-only simulation (for sweeps) --------------------
   // s_up / s_dn default to 1 so legacy 5-arg callers keep their
   // pre-feature behaviour exactly (frozen regression values intact).
-  function simulateTotal(level, X, Y, Z, theta_flat, s_up = 1, s_dn = 1) {
-    const isL2 = level === 2;
+  // s3: null (disabled) or { K, S_min, sigma_max, X_cap, M } — when set
+  // AND level === 3, adds the speculative intraday-oversell contribution.
+  function simulateTotal(level, X, Y, Z, theta_flat, s_up = 1, s_dn = 1, s3 = null) {
+    const isL2 = level >= 2;
+    const isL3 = level === 3;
     const sUpC = s_up < 0 ? 0 : s_up > 1 ? 1 : s_up;
     const sDnC = s_dn < 0 ? 0 : s_dn > 1 ? 1 : s_dn;
+    const s3Enabled = isL3 && s3 && (s3.X_cap | 0) >= 1;
+    const s3K = s3Enabled ? (s3.K | 0) || 4 : 0;
+    const s3S_min = s3Enabled ? +s3.S_min : 0;
+    const s3Sigma_max = s3Enabled ? +s3.sigma_max : 0;
+    const s3X_cap = s3Enabled ? (s3.X_cap | 0) : 0;
+    const s3M = s3Enabled ? +s3.M : 0;
+    const s3Roll = s3Enabled ? _getS3Rolling(s3K) : null;
+    const s3MeanArr = s3Roll ? s3Roll.mean : null;
+    const s3StdArr = s3Roll ? s3Roll.std : null;
+    const vwap_arr = D.vwap_1h;
     const F_arr = D.da_forecast;
     const ID_arr = D.id_forecast;
     const P_da_arr = D.p_da;
@@ -634,8 +817,39 @@ const Engine = (() => {
       if (isL2) {
         const up_afrr_disp = upAfrrActive ? Q_up_afrr * (nPos_arr[i] / 225) : 0;
         const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * (nNeg_arr[i] / 225) : 0;
-        const Q_pos =
+        let Q_pos =
           da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
+        // ----- S3 (Level-3 speculative intraday oversell) -----
+        // Same logic as simulate(); inlined for hot-path performance.
+        if (s3Enabled) {
+          const P_ID_est = vwap_arr[i];
+          if (!isNaN(P_ID_est)) {
+            const P_imb_est = s3MeanArr[i];
+            const P_imb_sigma = s3StdArr[i];
+            if (!isNaN(P_imb_est) && !isNaN(P_imb_sigma)) {
+              const spread = P_ID_est - P_imb_est;
+              if (spread >= s3S_min && P_imb_sigma <= s3Sigma_max) {
+                const sig = (spread - s3S_min) / s3S_min;
+                const X_raw = s3X_cap * (sig < 1 ? sig : 1);
+                const X_prop = (X_raw + 1e-9) | 0; // floor
+                if (X_prop >= 1) {
+                  const bid_price = P_ID_est + s3M;
+                  rev += X_prop * P_ID_est;
+                  // Defensive bid is a stop-loss for mFRR-dn: clears
+                  // whenever the marginal price isn't above our ceiling.
+                  // Curtailment revenue −P_mfrr can be positive (paid)
+                  // or negative (we paid up to bid_price per MWh).
+                  if (P_mfrr <= bid_price) {
+                    rev += X_prop * (-P_mfrr);
+                    // defensive fires offsets the oversell — no position increase
+                  } else {
+                    Q_pos += X_prop; // shortfall increases by X_prop
+                  }
+                }
+              }
+            }
+          }
+        }
         const Q_pot = Q_pot_arr[i];
         const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
         // NaN p_imb (April rows): skip imbalance + flat costs entirely.
@@ -754,6 +968,75 @@ const Engine = (() => {
     };
   }
 
+  // ---------- L3 oversell sweep ------------------------------------------
+  // Separate optimiser for the S3 strategy params (K, S_min, sigma_max,
+  // X_cap, M). Holds the market params (X, Y, Z, s_up, s_dn, theta_flat)
+  // fixed at the values passed in — by design (per Q7), so the user can
+  // independently tune market vs speculation. 5-D grid; coarse defaults
+  // for speed (the caller can pass denser grids if needed).
+  function sweepLevel3Oversell(
+    Ks,
+    S_mins,
+    sigma_maxs,
+    X_caps,
+    Ms,
+    fixedMarket,
+    progressCb,
+  ) {
+    const X = fixedMarket.X;
+    const Y = fixedMarket.Y;
+    const Z = fixedMarket.Z;
+    const theta = fixedMarket.theta_flat;
+    const sUp = fixedMarket.s_up == null ? 1 : fixedMarket.s_up;
+    const sDn = fixedMarket.s_dn == null ? 1 : fixedMarket.s_dn;
+    let bestRev = -Infinity,
+      bestK = Ks[0],
+      bestSmin = S_mins[0],
+      bestSigma = sigma_maxs[0],
+      bestXcap = X_caps[0],
+      bestM = Ms[0];
+    const total =
+      Ks.length * S_mins.length * sigma_maxs.length * X_caps.length * Ms.length;
+    let done = 0;
+    for (let ki = 0; ki < Ks.length; ki++) {
+      for (let si = 0; si < S_mins.length; si++) {
+        for (let gi = 0; gi < sigma_maxs.length; gi++) {
+          for (let xi = 0; xi < X_caps.length; xi++) {
+            for (let mi = 0; mi < Ms.length; mi++) {
+              const r = simulateTotal(3, X, Y, Z, theta, sUp, sDn, {
+                K: Ks[ki],
+                S_min: S_mins[si],
+                sigma_max: sigma_maxs[gi],
+                X_cap: X_caps[xi],
+                M: Ms[mi],
+              });
+              if (r > bestRev) {
+                bestRev = r;
+                bestK = Ks[ki];
+                bestSmin = S_mins[si];
+                bestSigma = sigma_maxs[gi];
+                bestXcap = X_caps[xi];
+                bestM = Ms[mi];
+              }
+              done++;
+            }
+          }
+        }
+      }
+      if (progressCb) progressCb(done / total);
+    }
+    return {
+      best: {
+        K: bestK,
+        S_min: bestSmin,
+        sigma_max: bestSigma,
+        X_cap: bestXcap,
+        M: bestM,
+        revenue: bestRev,
+      },
+    };
+  }
+
   // ---------- robustness: top-N revenue concentration --------------------
   function topConcentration(perISPRev, fraction) {
     const sorted = new Float64Array(perISPRev);
@@ -773,7 +1056,8 @@ const Engine = (() => {
   function monthlyAggregation(level, params) {
     const start = new Date(D.start_iso);
     const buckets = new Map();
-    const isL2 = level === 2;
+    const isL2 = level >= 2;
+    const isL3 = level === 3;
     const Y = params.Y;
     const X = params.X;
     const Z = params.Z || 0;
@@ -782,6 +1066,14 @@ const Engine = (() => {
     const s_dn = params.s_dn == null ? 1 : params.s_dn;
     const sUpC = s_up < 0 ? 0 : s_up > 1 ? 1 : s_up;
     const sDnC = s_dn < 0 ? 0 : s_dn > 1 ? 1 : s_dn;
+    // S3 params (active when level === 3 AND X_cap ≥ 1 AND K ≥ 1).
+    const s3K = (params.s3_K | 0) || 0;
+    const s3X_cap = (params.s3_X_cap | 0) || 0;
+    const s3Enabled = isL3 && s3X_cap >= 1 && s3K >= 1;
+    const s3S_min = +params.s3_S_min || 0;
+    const s3Sigma_max = +params.s3_sigma_max || 0;
+    const s3M = +params.s3_M || 0;
+    const s3Roll = s3Enabled ? _getS3Rolling(s3K) : null;
     for (let i = winStart; i < winEnd; i++) {
       const ts = new Date(start.getTime() + D.offsets[i] * D.step_min * 60000);
       const key = `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`;
@@ -816,28 +1108,75 @@ const Engine = (() => {
       const DnAfrr_rev = dnAfrrActive ? -Q_dn_afrr * avg_neg * 0.25 : 0;
       let imb = 0,
         flat = 0;
+      let S3Intraday_rev = 0,
+        S3Curtail_rev = 0,
+        S3ExtraCost = 0;
       if (isL2) {
         // Favourable-only counts (see init()) — matches simulate().
         const up_afrr_disp = upAfrrActive ? Q_up_afrr * (D.afrr_n_pos_fav[i] / 225) : 0;
         const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * (D.afrr_n_neg_fav[i] / 225) : 0;
-        const Q_pos = da_sold + up_mfrr_q + up_afrr_disp - dn_mfrr_q - dn_afrr_disp;
-        const short = Q_pos > D.q_pot[i] ? Q_pos - D.q_pot[i] : 0;
+        const Q_pos_l2 = da_sold + up_mfrr_q + up_afrr_disp - dn_mfrr_q - dn_afrr_disp;
+
+        // S3 contribution per ISP — mirrors simulate() logic.
+        let s3_X = 0;
+        let s3_fires = false;
+        if (s3Enabled) {
+          const P_ID_est = D.vwap_1h[i];
+          if (!isNaN(P_ID_est)) {
+            const P_imb_est = s3Roll.mean[i];
+            const P_imb_sigma = s3Roll.std[i];
+            if (!isNaN(P_imb_est) && !isNaN(P_imb_sigma)) {
+              const spread = P_ID_est - P_imb_est;
+              if (spread >= s3S_min && P_imb_sigma <= s3Sigma_max) {
+                const sig = (spread - s3S_min) / s3S_min;
+                const X_prop = Math.floor(s3X_cap * (sig < 1 ? sig : 1) + 1e-9);
+                if (X_prop >= 1) {
+                  const bid_price = P_ID_est + s3M;
+                  // Stop-loss activation: P_mfrr ≤ bid_price (see simulate()).
+                  s3_fires = P_mfrr <= bid_price;
+                  s3_X = X_prop;
+                  S3Intraday_rev = X_prop * P_ID_est * 0.25;
+                  if (s3_fires) S3Curtail_rev = X_prop * (-P_mfrr) * 0.25;
+                }
+              }
+            }
+          }
+        }
+        const Q_pos = Q_pos_l2 + (s3_fires ? 0 : s3_X);
+        const Q_pot = D.q_pot[i];
+        const short_l2 = Q_pos_l2 > Q_pot ? Q_pos_l2 - Q_pot : 0;
+        const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
         // Guard against NaN p_imb (April rows): treat as 0 cost rather than
         // letting NaN poison the entire month's bucket.
         const pimb = D.p_imb[i];
         if (!isNaN(pimb)) {
-          imb = short * pimb * 0.25;
-          flat = short * theta * 0.25;
+          imb = short_l2 * pimb * 0.25;
+          flat = short_l2 * theta * 0.25;
+          S3ExtraCost = (short - short_l2) * (pimb + theta) * 0.25;
         }
       }
       const b =
         buckets.get(key) ||
-        { DA: 0, up_mfrr: 0, dn_mfrr: 0, up_afrr: 0, dn_afrr: 0, imb: 0, flat: 0 };
+        {
+          DA: 0,
+          up_mfrr: 0,
+          dn_mfrr: 0,
+          up_afrr: 0,
+          dn_afrr: 0,
+          s3_intraday: 0,
+          s3_curtail: 0,
+          s3_extra_cost: 0,
+          imb: 0,
+          flat: 0,
+        };
       b.DA += DA_rev;
       b.up_mfrr += UpMfrr_rev;
       b.dn_mfrr += DnMfrr_rev;
       b.up_afrr += UpAfrr_rev;
       b.dn_afrr += DnAfrr_rev;
+      b.s3_intraday += S3Intraday_rev;
+      b.s3_curtail += S3Curtail_rev;
+      b.s3_extra_cost += S3ExtraCost;
       b.imb += imb;
       b.flat += flat;
       buckets.set(key, b);
@@ -858,9 +1197,22 @@ const Engine = (() => {
         dn_mfrr: b.dn_mfrr,
         up_afrr: b.up_afrr,
         dn_afrr: b.dn_afrr,
+        s3_intraday: b.s3_intraday,
+        s3_curtail: b.s3_curtail,
+        s3_extra_cost: b.s3_extra_cost,
         imb: b.imb,
         flat: b.flat,
-        total: b.DA + b.up_mfrr + b.dn_mfrr + b.up_afrr + b.dn_afrr - b.imb - b.flat,
+        total:
+          b.DA +
+          b.up_mfrr +
+          b.dn_mfrr +
+          b.up_afrr +
+          b.dn_afrr +
+          b.s3_intraday +
+          b.s3_curtail -
+          b.imb -
+          b.flat -
+          b.s3_extra_cost,
       });
     }
     return out;
@@ -891,6 +1243,7 @@ const Engine = (() => {
     naiveRevenue,
     sweepLevel1,
     sweepLevel2,
+    sweepLevel3Oversell,
     topConcentration,
     monthlyAggregation,
     totalPotMWhInWindow,

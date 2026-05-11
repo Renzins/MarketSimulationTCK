@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Market Strategy Backtester</title>
-    <link rel="stylesheet" href="style.css?v=10" />
+    <link rel="stylesheet" href="style.css?v=16" />
   </head>
   <body>
     <nav class="site-nav">
@@ -24,8 +24,9 @@
     </header>
 
     <nav class="tabs">
-      <button class="tab active" data-level="1">Level 1 — Perfect Foresight</button>
-      <button class="tab" data-level="2">Level 2 — Real Forecast Errors</button>
+      <button class="tab active" data-level="1">Level 1 — DA forecast = Actual Power</button>
+      <button class="tab" data-level="2">Level 2 — DA + Actual power + imbalance penalties</button>
+      <button class="tab" data-level="3">Level 3 — DA + Actual power + imbalance penalties + speculation</button>
     </nav>
 
     <main>
@@ -343,6 +344,193 @@
           <div id="l2-heatmap" class="chart"></div>
         </div>
       </section>
+
+      <!-- =================================================================
+           LEVEL 3 PANEL
+           L2 + S3 (speculative intraday oversell). Three control groups:
+           Setup, Market parameters, Intra-day oversell. Per Q7, market
+           and oversell each have their own ⚡ Optimise button — they're
+           tuned independently. Setting s3_X_cap = 0 disables S3 entirely
+           and L3 reverts to L2 behaviour.
+           ================================================================= -->
+      <section id="panel-3" class="panel">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Define the experiment environment — what data is fed into the
+                simulation. These bound the analysis but aren't varied by the
+                optimiser.
+              </p>
+            </div>
+            <div class="controls-grid" id="l3-setup-params"></div>
+          </div>
+
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>Market parameters <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                The L2 strategy levers — DA withholding, ID-forecast trust,
+                mFRR↔aFRR per-direction split. The "Optimise market" button
+                sweeps over these while holding the oversell strategy fixed
+                at its current values.
+              </p>
+            </div>
+            <div class="controls-grid" id="l3-market-params"></div>
+            <div class="actions">
+              <button id="l3-optimise" class="btn primary">⚡ Optimise market</button>
+              <button id="l3-reset" class="btn">⇄ Reset to naïve</button>
+              <span id="l3-progress" class="progress"></span>
+            </div>
+          </div>
+
+          <div class="param-group oversell">
+            <div class="group-head">
+              <h3>Intra-day oversell <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                S3: for each ISP, if (VWAP1H − rolling-mean p_imb) ≥ S_min
+                AND recent σ ≤ σ_max, sell up to X_cap MW on intraday and
+                submit a defensive mFRR-dn bid at VWAP1H + M. The defensive
+                bid fires only when p_mfrr ≤ −(VWAP1H + M) — i.e., mFRR-dn
+                cleared at a magnitude ≥ what we demanded. Set X_cap = 0
+                to disable S3 and revert L3 to L2 behaviour. The
+                "Optimise oversell" button sweeps the 5 S3 params while
+                holding market params fixed.
+              </p>
+            </div>
+            <div class="controls-grid" id="l3-oversell-params"></div>
+            <div class="actions">
+              <button id="l3-optimise-oversell" class="btn primary">⚡ Optimise oversell</button>
+              <span id="l3-progress-oversell" class="progress"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="stats-card" id="l3-stats">
+          <div class="stat-grid">
+            <div class="big-stat">
+              <div class="label" title="Sum of per-ISP P&L over the entire backtest window.">Total revenue</div>
+              <div class="value" id="l3-total">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Difference vs. selling everything to DA at every ISP (Y=0, Z=0). Computed at the current θ_flat and winsorization.">Vs. naïve baseline</div>
+              <div class="value" id="l3-vs-naive">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated). Useful as an asset-yield comparison.">Revenue per MWh of potential</div>
+              <div class="value" id="l3-per-mwh">–</div>
+            </div>
+          </div>
+          <table class="decomposition" id="l3-decomp-table"></table>
+          <table class="decomposition" id="l3-counts-table"></table>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Time series</h2>
+            <div class="ts-controls">
+              <label>From:
+                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
+                       id="l3-date-from" class="date-eu" />
+              </label>
+              <label>To:
+                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
+                       id="l3-date-to" class="date-eu" />
+              </label>
+              <button id="l3-prev-range" class="btn small" title="Shift backward by current span">◀</button>
+              <button id="l3-next-range" class="btn small" title="Shift forward by current span">▶</button>
+              <span class="preset-group">
+                <button class="btn small preset" data-level="3" data-preset="1d">1d</button>
+                <button class="btn small preset" data-level="3" data-preset="1w">1w</button>
+                <button class="btn small preset" data-level="3" data-preset="1mo">1mo</button>
+                <button class="btn small preset" data-level="3" data-preset="3mo">3mo</button>
+                <button class="btn small preset" data-level="3" data-preset="all">all</button>
+              </span>
+              <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
+            </div>
+          </div>
+          <p class="card-desc">
+            DA-sold (line) and mFRR up/down volumes (bars) over the chosen window.
+            Hover any ISP for the full P&L breakdown. Bar mode for ranges ≤ 6 days;
+            filled-area scatter for longer ranges (the "all" preset plots all 40 k ISPs).
+          </p>
+          <div id="l3-ts-chart" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Robustness</h2>
+          </div>
+          <p class="card-desc">
+            How concentrated is the revenue? If a few rare periods dominate, the
+            "optimum" may be a coincidence. Read the numbers below as a stress test.
+          </p>
+          <div class="robust-grid">
+            <div class="robust-item">
+              <div class="label">Top 1% concentration</div>
+              <div class="big-num" id="l3-top1pct">–</div>
+              <div class="robust-help">
+                Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
+                <br><b>&lt; 10%:</b> well-distributed.
+                <br><b>&gt; 30%:</b> strategy depends on rare events.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 5% concentration</div>
+              <div class="big-num" id="l3-top5pct">–</div>
+              <div class="robust-help">
+                Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 10% concentration</div>
+              <div class="big-num" id="l3-top10pct">–</div>
+              <div class="robust-help">
+                Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
+              </div>
+            </div>
+          </div>
+          <div class="two-col">
+            <div>
+              <h3>Monthly revenue (decomposition)</h3>
+              <p class="chart-desc">
+                Stacked bar per calendar month showing how each leg contributes.
+                Big swings between months suggest seasonality.
+              </p>
+              <div id="l3-monthly-chart" class="chart small"></div>
+            </div>
+            <div>
+              <h3>Per-ISP revenue distribution</h3>
+              <p class="chart-desc">
+                Histogram (log-scale Y) of every ISP's revenue. A long right tail
+                means a few periods dominate.
+              </p>
+              <div id="l3-hist-chart" class="chart small"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Optimisation surface</h2>
+            <div>
+              <label>Heatmap pair:
+                <select id="l3-heatmap-pair">
+                  <option value="XY">X × Y (at current Z)</option>
+                  <option value="XZ">X × Z (at current Y)</option>
+                  <option value="YZ">Y × Z (at current X)</option>
+                </select>
+              </label>
+              <button id="l3-show-heatmap" class="btn">Compute heatmap</button>
+              <span id="l3-heatmap-progress" class="progress"></span>
+            </div>
+          </div>
+          <div id="l3-heatmap" class="chart"></div>
+        </div>
+      </section>
     </main>
 
     <footer class="site-footer">
@@ -358,7 +546,7 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="data.js?v=10"></script>
+    <script src="data.js?v=16"></script>
     <!--
       data-afrr.js: per-ISP aFRR activation counts (n_pos, n_neg, n_total).
       Engine reads n_pos / n_neg to scale aFRR position contribution
@@ -368,10 +556,10 @@
       mFRR↔aFRR split parameter s < 1. Both files are gracefully optional
       — engine.js falls back to zero arrays if either is missing.
     -->
-    <script src="data-afrr.js?v=10"></script>
-    <script src="data-afrr-15min.js?v=10"></script>
-    <script src="engine.js?v=10"></script>
-    <script src="charts.js?v=10"></script>
-    <script src="app.js?v=10"></script>
+    <script src="data-afrr.js?v=16"></script>
+    <script src="data-afrr-15min.js?v=16"></script>
+    <script src="engine.js?v=16"></script>
+    <script src="charts.js?v=16"></script>
+    <script src="app.js?v=16"></script>
   </body>
 </html>
