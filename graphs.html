@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Graphs</title>
-    <link rel="stylesheet" href="style.css?v=15" />
+    <link rel="stylesheet" href="style.css?v=18" />
   </head>
   <body>
     <nav class="site-nav">
@@ -26,6 +26,7 @@
     <nav class="tabs">
       <button class="tab active" data-section="mfrr">mFRR</button>
       <button class="tab" data-section="afrr">aFRR</button>
+      <button class="tab" data-section="compare">mFRR vs aFRR</button>
     </nav>
 
     <main>
@@ -353,6 +354,106 @@
           </div>
         </div>
       </section>
+
+      <!-- =================================================================
+           mFRR vs aFRR SECTION
+           Joint analysis of the two balancing markets: do they "agree"
+           on the direction of system need? Sign-agreement on the
+           spread (market_price − DA) is the headline metric per the
+           original spec; this section also adds a joint direction
+           matrix, a spread scatter, and summary stats.
+           ================================================================= -->
+      <section id="panel-compare" class="panel">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Restricts the comparison to ISPs in this window. The aFRR
+                window naturally starts ~2025-05-01 (before that, aFRR
+                spreads are NaN and excluded). Day-type filter is
+                independent from the mFRR / aFRR tabs.
+              </p>
+            </div>
+            <div class="controls-grid" id="g-cmp-setup-params"></div>
+          </div>
+
+          <div class="actions">
+            <button id="g-cmp-recompute" class="btn primary">↻ Recompute</button>
+            <span id="g-cmp-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <!-- ===== Summary scoreboard ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Summary statistics</h2>
+          </div>
+          <p class="card-desc">
+            Headline numbers: how often each market fires, how often they
+            fire in agreement, and the Pearson correlation between the two
+            spreads (where both are defined — i.e. mFRR cleared AND
+            aFRR-up had favourable activity in the same ISP).
+          </p>
+          <div id="g-cmp-stats" class="cmp-stats-grid"></div>
+        </div>
+
+        <!-- ===== Joint direction matrix ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Joint direction matrix</h2>
+          </div>
+          <p class="card-desc">
+            Rows: mFRR direction inferred from <code>p_mfrr</code> sign
+            (Up ≥ +1, Dead band |·| &lt; 1, Down ≤ −1). Columns: aFRR
+            direction inferred from <code>avg_p_pos</code> / <code>avg_p_neg</code>
+            being non-zero (Up only / Down only / Both directions / Neither).
+            Diagonal-like cells (Up–Up, Down–Down) mean the markets agree.
+          </p>
+          <div id="g-cmp-matrix" class="chart"></div>
+        </div>
+
+        <!-- ===== Sign-agreement bars (user's specific request) ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Sign agreement of the DA-spread</h2>
+          </div>
+          <p class="card-desc">
+            For each ISP where both spreads are defined, we record the
+            sign of <em>mFRR spread</em> (= p_mfrr − p_da) and the sign of
+            <em>aFRR spread</em> (= avg_p_pos − p_da on the left chart,
+            avg_p_neg − p_da on the right). Four mutually-exclusive
+            buckets: both positive (markets above DA → upward signal),
+            both negative (below DA → downward signal), or mixed.
+            <strong>Caveat:</strong> aFRR-down spread is structurally
+            ≤ 0 (since avg_p_neg ≤ 0 and p_da is usually positive), so
+            the right-hand chart is heavily dominated by "both negative"
+            — informative for verifying that, less so for new insight.
+          </p>
+          <div class="two-col">
+            <div id="g-cmp-sign-pos" class="chart"></div>
+            <div id="g-cmp-sign-neg" class="chart"></div>
+          </div>
+        </div>
+
+        <!-- ===== Spread × spread scatter ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Spread correlation scatter</h2>
+          </div>
+          <p class="card-desc">
+            Each point is one ISP plotted at (mFRR spread, aFRR spread).
+            A clean diagonal cloud means the two markets move together;
+            a flat or anti-diagonal cloud means they're uncorrelated or
+            inverse. Left: aFRR-up direction; right: aFRR-down direction.
+            Subsampled to ≤ 8 k points for responsiveness.
+          </p>
+          <div class="two-col">
+            <div id="g-cmp-scatter-pos" class="chart"></div>
+            <div id="g-cmp-scatter-neg" class="chart"></div>
+          </div>
+        </div>
+      </section>
     </main>
 
     <footer class="site-footer">
@@ -375,21 +476,22 @@
       a console.info in that case but keeps working.
     -->
     <script src="https://cdn.jsdelivr.net/npm/date-holidays@3.28.0/dist/umd.min.js"></script>
-    <script src="data.js?v=15"></script>
-    <script src="data-afrr.js?v=15"></script>
+    <script src="data.js?v=18"></script>
+    <script src="data-afrr.js?v=18"></script>
     <!--
       data-afrr-15min.js: per-ISP averaged AST_POS / AST_NEG (NaN→0, ÷225)
       from preprocess-afrr-15min.py. Engine.init wraps it into typed arrays;
       Graphs page doesn't currently use these prices but engine.js reads
       them up front so the Backtester and Graphs share one engine init path.
     -->
-    <script src="data-afrr-15min.js?v=15"></script>
-    <script src="engine.js?v=15"></script>
-    <script src="graphs-engine.js?v=15"></script>
-    <script src="graphs-charts.js?v=15"></script>
-    <script src="afrr-engine.js?v=15"></script>
-    <script src="afrr-charts.js?v=15"></script>
-    <script src="afrr-spread-engine.js?v=15"></script>
-    <script src="graphs-app.js?v=15"></script>
+    <script src="data-afrr-15min.js?v=18"></script>
+    <script src="engine.js?v=18"></script>
+    <script src="graphs-engine.js?v=18"></script>
+    <script src="graphs-charts.js?v=18"></script>
+    <script src="afrr-engine.js?v=18"></script>
+    <script src="afrr-charts.js?v=18"></script>
+    <script src="afrr-spread-engine.js?v=18"></script>
+    <script src="mfrr-vs-afrr-engine.js?v=18"></script>
+    <script src="graphs-app.js?v=18"></script>
   </body>
 </html>

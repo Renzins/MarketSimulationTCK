@@ -711,3 +711,41 @@ select {
   font-size: 12px;
   text-align: center;
 }
+
+/* ---------- mFRR vs aFRR stats scoreboard ---------------------------- */
+/* Grid of compact stat tiles. Each tile has a small label, a big value,
+   and an optional small help line below. Auto-fits 3–4 columns on
+   desktop, collapses to 2 on narrower viewports. */
+.cmp-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.cmp-stat {
+  background: var(--bg3);
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+
+.cmp-stat-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+
+.cmp-stat-val {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.cmp-stat-help {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  line-height: 1.4;
+}

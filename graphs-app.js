@@ -783,6 +783,10 @@
             document.getElementById("g-afrr-prices-loading-card").style.display = "none";
             document.getElementById("g-afrr-prices-section").style.display = "";
             updateAfrrPriceCharts();
+            // Compare tab uses the same 4-s data for slot-level analysis;
+            // re-render it now that AFRR_PRICES is available so the user
+            // sees the slot-level upgrade automatically.
+            if (typeof scheduleCmpUpdate === "function") scheduleCmpUpdate();
           }, 60);
         }
       }
@@ -1153,6 +1157,628 @@
     document.getElementById("g-afrr-setup-params").innerHTML = afrrSetupHTML();
   }
 
+  // =====================================================================
+  //  mFRR vs aFRR SUB-TAB
+  //  Joint analysis. Independent state from the mFRR / aFRR sub-tabs.
+  //  Sim range defaults to the intersection of main-data range and the
+  //  aFRR data extent (since aFRR spreads are NaN before 2025-05-01).
+  // =====================================================================
+  MfrrAfrrEngine.init();
+
+  const cmpState = {
+    sim: {
+      from: afrrMinDate > dataMinDate ? afrrMinDate : dataMinDate,
+      to: afrrMaxDate < dataMaxDate ? afrrMaxDate : dataMaxDate,
+    },
+    dayType: "all",
+    // Two independent winsor percentile pairs. mFRR uses one bound for
+    // both ISP and slot modes (per-ISP distribution is the same in both).
+    // aFRR uses different bounds per mode because the per-ISP-aggregated
+    // and per-4-s-entry distributions are quantitatively different.
+    winsorMfrrLo: 10,
+    winsorMfrrHi: 90,
+    winsorAfrrLo: 10,
+    winsorAfrrHi: 90,
+  };
+
+  function cmpSetupHTML() {
+    return `
+      <div class="control sim-range">
+        <label>Simulation date range<span class="unit">DD/MM/YYYY</span></label>
+        <div class="slider-row two">
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-cmp-sim-from" value="${isoToEU(cmpState.sim.from)}">
+          <span>→</span>
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-cmp-sim-to" value="${isoToEU(cmpState.sim.to)}">
+          <button type="button" class="btn small" id="g-cmp-sim-reset" title="Reset to full aFRR range">↻</button>
+        </div>
+        <div class="param-desc">
+          <p>Restricts the comparison to ISPs in this window. The aFRR
+             portion is clamped to ${isoToEU(afrrMinDate)} → ${isoToEU(afrrMaxDate)}
+             (before that, avg_p_pos / avg_p_neg are zero so spreads are
+             undefined and ISPs are excluded).</p>
+        </div>
+      </div>
+
+      <div class="control">
+        <label>Day type filter</label>
+        <div class="day-type-toggle g-cmp-day-type-toggle">
+          <button type="button" class="btn small preset${cmpState.dayType === "all" ? " active" : ""}" data-day-type="all">All days</button>
+          <button type="button" class="btn small preset${cmpState.dayType === "weekend-holiday" ? " active" : ""}" data-day-type="weekend-holiday">Weekends + holidays</button>
+          <button type="button" class="btn small preset${cmpState.dayType === "workday" ? " active" : ""}" data-day-type="workday">Workdays only</button>
+        </div>
+        <div class="param-desc">
+          <p>Independent from the mFRR / aFRR tabs. Useful for asking
+             whether the markets agree differently on weekends than on
+             workdays (system imbalance regimes can shift).</p>
+        </div>
+      </div>
+
+      <div class="control winsor">
+        <label>Winsorize mFRR spread (percentiles)</label>
+        <div class="slider-row two winsor-row">
+          <span class="winsor-input">
+            <input type="number" id="g-cmp-winsor-mfrr-lo" value="${cmpState.winsorMfrrLo}" min="0" max="50" step="1">
+            <span class="winsor-cap" id="g-cmp-winsor-mfrr-cap-lo">(…)</span>
+          </span>
+          <span>/</span>
+          <span class="winsor-input">
+            <input type="number" id="g-cmp-winsor-mfrr-hi" value="${cmpState.winsorMfrrHi}" min="50" max="100" step="1">
+            <span class="winsor-cap" id="g-cmp-winsor-mfrr-cap-hi">(…)</span>
+          </span>
+        </div>
+        <div class="param-desc">
+          <p>Clip mFRR spread (p_mfrr − p_da) at the chosen percentiles
+             before any sign / correlation / scatter computation. Without
+             this, the few ±10 000 €/MWh outliers in the dataset dominate
+             the Pearson correlation and squash the scatter cloud to a
+             single pixel near the origin.</p>
+        </div>
+      </div>
+
+      <div class="control winsor">
+        <label>Winsorize aFRR spread (percentiles)</label>
+        <div class="slider-row two winsor-row">
+          <span class="winsor-input">
+            <input type="number" id="g-cmp-winsor-afrr-lo" value="${cmpState.winsorAfrrLo}" min="0" max="50" step="1">
+            <span class="winsor-cap" id="g-cmp-winsor-afrr-cap-lo">(…)</span>
+          </span>
+          <span>/</span>
+          <span class="winsor-input">
+            <input type="number" id="g-cmp-winsor-afrr-hi" value="${cmpState.winsorAfrrHi}" min="50" max="100" step="1">
+            <span class="winsor-cap" id="g-cmp-winsor-afrr-cap-hi">(…)</span>
+          </span>
+        </div>
+        <div class="param-desc">
+          <p>Applied separately to POS and NEG aFRR spreads using their
+             own per-direction percentile points (so positive-side and
+             negative-side outliers get clipped at appropriately scaled
+             bounds). In slot mode, percentiles are over the per-4-s
+             entries (millions of points); in the ISP-level fallback, over
+             the favourable-only ISP averages.</p>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCmpCards() {
+    document.getElementById("g-cmp-setup-params").innerHTML = cmpSetupHTML();
+  }
+
+  let cmpUpdateTimer = null;
+  function scheduleCmpUpdate() {
+    clearTimeout(cmpUpdateTimer);
+    cmpUpdateTimer = setTimeout(updateCmp, 60);
+  }
+
+  // ----- Chart-drawer helpers (kept inline; no separate file for now) -----
+
+  // Standard Plotly layout / config for the new charts. Reuses the dark
+  // palette from the rest of the page (graphs-charts.js's LAYOUT).
+  const CMP_LAYOUT = {
+    paper_bgcolor: "#11161c",
+    plot_bgcolor: "#11161c",
+    font: { color: "#e6edf3", family: "system-ui, sans-serif", size: 12 },
+    margin: { t: 60, r: 18, b: 60, l: 80 },
+    xaxis: { gridcolor: "#262d36", linecolor: "#3a4350", zerolinecolor: "#3a4350" },
+    yaxis: { gridcolor: "#262d36", linecolor: "#3a4350", zerolinecolor: "#3a4350" },
+    hoverlabel: { bgcolor: "#1f2630", bordercolor: "#3a4350", font: { color: "#e6edf3" } },
+  };
+  const CMP_CFG = {
+    responsive: true,
+    displaylogo: false,
+    modeBarButtonsToRemove: ["lasso2d", "select2d"],
+  };
+
+  // Joint direction matrix: 3 × 4 heatmap with numeric annotations.
+  // Used for both ISP-level and slot-level modes — same shape, different
+  // semantics for the column labels (configurable via labelMode).
+  function drawCmpMatrix(targetId, result, labelMode) {
+    const mRows = ["mFRR Up (≥ +1)", "mFRR Down (≤ −1)", "mFRR Dead (|·|<1)"];
+    const aCols =
+      labelMode === "slot"
+        ? [
+            "aFRR slot: POS only",
+            "aFRR slot: NEG only",
+            "aFRR slot: Both",
+            "aFRR slot: Neither",
+          ]
+        : ["aFRR Up only", "aFRR Down only", "aFRR Both", "aFRR Neither"];
+    const cells = result.cells;
+    const total = result.total || 1;
+    // Plotly heatmap z is [row][col].
+    const annotations = [];
+    for (let m = 0; m < 3; m++) {
+      for (let a = 0; a < 4; a++) {
+        const n = cells[m][a];
+        const pct = (n / total) * 100;
+        annotations.push({
+          x: aCols[a],
+          y: mRows[m],
+          text: `<b>${n.toLocaleString("en-US")}</b><br><span style="font-size:9px;color:#9aa5b1">${pct.toFixed(1)}%</span>`,
+          showarrow: false,
+          font: { size: 11, color: "#0d1117" },
+          align: "center",
+        });
+      }
+    }
+    const traces = [
+      {
+        type: "heatmap",
+        z: cells,
+        x: aCols,
+        y: mRows,
+        colorscale: [
+          [0, "#1d2c50"],
+          [0.5, "#7d8fad"],
+          [1, "#ffd166"],
+        ],
+        showscale: true,
+        colorbar: { title: { text: "ISP count", side: "right" } },
+        hovertemplate:
+          "%{y}<br>%{x}<br>n = %{z:,}<extra></extra>",
+      },
+    ];
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: {
+        text: `Joint direction · n = ${total.toLocaleString("en-US")} ${labelMode === "slot" ? "4-s slots" : "ISPs"}`,
+        font: { size: 14, color: "#e6edf3" },
+      },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "category", title: labelMode === "slot" ? "aFRR slot type" : "aFRR direction" },
+      yaxis: { ...CMP_LAYOUT.yaxis, type: "category", title: "mFRR direction (broadcast)", autorange: "reversed" },
+      annotations,
+    });
+    Plotly.react(targetId, traces, layout, CMP_CFG);
+  }
+
+  // Sign-agreement bar: 4 segments, one stack.
+  // Colour code: agreement greens, disagreement reds (matches the rest
+  // of the site's palette).
+  function drawCmpSignBar(targetId, result, title, subtitle) {
+    const { counts, total } = result;
+    const tot = total || 1;
+    const segs = [
+      ["Both POS (agree, mkts above DA)", "#3fb950", counts.ppos],
+      ["mFRR+ / aFRR− (disagree)", "#f0883e", counts.pneg],
+      ["mFRR− / aFRR+ (disagree)", "#bc8cff", counts.npos],
+      ["Both NEG (agree, mkts below DA)", "#f85149", counts.nneg],
+    ];
+    const traces = segs.map(([name, colour, n]) => ({
+      type: "bar",
+      name,
+      x: ["agreement"],
+      y: [(n / tot) * 100],
+      customdata: [[n, tot]],
+      marker: { color: colour, line: { color: "#0d1117", width: 1 } },
+      hovertemplate:
+        `<b>${name}</b><br>%{y:.2f}%<br>%{customdata[0]:,} / %{customdata[1]:,} ISPs<extra></extra>`,
+    }));
+    const annotations = [];
+    let cum = 0;
+    for (const [, , n] of segs) {
+      const pct = (n / tot) * 100;
+      if (pct >= 4) {
+        annotations.push({
+          x: "agreement",
+          y: cum + pct / 2,
+          xref: "x",
+          yref: "y",
+          text: `<b>${pct.toFixed(1)}%</b>`,
+          showarrow: false,
+          font: { color: "#0d1117", size: 13 },
+        });
+      }
+      cum += pct;
+    }
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: {
+        text: `${title}<br><span style="font-size:11px;color:#9aa5b1">${subtitle} · n = ${tot.toLocaleString("en-US")}</span>`,
+        font: { size: 14, color: "#e6edf3" },
+      },
+      barmode: "stack",
+      yaxis: {
+        ...CMP_LAYOUT.yaxis,
+        title: "% of ISPs",
+        range: [0, 100],
+        ticksuffix: "%",
+      },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "category", showticklabels: false },
+      annotations,
+      legend: {
+        orientation: "h",
+        x: 0,
+        y: -0.2,
+        bgcolor: "rgba(0,0,0,0)",
+        font: { color: "#e6edf3", size: 11 },
+      },
+      showlegend: true,
+    });
+    Plotly.react(targetId, traces, layout, CMP_CFG);
+  }
+
+  // Scatter of mFRR spread vs aFRR spread. scattergl handles 8k points
+  // efficiently; semi-transparent dots so density shows through.
+  function drawCmpScatter(targetId, result, title, yAxisLabel) {
+    const traces = [
+      {
+        type: "scattergl",
+        mode: "markers",
+        x: result.x,
+        y: result.y,
+        marker: {
+          color: "#7ee787",
+          size: 4,
+          opacity: 0.35,
+          line: { width: 0 },
+        },
+        hovertemplate:
+          "mFRR spread: %{x:.1f} €/MWh<br>aFRR spread: %{y:.1f} €/MWh<extra></extra>",
+        name: "",
+      },
+    ];
+    // y = x reference line — agreement axis.
+    const allVals = [];
+    for (const v of result.x) if (isFinite(v)) allVals.push(v);
+    for (const v of result.y) if (isFinite(v)) allVals.push(v);
+    if (allVals.length > 0) {
+      allVals.sort((a, b) => a - b);
+      const p1 = allVals[Math.floor(allVals.length * 0.01)];
+      const p99 = allVals[Math.floor(allVals.length * 0.99)];
+      const lo = Math.min(p1, -10);
+      const hi = Math.max(p99, 10);
+      traces.push({
+        type: "scattergl",
+        mode: "lines",
+        x: [lo, hi],
+        y: [lo, hi],
+        line: { color: "#f85149", width: 1, dash: "dash" },
+        name: "y = x (agreement)",
+        hoverinfo: "skip",
+      });
+    }
+    const subtitle = result.subsampled
+      ? `n = ${result.n.toLocaleString("en-US")} (showing ${result.x.length.toLocaleString("en-US")} subsampled)`
+      : `n = ${result.n.toLocaleString("en-US")}`;
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: {
+        text: `${title}<br><span style="font-size:11px;color:#9aa5b1">${subtitle}</span>`,
+        font: { size: 14, color: "#e6edf3" },
+      },
+      xaxis: {
+        ...CMP_LAYOUT.xaxis,
+        title: "mFRR spread (p_mfrr − p_da, €/MWh)",
+        zeroline: true,
+        zerolinecolor: "#5a6470",
+      },
+      yaxis: {
+        ...CMP_LAYOUT.yaxis,
+        title: yAxisLabel,
+        zeroline: true,
+        zerolinecolor: "#5a6470",
+      },
+      showlegend: false,
+    });
+    Plotly.react(targetId, traces, layout, CMP_CFG);
+  }
+
+  // Build the stats scoreboard HTML.
+  // Two modes: "isp" (15-min ISP-level, fast, fallback before 4-s loads)
+  //            "slot" (4-s slot-level, requires AFRR_PRICES loaded).
+  function renderCmpStats(s, mode) {
+    const fmtInt = (n) => (n || 0).toLocaleString("en-US");
+    const fmtPct = (a, b) => (b > 0 ? ((a / b) * 100).toFixed(1) + "%" : "—");
+    const fmtCorr = (c) => (isFinite(c) ? c.toFixed(3) : "—");
+    let html;
+    if (mode === "slot") {
+      // Slot-level: every metric is in units of 4-s slots / entries.
+      // Confidence is overstated because mFRR is broadcast 225× per ISP —
+      // flagged in the help line for the correlation tile.
+      html = `
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">4-s slots in window</div>
+          <div class="cmp-stat-val">${fmtInt(s.nSlots)}</div>
+          <div class="cmp-stat-help">${fmtInt(s.nIspsWithAfrr)} ISPs with aFRR data</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">aFRR active entries (POS / NEG)</div>
+          <div class="cmp-stat-val">
+            <span style="color:#3fb950">${fmtInt(s.nPos)}</span>
+            <span style="color:#9aa5b1"> · </span>
+            <span style="color:#f85149">${fmtInt(s.nNeg)}</span>
+          </div>
+          <div class="cmp-stat-help">${fmtPct(s.nPos + s.nNeg, s.nSlots)} of slots had at least one direction cleared</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Co-fire (mFRR ↑ AND aFRR POS slot)</div>
+          <div class="cmp-stat-val" style="color:#3fb950">${fmtInt(s.nCoUpPos)}</div>
+          <div class="cmp-stat-help">${fmtPct(s.nCoUpPos, s.nPos)} of POS-direction 4-s slots fell inside an mFRR-up ISP</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Co-fire (mFRR ↓ AND aFRR NEG slot)</div>
+          <div class="cmp-stat-val" style="color:#f85149">${fmtInt(s.nCoDnNeg)}</div>
+          <div class="cmp-stat-help">${fmtPct(s.nCoDnNeg, s.nNeg)} of NEG-direction 4-s slots fell inside an mFRR-dn ISP</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Sign-agreement (POS direction)</div>
+          <div class="cmp-stat-val">${fmtPct(s.nSignAgreePos, s.nPos)}</div>
+          <div class="cmp-stat-help">Per POS-direction 4-s slot: sign(mFRR spread) = sign(aFRR spread). n = ${fmtInt(s.nPos)}</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Sign-agreement (NEG direction)</div>
+          <div class="cmp-stat-val">${fmtPct(s.nSignAgreeNeg, s.nNeg)}</div>
+          <div class="cmp-stat-help">Same metric on NEG-direction slots. Heavily skewed to "both negative" by construction.</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Pearson correlation (all entries)</div>
+          <div class="cmp-stat-val">${fmtCorr(s.corr)}</div>
+          <div class="cmp-stat-help">mFRR vs aFRR spread across ${fmtInt(s.nCorr)} entries. <strong>Independent obs ≈ n_ISPs</strong>; mFRR is broadcast 225× so don't over-interpret confidence here.</div>
+        </div>
+      `;
+    } else {
+      // ISP-level fallback (used only while 4-s data is loading).
+      html = `
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">ISPs in window</div>
+          <div class="cmp-stat-val">${fmtInt(s.nTotal)}</div>
+          <div class="cmp-stat-help">ISP-level mode (4-s data still loading)</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">mFRR fires (Up / Dn)</div>
+          <div class="cmp-stat-val">
+            <span style="color:#3fb950">${fmtInt(s.nMfrrUp)}</span>
+            <span style="color:#9aa5b1"> · </span>
+            <span style="color:#f85149">${fmtInt(s.nMfrrDn)}</span>
+          </div>
+          <div class="cmp-stat-help">${fmtPct(s.nMfrrUp + s.nMfrrDn, s.nTotal)} of ISPs</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">aFRR fires (Up / Dn / Both)</div>
+          <div class="cmp-stat-val">
+            <span style="color:#3fb950">${fmtInt(s.nAfrrUp)}</span>
+            <span style="color:#9aa5b1"> · </span>
+            <span style="color:#f85149">${fmtInt(s.nAfrrDn)}</span>
+            <span style="color:#9aa5b1"> · </span>
+            <span style="color:#ffd166">${fmtInt(s.nAfrrBoth)}</span>
+          </div>
+          <div class="cmp-stat-help">${fmtPct(s.nAfrrUp + s.nAfrrDn + s.nAfrrBoth, s.nTotal)} of ISPs</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Co-fire (mFRR ↑ AND aFRR ↑)</div>
+          <div class="cmp-stat-val" style="color:#3fb950">${fmtInt(s.nCoUp)}</div>
+          <div class="cmp-stat-help">${fmtPct(s.nCoUp, s.nMfrrUp)} of mFRR-up ISPs also had aFRR-up activity</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Co-fire (mFRR ↓ AND aFRR ↓)</div>
+          <div class="cmp-stat-val" style="color:#f85149">${fmtInt(s.nCoDn)}</div>
+          <div class="cmp-stat-help">${fmtPct(s.nCoDn, s.nMfrrDn)} of mFRR-dn ISPs also had aFRR-dn activity</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Sign-agreement (Up direction)</div>
+          <div class="cmp-stat-val">${fmtPct(s.signAgreePos * s.nSignAgreePos, s.nSignAgreePos)}</div>
+          <div class="cmp-stat-help">mFRR spread sign matches aFRR-up spread sign, n = ${fmtInt(s.nSignAgreePos)} ISPs</div>
+        </div>
+        <div class="cmp-stat">
+          <div class="cmp-stat-label">Pearson correlation</div>
+          <div class="cmp-stat-val">${fmtCorr(s.corrPos)}</div>
+          <div class="cmp-stat-help">mFRR spread vs aFRR-up spread, n = ${fmtInt(s.nCorrPos)} ISPs (where both defined)</div>
+        </div>
+      `;
+    }
+    document.getElementById("g-cmp-stats").innerHTML = html;
+  }
+
+  // Live preview of the per-direction winsor cap values. Mirrors the
+  // backtester's "(≤ ...)/(≥ ...)" preview style. Picks the slot-mode
+  // aFRR bounds when 4-s data is loaded (those are the bounds the charts
+  // actually use), else falls back to ISP-level aFRR bounds.
+  function updateCmpWinsorCaps() {
+    const fmt = (v) => {
+      if (!isFinite(v)) return "—";
+      const abs = Math.abs(v);
+      if (abs >= 1000) return Math.round(v).toLocaleString("en-US");
+      if (abs >= 100) return v.toFixed(0);
+      return v.toFixed(1);
+    };
+    const setCap = (id, v, prefix) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = `(${prefix} ${fmt(v)} €/MWh)`;
+    };
+    const mB = MfrrAfrrEngine.getCurrentBounds("mfrr");
+    if (mB) {
+      setCap("g-cmp-winsor-mfrr-cap-lo", mB.lo, "≤");
+      setCap("g-cmp-winsor-mfrr-cap-hi", mB.hi, "≥");
+    }
+    // Use slot-level bounds when 4-s data is loaded; fall back to ISP.
+    const useSlot = MfrrAfrrEngine.isSlotDataLoaded();
+    const aBp = MfrrAfrrEngine.getCurrentBounds(useSlot ? "slot" : "isp", "pos");
+    const aBn = MfrrAfrrEngine.getCurrentBounds(useSlot ? "slot" : "isp", "neg");
+    // The aFRR caps shown summarise both POS and NEG side cap ranges:
+    // lo = min of pos-lo/neg-lo, hi = max of pos-hi/neg-hi. Tooltip-style
+    // single line; if the user needs per-direction precision they can
+    // open the per-direction charts (axes are labelled).
+    if (aBp && aBn) {
+      const lo = Math.min(aBp.lo, aBn.lo);
+      const hi = Math.max(aBp.hi, aBn.hi);
+      setCap("g-cmp-winsor-afrr-cap-lo", lo, "≤");
+      setCap("g-cmp-winsor-afrr-cap-hi", hi, "≥");
+    }
+  }
+
+  function updateCmp() {
+    const progEl = document.getElementById("g-cmp-progress");
+    const { start, end } = rangeToIdx(cmpState.sim.from, cmpState.sim.to);
+    Engine.setWindow(start, end);
+    MfrrAfrrEngine.setDayTypeFilter(cmpState.dayType);
+    MfrrAfrrEngine.setWinsorMfrr(cmpState.winsorMfrrLo, cmpState.winsorMfrrHi);
+    MfrrAfrrEngine.setWinsorAfrr(cmpState.winsorAfrrLo, cmpState.winsorAfrrHi);
+
+    // Prefer slot-level analysis (per-4-s) — it's what the user asked
+    // for. If the lazy-loaded 4-s price file isn't ready, render the
+    // ISP-level fallback and trigger the load; re-renders automatically
+    // once the load completes (see loadAfrrPriceData below).
+    if (MfrrAfrrEngine.isSlotDataLoaded()) {
+      progEl.textContent = "computing (4-s mode)…";
+      setTimeout(() => {
+        const t0 = performance.now();
+        renderCmpStats(MfrrAfrrEngine.slotLevelStats(), "slot");
+        drawCmpMatrix("g-cmp-matrix", MfrrAfrrEngine.slotLevelMatrix(), "slot");
+        drawCmpSignBar(
+          "g-cmp-sign-pos",
+          MfrrAfrrEngine.slotLevelSignAgreement("pos"),
+          "Sign agreement — aFRR POS slots",
+          "Per 4-s POS slot: sign(p_mfrr − p_da) vs sign(AST_POS − p_da)",
+        );
+        drawCmpSignBar(
+          "g-cmp-sign-neg",
+          MfrrAfrrEngine.slotLevelSignAgreement("neg"),
+          "Sign agreement — aFRR NEG slots",
+          "Per 4-s NEG slot: sign(p_mfrr − p_da) vs sign(AST_NEG − p_da)",
+        );
+        drawCmpScatter(
+          "g-cmp-scatter-pos",
+          MfrrAfrrEngine.slotLevelScatter("pos"),
+          "mFRR spread (broadcast) vs aFRR POS spread",
+          "aFRR POS spread (AST_POS − p_da, €/MWh)",
+        );
+        drawCmpScatter(
+          "g-cmp-scatter-neg",
+          MfrrAfrrEngine.slotLevelScatter("neg"),
+          "mFRR spread (broadcast) vs aFRR NEG spread",
+          "aFRR NEG spread (AST_NEG − p_da, €/MWh)",
+        );
+        const ms = Math.round(performance.now() - t0);
+        progEl.textContent = `done in ${ms} ms (4-s mode)`;
+        updateCmpWinsorCaps();
+      }, 30);
+    } else {
+      // ISP-level fallback while 4-s data loads.
+      progEl.textContent = "loading 4-second aFRR price data… (ISP-level shown meanwhile)";
+      setTimeout(() => {
+        const t0 = performance.now();
+        renderCmpStats(MfrrAfrrEngine.statsScoreboard(), "isp");
+        drawCmpMatrix("g-cmp-matrix", MfrrAfrrEngine.agreementMatrix(), "isp");
+        drawCmpSignBar(
+          "g-cmp-sign-pos",
+          MfrrAfrrEngine.signAgreement("pos"),
+          "Sign agreement — aFRR-up direction (ISP-level)",
+          "spread = avg_p_pos − p_da (only ISPs with avg_p_pos > 0)",
+        );
+        drawCmpSignBar(
+          "g-cmp-sign-neg",
+          MfrrAfrrEngine.signAgreement("neg"),
+          "Sign agreement — aFRR-dn direction (ISP-level)",
+          "spread = avg_p_neg − p_da (only ISPs with avg_p_neg < 0)",
+        );
+        drawCmpScatter(
+          "g-cmp-scatter-pos",
+          MfrrAfrrEngine.spreadScatter("pos"),
+          "mFRR spread vs aFRR-up spread (ISP-level)",
+          "aFRR-up spread (avg_p_pos − p_da, €/MWh)",
+        );
+        drawCmpScatter(
+          "g-cmp-scatter-neg",
+          MfrrAfrrEngine.spreadScatter("neg"),
+          "mFRR spread vs aFRR-dn spread (ISP-level)",
+          "aFRR-dn spread (avg_p_neg − p_da, €/MWh)",
+        );
+        const ms = Math.round(performance.now() - t0);
+        progEl.textContent = `done in ${ms} ms (ISP-level fallback — 4-s data still loading)`;
+        updateCmpWinsorCaps();
+      }, 30);
+      // Kick off the lazy load. Will call scheduleCmpUpdate() on completion
+      // (see loadAfrrPriceData hook below), at which point we'll re-render
+      // in 4-s mode.
+      loadAfrrPriceData();
+    }
+  }
+
+  function bindCmpControls() {
+    const fromEl = document.getElementById("g-cmp-sim-from");
+    const toEl = document.getElementById("g-cmp-sim-to");
+    const onSim = () => {
+      let f = clampDate(parseEU(fromEl.value) || dataMinDate, dataMinDate, dataMaxDate);
+      let t = clampDate(parseEU(toEl.value) || dataMaxDate, dataMinDate, dataMaxDate);
+      if (f > t) [f, t] = [t, f];
+      fromEl.value = isoToEU(f);
+      toEl.value = isoToEU(t);
+      cmpState.sim = { from: f, to: t };
+      scheduleCmpUpdate();
+    };
+    fromEl.addEventListener("change", onSim);
+    toEl.addEventListener("change", onSim);
+    document.getElementById("g-cmp-sim-reset").addEventListener("click", () => {
+      fromEl.value = isoToEU(afrrMinDate);
+      toEl.value = isoToEU(afrrMaxDate);
+      onSim();
+    });
+    document
+      .querySelectorAll(".g-cmp-day-type-toggle .preset[data-day-type]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const t = btn.dataset.dayType;
+          if (cmpState.dayType === t) return;
+          cmpState.dayType = t;
+          document
+            .querySelectorAll(".g-cmp-day-type-toggle .preset[data-day-type]")
+            .forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          scheduleCmpUpdate();
+        });
+      });
+    // Winsor controls — mFRR and aFRR independently. Clamps to safe ranges
+    // (lo ∈ [0,50], hi ∈ [50,100]); recomputes on every change.
+    const wMLo = document.getElementById("g-cmp-winsor-mfrr-lo");
+    const wMHi = document.getElementById("g-cmp-winsor-mfrr-hi");
+    const onWinsorMfrr = () => {
+      const lo = Math.max(0, Math.min(50, parseFloat(wMLo.value) || 0));
+      const hi = Math.max(50, Math.min(100, parseFloat(wMHi.value) || 100));
+      wMLo.value = lo;
+      wMHi.value = hi;
+      cmpState.winsorMfrrLo = lo;
+      cmpState.winsorMfrrHi = hi;
+      scheduleCmpUpdate();
+    };
+    wMLo.addEventListener("change", onWinsorMfrr);
+    wMHi.addEventListener("change", onWinsorMfrr);
+    const wALo = document.getElementById("g-cmp-winsor-afrr-lo");
+    const wAHi = document.getElementById("g-cmp-winsor-afrr-hi");
+    const onWinsorAfrr = () => {
+      const lo = Math.max(0, Math.min(50, parseFloat(wALo.value) || 0));
+      const hi = Math.max(50, Math.min(100, parseFloat(wAHi.value) || 100));
+      wALo.value = lo;
+      wAHi.value = hi;
+      cmpState.winsorAfrrLo = lo;
+      cmpState.winsorAfrrHi = hi;
+      scheduleCmpUpdate();
+    };
+    wALo.addEventListener("change", onWinsorAfrr);
+    wAHi.addEventListener("change", onWinsorAfrr);
+    document.getElementById("g-cmp-recompute").addEventListener("click", updateCmp);
+  }
+
   // ---------- tabs -------------------------------------------------------
   // Cleared on every render to avoid duplicate listeners. Each tab's update
   // fires when it's activated (the engine window is shared, so we need to
@@ -1182,6 +1808,8 @@
         // Kick off the lazy load of the 86 MB price file in the background.
         // Safe to call repeatedly — early-returns if already loaded/loading.
         loadAfrrPriceData();
+      } else if (section === "compare") {
+        scheduleCmpUpdate();
       } else {
         scheduleUpdate();
       }
@@ -1193,7 +1821,10 @@
   bindControls();
   renderAfrrCards();
   bindAfrrControls();
+  renderCmpCards();
+  bindCmpControls();
   updateAll();
-  // Pre-compute aFRR so switching tabs is instant
+  // Pre-compute aFRR + compare so switching tabs is instant
   setTimeout(updateAfrr, 200);
+  setTimeout(updateCmp, 400);
 })();
