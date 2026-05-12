@@ -74,7 +74,7 @@ NEEDED = [
     "final_imbalance_price_latvia",
     # Intraday VWAP at 1h before delivery (LV bidding zone). Used by Level 3
     # speculation strategy as the intraday-sale-price estimate (`P_ID_est`)
-    # and as the basis for the defensive mFRR-dn bid price (P_ID + M).
+    # and as the basis for the hedge mFRR-dn bid price (P_ID + M).
     "averagePriceLast1H",
     # Baltic-level columns (used by the Graphs page)
     "lv_wind_onshore_dayahead_mw",

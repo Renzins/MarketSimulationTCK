@@ -1342,13 +1342,28 @@
           "%{y}<br>%{x}<br>n = %{z:,}<extra></extra>",
       },
     ];
+    // Larger left/bottom margins so the "mFRR direction (broadcast)" axis
+    // title and the long mFRR/aFRR tick labels ("mFRR Up (≥ +1)" etc.)
+    // don't collide with each other or get clipped at narrow viewports.
     const layout = Object.assign({}, CMP_LAYOUT, {
       title: {
         text: `Joint direction · n = ${total.toLocaleString("en-US")} ${labelMode === "slot" ? "4-s slots" : "ISPs"}`,
         font: { size: 14, color: "#e6edf3" },
       },
-      xaxis: { ...CMP_LAYOUT.xaxis, type: "category", title: labelMode === "slot" ? "aFRR slot type" : "aFRR direction" },
-      yaxis: { ...CMP_LAYOUT.yaxis, type: "category", title: "mFRR direction (broadcast)", autorange: "reversed" },
+      margin: { t: 60, r: 18, b: 90, l: 150 },
+      xaxis: {
+        ...CMP_LAYOUT.xaxis,
+        type: "category",
+        title: { text: labelMode === "slot" ? "aFRR slot type" : "aFRR direction", standoff: 14 },
+        automargin: true,
+      },
+      yaxis: {
+        ...CMP_LAYOUT.yaxis,
+        type: "category",
+        title: { text: "mFRR direction (broadcast)", standoff: 14 },
+        autorange: "reversed",
+        automargin: true,
+      },
       annotations,
     });
     Plotly.react(targetId, traces, layout, CMP_CFG);
@@ -1788,9 +1803,16 @@
   // load (see updateAfrr below) into a panel that's still display:none —
   // Plotly canvases get drawn at 0×0 and `responsive:true` only fires on
   // window resize, leaving them visibly broken until the user zoomed or
-  // resized. Forcing Plotly.Plots.resize on every chart in the newly-active
-  // panel re-measures against the now-visible container. Idempotent and
-  // safe on un-rendered charts (guarded via `_fullLayout`).
+  // resized. We address this with two layers:
+  //   1. On every tab click, force Plotly.Plots.resize on each chart in the
+  //      newly-visible panel — but only after the next animation frame, so
+  //      the browser has performed its layout pass with the new .active
+  //      class applied.
+  //   2. A global ResizeObserver watches every .chart div and re-runs
+  //      Plotly.Plots.resize whenever the container's content-box size
+  //      changes (display:none → block, window resize, font load, etc.).
+  //      Idempotent and safe on un-rendered charts (guarded via
+  //      `_fullLayout`).
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
@@ -1799,8 +1821,10 @@
       const section = btn.dataset.section;
       const panel = document.getElementById(`panel-${section}`);
       panel.classList.add("active");
-      panel.querySelectorAll(".chart").forEach((div) => {
-        if (div._fullLayout) Plotly.Plots.resize(div);
+      requestAnimationFrame(() => {
+        panel.querySelectorAll(".chart").forEach((div) => {
+          if (div._fullLayout) Plotly.Plots.resize(div);
+        });
       });
       // Re-pin the engine window to whichever tab we just activated
       if (section === "afrr") {
@@ -1815,6 +1839,28 @@
       }
     });
   });
+
+  // Global ResizeObserver for all .chart elements. Triggers a Plotly resize
+  // whenever a chart's container changes size, which catches all the
+  // "rendered while hidden" cases the tab-click handler can't (e.g. the
+  // initial display:none → block transition that fires when the user
+  // first switches to the aFRR / compare tab).
+  if (typeof ResizeObserver !== "undefined") {
+    const chartResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const div = entry.target;
+        if (div._fullLayout) {
+          // rAF: let any in-flight layout settle before measuring again.
+          requestAnimationFrame(() => {
+            if (div.isConnected && div._fullLayout) Plotly.Plots.resize(div);
+          });
+        }
+      }
+    });
+    document.querySelectorAll(".chart").forEach((div) => {
+      chartResizeObserver.observe(div);
+    });
+  }
 
   // ---------- init -------------------------------------------------------
   renderCards();

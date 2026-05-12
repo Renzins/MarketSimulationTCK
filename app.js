@@ -234,11 +234,45 @@
       numStep: 1,
       decimals: 0,
       description:
-        "How many recent settled imbalance prices we average to estimate the next ISP's imbalance price. Small K (2–4) reacts fast but noisy; large K (12–24) stable but slow to detect regime changes.",
+        "How many recent settled mFRR clearing prices we average to estimate the next ISP's mFRR price. Small K (2–4) reacts fast but noisy; large K (12–24) stable but slow to detect regime changes.",
       extremes: [
         ["K = 2", "very reactive — picks up rapid regime changes but mean is noisy"],
         ["K = 4 (default)", "covers the last hour (4 × 15 min)"],
         ["K = 48", "very stable; 12 hours of history"],
+      ],
+    },
+    s3_lag: {
+      group: "oversell",
+      label: "Publication lag L",
+      unit: "ISPs",
+      min: 0,
+      max: 24,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Number of most-recent ISPs whose settlement we cannot yet observe at the time the intra-day bid is placed. The rolling stats use samples in [target − K − L, target − L). At 08:55 a trader bidding for the 09:30 ISP has visibility only through ~08:30 ⇒ L = 4. Not swept by the optimiser; set manually based on real publication latency.",
+      extremes: [
+        ["L = 0", "no lag — trader magically sees prices up to the target ISP (unrealistic)"],
+        ["L = 4 (default)", "≈ 1 h gap between latest visible settlement and target ISP"],
+        ["L = 24", "6 h delay; rolling stats become quite stale"],
+      ],
+    },
+    s3_da_skip: {
+      group: "oversell",
+      label: "Skip if DA sold ≥",
+      unit: "MW",
+      min: 0,
+      max: 59,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "S3 is skipped on ISPs where da_sold (after withholding + floor) is at or above this MW threshold. Prevents oversell-on-top-of-near-max-DA situations where the park has little physical headroom to honour an extra X_cap MW. Park capacity is 58.8 MW. Setting this to 0 disables S3 entirely; setting it to 59 effectively turns the gate off. Not optimised — set manually based on physical / risk considerations.",
+      extremes: [
+        ["skip = 0", "S3 fully disabled (gate always trips)"],
+        ["skip = 50 (default)", "S3 only runs when DA position leaves ≥ 9 MW headroom"],
+        ["skip = 59", "gate effectively off — S3 runs at any DA level"],
       ],
     },
     s3_S_min: {
@@ -251,7 +285,7 @@
       numStep: 1,
       decimals: 0,
       description:
-        "Trigger gate: only trade when (VWAP1H − rolling-mean imbalance) ≥ S_min. Below this, the expected profit per MW is too small to overcome friction and noise.",
+        "Trigger gate: only trade when (VWAP1H − rolling-mean mFRR) ≥ S_min. Below this, the expected profit per MW is too small to overcome friction and noise.",
       extremes: [
         ["S_min = 10", "loose — most ISPs trigger; lots of low-margin trades"],
         ["S_min = 25 (default)", "balanced filter"],
@@ -268,7 +302,7 @@
       numStep: 5,
       decimals: 0,
       description:
-        "Stand-aside gate: skip the trade if rolling std of recent imbalance prices exceeds σ_max. Captures the intuition that the rolling mean is meaningless when prices have been chaotic.",
+        "Stand-aside gate: skip the trade if rolling std of recent mFRR prices exceeds σ_max. Captures the intuition that the rolling mean is meaningless when prices have been chaotic.",
       extremes: [
         ["σ_max = 20", "very strict — only trade during very stable regimes"],
         ["σ_max = 75 (default)", "moderate filter"],
@@ -285,7 +319,7 @@
       numStep: 1,
       decimals: 0,
       description:
-        "Hard upper limit on the extra MW oversold in a single ISP. Strong signal → up to X_cap; weak signal → proportionally less (whole-MW floored). Setting X_cap = 0 disables the strategy entirely. Park capacity is 58.8 MW.",
+        "Hard upper limit on the extra MW oversold in a single ISP. Strong signal → up to X_cap; weak signal → proportionally less (whole-MW floored). Setting X_cap = 0 disables the strategy entirely. Park capacity is 58.8 MW. NOT optimised — the backtest has no price-impact term, so a sweep would always pick the grid maximum; the user must set this manually based on real intra-day liquidity. Default 5 MW.",
       extremes: [
         ["X_cap = 0", "S3 disabled — L3 reverts to L2 behaviour"],
         ["X_cap = 5 (default)", "modest position, safe in shallow markets"],
@@ -294,7 +328,7 @@
     },
     s3_M: {
       group: "oversell",
-      label: "Defensive bid margin M",
+      label: "Hedge bid margin M",
       unit: "EUR/MWh",
       min: -50,
       max: 100,
@@ -302,7 +336,7 @@
       numStep: 1,
       decimals: 0,
       description:
-        "Sets the defensive mFRR-dn bid_price = VWAP1H + M. The bid acts as a STOP-LOSS: it clears whenever p_mfrr ≤ bid_price. p_mfrr < 0 → grid pays us (windfall); 0 < p_mfrr ≤ bid_price → we pay up to bid_price per MWh (capped loss vs imbalance). Higher M → looser stop, fires almost always but accepts higher curtailment costs; lower (or negative) M → tighter stop, fires only when curtailment is cheap/free or we get paid.",
+        "Sets the hedge mFRR-dn bid_price = VWAP1H + M. This is a stop-loss mFRR-dn offer the wind park wouldn't normally place — pitched above the typical clearing — so when it clears it costs us, but it bounds the loss on the oversold MW vs imbalance settlement. Clears whenever p_mfrr ≤ bid_price. p_mfrr < 0 → grid pays us (windfall); 0 < p_mfrr ≤ bid_price → we pay up to bid_price per MWh. Higher M → looser stop, clears almost always but accepts higher curtailment costs; lower (or negative) M → tighter stop, clears only when curtailment is cheap/free or we get paid.",
       extremes: [
         ["M = −50", "tight stop — only accept curtailment when paid ≥ 50 below VWAP1H"],
         ["M = 0", "bid right at VWAP1H — fires when curtailment is breakeven or better"],
@@ -401,6 +435,8 @@
         "s_up",
         "s_dn",
         "s3_K",
+        "s3_lag",
+        "s3_da_skip",
         "s3_S_min",
         "s3_sigma_max",
         "s3_X_cap",
@@ -423,6 +459,8 @@
         w_afrr_neg_lo: 10,
         w_afrr_neg_hi: 90,
         s3_K: 4,
+        s3_lag: 4,
+        s3_da_skip: 50,
         s3_S_min: 25,
         s3_sigma_max: 75,
         s3_X_cap: 5,
@@ -451,9 +489,9 @@
       { key: "imb", label: "Imbalance cost", type: "eur-cost" },
       { key: "flat", label: "Flat penalty", type: "eur-cost" },
     ],
-    // L3 = L2 + S3 (intraday oversell + defensive mFRR-dn). The s3_extra_cost
+    // L3 = L2 + S3 (intraday oversell + hedge mFRR-dn bid). The s3_extra_cost
     // bundles the extra imbalance + flat penalty incurred specifically by
-    // the S3-induced shortfall (when the defensive bid doesn't fire).
+    // the S3-induced shortfall (when the hedge bid doesn't clear).
     3: [
       { key: "DA", label: "DA revenue", type: "eur" },
       { key: "mFRR_up", label: "mFRR-up rev", type: "eur" },
@@ -496,7 +534,7 @@
       { key: "shortMWh", label: "Total shortfall (MWh)", type: "mwh" },
       { key: "shortAvg", label: "Avg cost / short ISP", type: "eur" },
       { key: "s3Oversold", label: "ISPs with S3 oversell", type: "int", help: "ISPs where the S3 strategy passed all three gates (spread, sigma, ≥1 MW) and the wind park oversold on intraday." },
-      { key: "s3DefensiveFired", label: "S3 defensive fired", type: "int", help: "Of the S3-oversell ISPs, how many had p_mfrr ≤ −(VWAP1H+M) so the defensive bid cleared and the wind park was curtailed (windfall outcome)." },
+      { key: "s3HedgeFired", label: "S3 hedge fired", type: "int", help: "Of the S3-oversell ISPs, how many had p_mfrr ≤ VWAP1H + M so the hedge mFRR-dn bid cleared and the wind park was curtailed." },
     ],
   };
 
@@ -848,8 +886,8 @@
             ? fmtEUR((sim.breakdown.imb + sim.breakdown.flat) / sim.counts.short)
             : "0 €";
       else if (col.key === "s3Oversold") v = fmtInt(sim.counts.s3Oversold || 0);
-      else if (col.key === "s3DefensiveFired")
-        v = fmtInt(sim.counts.s3DefensiveFired || 0);
+      else if (col.key === "s3HedgeFired")
+        v = fmtInt(sim.counts.s3HedgeFired || 0);
       document.getElementById(`${prefix}-cnt-${col.key}`).textContent = v;
     }
 
@@ -1080,6 +1118,8 @@
                   sigma_max: p.s3_sigma_max,
                   X_cap: p.s3_X_cap,
                   M: p.s3_M,
+                  lag: p.s3_lag,
+                  da_skip: p.s3_da_skip,
                 }
               : null;
           for (let yi = 0; yi < ys.length; yi++) {
@@ -1118,9 +1158,13 @@
   }
 
   // =====================================================================
-  //  OVERSELL OPTIMISER (L3 only) — sweeps over (K, S_min, sigma_max, X_cap, M)
-  //  while holding market params fixed. Per Q7, this is a separate button
-  //  from the market optimiser so they can be tuned independently.
+  //  OVERSELL OPTIMISER (L3 only) — sweeps (K, S_min, sigma_max, M) while
+  //  holding market params + X_cap + lag fixed at their current values.
+  //  X_cap is NOT swept: the backtest model has no price-impact term, so
+  //  more volume is always net-positive on this dataset; sweeping it just
+  //  picks the grid boundary. The user sets X_cap manually based on real
+  //  liquidity constraints (default 5 MW). Per Q7, market + oversell each
+  //  have their own button so they're tuned independently.
   // =====================================================================
   function bindOptimiseOversell(level) {
     const btn = document.getElementById(`l${level}-optimise-oversell`);
@@ -1139,14 +1183,14 @@
         p.w_afrr_neg_lo,
         p.w_afrr_neg_hi,
       );
-      // Coarse grids — total ~10 k combos, ~15 s. Now covers wider ranges
-      // per user request (M down to -20 etc.); includes X_cap = 0 so the
-      // optimiser can pick "no S3" if that wins, and M = -50..30 so it can
-      // explore the windfall-only regime (tight stop) vs loose-stop regime.
+      // Coarse grids — total ~2 k combos, ~3 s. K covers minutes-to-half-day
+      // history; S_min and σ_max widely; M covers windfall-only (-50) up to
+      // loose-stop (30). X_cap is held at the user's current setting (see
+      // function header).
       const Ks = [2, 4, 6, 8, 12, 16, 24, 36];
       const Smins = [0, 10, 20, 40, 80, 120];
       const Sigmas = [50, 150, 300, 600, 1000];
-      const Xcaps = [0, 2, 5, 10, 20, 30];
+      const Xcaps = [p.s3_X_cap];
       const Ms = [-50, -20, -10, -5, 0, 5, 10, 20, 30];
       progEl.textContent = "computing…";
       setTimeout(() => {
@@ -1164,17 +1208,20 @@
             theta_flat: p.theta_flat,
             s_up: p.s_up,
             s_dn: p.s_dn,
+            lag: p.s3_lag,
+            da_skip: p.s3_da_skip,
           },
         );
         const ms = Math.round(performance.now() - t0);
         progEl.textContent =
           `done in ${ms} ms — best at K=${result.best.K}, S_min=${result.best.S_min},` +
-          ` σ_max=${result.best.sigma_max}, X_cap=${result.best.X_cap}, M=${result.best.M}` +
+          ` σ_max=${result.best.sigma_max}, M=${result.best.M}` +
+          ` (X_cap fixed @ ${result.best.X_cap})` +
           ` → ${fmtEUR(result.best.revenue)}`;
         setSliderValue(level, "s3_K", result.best.K);
         setSliderValue(level, "s3_S_min", result.best.S_min);
         setSliderValue(level, "s3_sigma_max", result.best.sigma_max);
-        setSliderValue(level, "s3_X_cap", result.best.X_cap);
+        // s3_X_cap intentionally not updated — held at user setting.
         setSliderValue(level, "s3_M", result.best.M);
         state[level].lastSweepOversell = result;
         updateLevel(level);
@@ -1285,6 +1332,8 @@
               sigma_max: p.s3_sigma_max,
               X_cap: p.s3_X_cap,
               M: p.s3_M,
+              lag: p.s3_lag,
+              da_skip: p.s3_da_skip,
             }
           : null;
       let grid, axisXs, axisYs, axisLabels, markX, markY;
@@ -1399,12 +1448,34 @@
       const level = parseInt(btn.dataset.level);
       const panel = document.getElementById(`panel-${level}`);
       panel.classList.add("active");
-      panel.querySelectorAll(".chart").forEach((div) => {
-        if (div._fullLayout) Plotly.Plots.resize(div);
+      // rAF: wait for the browser's layout pass on the now-visible panel so
+      // Plotly measures the final container size, not the display:none one.
+      requestAnimationFrame(() => {
+        panel.querySelectorAll(".chart").forEach((div) => {
+          if (div._fullLayout) Plotly.Plots.resize(div);
+        });
       });
       setTimeout(() => updateLevel(level), 30);
     });
   });
+
+  // Global ResizeObserver — keeps every chart in sync with its container
+  // across any size change (initial reveal, window resize, font load).
+  if (typeof ResizeObserver !== "undefined") {
+    const chartResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const div = entry.target;
+        if (div._fullLayout) {
+          requestAnimationFrame(() => {
+            if (div.isConnected && div._fullLayout) Plotly.Plots.resize(div);
+          });
+        }
+      }
+    });
+    document.querySelectorAll(".chart").forEach((div) => {
+      chartResizeObserver.observe(div);
+    });
+  }
 
   // =====================================================================
   //  INIT

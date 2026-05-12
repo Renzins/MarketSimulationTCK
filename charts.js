@@ -170,7 +170,7 @@ const Charts = (() => {
     const upAfrrDisp = new Array(N); // dispatched (avg) MW = offered × n_pos/225
     const dnAfrrDisp = new Array(N); // negative-signed for the bar
     // S3 (Level-3 speculation) bars: oversold MW (positive y, green hatched)
-    // and the defensive-bid curtailment volume (negative y, red hatched).
+    // and the hedge-bid curtailment volume (negative y, red hatched).
     // Both are 0 for L1/L2 and for L3 ISPs where S3 didn't trigger.
     const s3Intraday = new Array(N);
     const s3Curtail = new Array(N); // negative-signed
@@ -271,6 +271,9 @@ const Charts = (() => {
       const terms = [];
 
       // --- Forecast ---
+      // Q_pot (actual generation potential) lives in the Imbalance section
+      // for L2+ — it's the value the position equation gets compared to,
+      // so it belongs alongside the shortfall math, not the inputs block.
       const fcLines = [`DA forecast: ${ttMW(f_arr[k])}`];
       if (level >= 2) {
         const rev_diff = id_arr[k] - f_arr[k];
@@ -279,6 +282,9 @@ const Charts = (() => {
         fcLines.push(
           `ID forecast: ${ttMW(id_arr[k])} <span style="color:${TT_COL.dim}">(<span style="color:${diffCol}">${sign}${rev_diff.toFixed(1)}</span> MW)</span>`,
         );
+      } else {
+        // L1 doesn't have a separate Imbalance section, so Q_pot stays here
+        // (it's equal to DA forecast in L1's "perfect forecast" world anyway).
         fcLines.push(`Q_pot (actual): ${ttPot(pot[k])}`);
       }
       s += section("Forecast", fcLines);
@@ -386,38 +392,106 @@ const Charts = (() => {
           const pmfrr = pmfrr_arr[k];
           const curtRev = curtX * (-pmfrr) * 0.25;
           terms.push(curtRev);
-          // Defensive bid is a stop-loss: clears whenever p_mfrr ≤ bid_price.
+          // Hedge mFRR-dn bid clears at p_mfrr ≤ bid_price.
           // p_mfrr < 0 → grid pays the wind farm (windfall).
           // p_mfrr > 0 → wind farm pays (capped at bid_price · X).
           const label = pmfrr < 0
-            ? `▼ Defensive FIRED (windfall — grid paid us ${ttPrice(-pmfrr)})`
-            : `▼ Defensive FIRED (stop-loss — we paid ${ttPrice(pmfrr)})`;
+            ? `▼ Hedge CLEARED (windfall — grid paid us ${ttPrice(-pmfrr)})`
+            : `▼ Hedge CLEARED (stop-loss — we paid ${ttPrice(pmfrr)})`;
           s3Lines.push(
             `<span style="color:${TT_COL.negRev}">${label}</span>: ${ttMW(curtX)} curtailed @ p_mfrr ${ttPrice(pmfrr)}`,
           );
           s3Lines.push(`Curtailment rev: ${ttRev(curtRev)}`);
         } else {
+          // Hedge didn't clear. Position math + settlement is laid out
+          // in the Imbalance section below — no need to duplicate it here.
           s3Lines.push(
-            `<span style="color:${TT_COL.dim}">— Defensive bid not fired (settling at p_imb)</span>`,
+            `<span style="color:${TT_COL.dim}">— Hedge mFRR-dn bid did not clear</span>`,
           );
         }
         s += section("S3 oversell", s3Lines);
       }
 
-      // --- Imbalance (L2 only, only if shortfall) ---
-      if (level >= 2 && short[k] > 0.01) {
-        const imbCost = short[k] * pimb_arr[k] * 0.25;
-        const flatCost = short[k] * theta * 0.25;
-        // Imbalance and flat penalty enter the equation as NEGATIVE terms.
-        terms.push(-imbCost);
-        if (theta > 0) terms.push(-flatCost);
+      // --- Imbalance section (L2+, always shown) ---
+      // Lays out the full position math so the user can trace shortfall
+      // from first principles:
+      //   1. Itemised equation: DA + mFRR-up + aFRR-up + S3 oversell
+      //                         − mFRR-dn − aFRR-dn − hedge curtail
+      //                         = Q_pos
+      //   2. Q_pot for comparison
+      //   3. Shortfall = max(0, Q_pos − Q_pot)
+      //   4. If shortfall > 0: P_imb, imbalance cost, flat penalty
+      //
+      // Zero-value terms are skipped to keep the equation short. The
+      // engine's L2/S3 decomposition of imb/flat/s3_extra_cost still
+      // happens internally (and is visible in the per-level breakdown
+      // table); here we show the aggregate shortfall × (p_imb + θ) since
+      // the user has no reason to care which leg caused the MW.
+      if (level >= 2) {
+        const upMfrrMW2 = upMfrrActive[k];
+        const dnMfrrMW2 = -dnMfrrActive[k];
+        const upAfrrDispMW2 = upAfrrDisp[k];
+        const dnAfrrDispMW2 = -dnAfrrDisp[k];
+        const s3X = s3Intraday[k];
+        const curtMW = -s3Curtail[k];
+        const fmtPosMW = (v) =>
+          `<span style="color:${TT_COL.mw}">${v.toFixed(v % 1 ? 1 : 0)}</span>`;
+        const dimLabel = (s) =>
+          `<span style="color:${TT_COL.dim}">${s}</span>`;
+        const op = (sym) => ` <span style="color:${TT_COL.dim}">${sym}</span> `;
+        const parts = [];
+        if (da[k] > 0.5) parts.push({ pos: true, mw: da[k], lbl: "DA" });
+        if (upMfrrMW2 > 0.5) parts.push({ pos: true, mw: upMfrrMW2, lbl: "mFRR-up" });
+        if (upAfrrDispMW2 > 0.05) parts.push({ pos: true, mw: upAfrrDispMW2, lbl: "aFRR-up" });
+        if (s3X > 0.5) parts.push({ pos: true, mw: s3X, lbl: "S3 oversell" });
+        if (dnMfrrMW2 > 0.5) parts.push({ pos: false, mw: dnMfrrMW2, lbl: "mFRR-dn" });
+        if (dnAfrrDispMW2 > 0.05) parts.push({ pos: false, mw: dnAfrrDispMW2, lbl: "aFRR-dn" });
+        if (curtMW > 0.5) parts.push({ pos: false, mw: curtMW, lbl: "hedge curtail" });
+        const qPos =
+          da[k] + upMfrrMW2 + upAfrrDispMW2 + s3X - dnMfrrMW2 - dnAfrrDispMW2 - curtMW;
+        let eqHtml;
+        if (parts.length === 0) {
+          eqHtml = fmtPosMW(0);
+        } else {
+          eqHtml = parts
+            .map((t, i) => {
+              const prefix =
+                i === 0
+                  ? t.pos
+                    ? ""
+                    : `<span style="color:${TT_COL.dim}">−</span> `
+                  : op(t.pos ? "+" : "−");
+              return `${prefix}${fmtPosMW(t.mw)} ${dimLabel("(" + t.lbl + ")")}`;
+            })
+            .join("");
+        }
         const imbLines = [
-          `Shortfall: ${ttMW(short[k])}`,
-          `P_imb: ${ttPrice(pimb_arr[k])}`,
-          `Imbalance cost: ${ttRev(-imbCost)}`,
+          `${eqHtml}${op("=")}${ttMW(qPos)}`,
+          `Q_pot: <span style="color:${TT_COL.pot}">${fmtMW(pot[k])}</span>`,
         ];
-        if (theta > 0) {
-          imbLines.push(`Flat penalty (θ=${theta}): ${ttRev(-flatCost)}`);
+        if (short[k] > 0.01) {
+          imbLines.push(
+            `Shortfall: ${ttMW(qPos)}${op("−")}<span style="color:${TT_COL.pot}">${fmtMW(pot[k])}</span>${op("=")}${ttMW(short[k])}`,
+          );
+          if (!isNaN(pimb_arr[k])) {
+            const imbCost = short[k] * pimb_arr[k] * 0.25;
+            const flatCost = short[k] * theta * 0.25;
+            terms.push(-imbCost);
+            if (theta > 0) terms.push(-flatCost);
+            imbLines.push(`P_imb: ${ttPrice(pimb_arr[k])}`);
+            imbLines.push(`Imbalance cost: ${ttRev(-imbCost)}`);
+            if (theta > 0) {
+              imbLines.push(`Flat penalty (θ=${theta}): ${ttRev(-flatCost)}`);
+            }
+          } else {
+            imbLines.push(
+              `<span style="color:${TT_COL.dim}">P_imb missing this ISP — treated as 0 cost</span>`,
+            );
+          }
+        } else {
+          imbLines.push(
+            `<span style="color:${TT_COL.dim}">No shortfall (Q_pot ≥ position)</span>`,
+          );
         }
         s += section("Imbalance", imbLines);
       }
@@ -492,12 +566,12 @@ const Charts = (() => {
           marker: { color: "rgba(250,121,112,0.55)" },
           hoverinfo: "skip",
         },
-        // S3 defensive curtailment — same red family, diagonal hatching.
+        // S3 hedge-bid curtailment — same red family, diagonal hatching.
         {
           x: ts,
           y: s3Curtail,
           type: "bar",
-          name: "S3 defensive curtail (MW)",
+          name: "S3 hedge curtail (MW)",
           marker: {
             color: "rgba(248,81,73,0.85)",
             pattern: { shape: "/", size: 6, solidity: 0.45 },
@@ -586,13 +660,13 @@ const Charts = (() => {
           fillcolor: "rgba(250,121,112,0.18)",
           hoverinfo: "skip",
         },
-        // S3 defensive curtailment — distinct longdashdot pattern.
+        // S3 hedge-bid curtailment — distinct longdashdot pattern.
         {
           x: ts,
           y: s3Curtail,
           type: "scattergl",
           mode: "lines",
-          name: "S3 defensive curtail (MW)",
+          name: "S3 hedge curtail (MW)",
           line: { color: "#f85149", width: 1.2, dash: "longdashdot" },
           fill: "tozeroy",
           fillcolor: "rgba(248,81,73,0.30)",
@@ -629,6 +703,13 @@ const Charts = (() => {
       const lower = dnMfrrActive[k] + dnAfrrDisp[k] + s3Curtail[k]; // all negative
       if (lower < yMin) yMin = lower;
     }
+    // Hover trace: invisible markers (size 1, opacity 0) at every ISP.
+    // Combined with hovermode:"x unified" below, this is the trace that
+    // contributes the actual tooltip text — and "x unified" prevents
+    // Plotly from tie-breaking against same-x bars (hoverinfo:'skip')
+    // and accidentally consuming the hover (the symptom the user reported
+    // for ISP 18/09 15:15 where the mFRR-dn bar at y=0 was beating the
+    // marker-line in y-distance proximity).
     const hoverY = new Array(N).fill(yMax * 1.05 || 1);
     traces.push({
       x: ts,
@@ -658,12 +739,24 @@ const Charts = (() => {
       xaxis: {
         ...PLOTLY_LAYOUT_DEFAULTS.xaxis,
         type: "date",
-        // European date format on tick labels and on the unified hover guideline
+        // European date format on tick labels. With hovermode:"x unified",
+        // Plotly would otherwise prepend a LOCAL-TIME timestamp banner to
+        // every tooltip — our custom text already carries the UTC stamp,
+        // so blank out hoverformat to suppress the redundant Plotly title.
         tickformat: "%d/%m/%Y",
-        hoverformat: "%d/%m/%Y %H:%M",
+        hoverformat: " ",
         title: `UTC · ${N.toLocaleString()} ISPs (${dayCount.toFixed(1)} d)${useBars ? "" : " · zoom in for bar mode"}`,
       },
-      hovermode: "x",
+      // Bar mode: "x unified" forces a single merged label per x, which
+      // dodges the per-trace y-distance tie-break that was leaving some
+      // ISPs (e.g. 18/09 15:15, where mFRR-dn bar was y=0) without a
+      // tooltip. Only our hover-marker trace contributes a label (all
+      // bars are hoverinfo:'skip').
+      // ScatterGL (multi-day): "x unified" breaks WebGL hover entirely —
+      // the classic "x" mode + invisible markers works there because no
+      // bars are competing for the closest-trace pick.
+      hovermode: useBars ? "x unified" : "x",
+      hoverdistance: -1,
       hoverlabel: {
         bgcolor: "#0d1117",
         bordercolor: "#3a4350",
@@ -769,10 +862,23 @@ const Charts = (() => {
         },
       });
     }
+    // Vertical right-side legend so the tallest bars (e.g. Jan 2026 ≈ 2.5 M €
+    // when S3 fires + DA spike) never cross into legend space, regardless of
+    // chart width / trace count. Extra right-margin reserves room for it.
+    // automargin lets the axis titles claim more space if labels need it.
     const layout = Object.assign({}, PLOTLY_LAYOUT_DEFAULTS, {
       barmode: "relative",
-      yaxis: { ...PLOTLY_LAYOUT_DEFAULTS.yaxis, title: "EUR" },
-      xaxis: { ...PLOTLY_LAYOUT_DEFAULTS.xaxis, title: "Month" },
+      yaxis: { ...PLOTLY_LAYOUT_DEFAULTS.yaxis, title: "EUR", automargin: true },
+      xaxis: { ...PLOTLY_LAYOUT_DEFAULTS.xaxis, title: "Month", automargin: true },
+      margin: { t: 28, r: 170, b: 50, l: 60 },
+      legend: {
+        bgcolor: "rgba(0,0,0,0)",
+        orientation: "v",
+        x: 1.02,
+        xanchor: "left",
+        y: 1,
+        yanchor: "top",
+      },
     });
     Plotly.react(targetId, traces, layout, PLOTLY_CONFIG);
   }

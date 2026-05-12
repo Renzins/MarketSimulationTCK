@@ -1,7 +1,7 @@
 """
 tests.py — comprehensive audit / regression suite for the wind-park backtester.
 
-57 tests over 8 categories; aFRR / split tests are gated on the optional
+65 tests over 9 categories; aFRR / split tests are gated on the optional
 data files being present so the suite still passes on a stripped repo.
 
   A. DATA INTEGRITY (data.js vs CSV)
@@ -19,6 +19,10 @@ data files being present so the suite still passes on a stripped repo.
      - Window respect: simulate over a sub-window matches summing per-ISP rev
      - NaN p_imb: L2 imbalance cost is 0 in those rows; L1 unaffected
      - L1 / L2 frozen-value regressions (see E)
+     - L3: X_cap=0 ≡ L2 (load-bearing); rolling source is p_mfrr_raw not
+       p_imb_raw; lag L shifts the rolling window to [i-K-L, i-L); imb +
+       flat + s3_extra_cost decomp ≡ short·(p_imb+θ) when hedge bid misses;
+       NaN p_imb zeroes all 3 imbalance terms; L3 frozen default value.
 
   C. SPEC EXAMPLES (the two from the original brief)
      - Example 1: F=20, X=10, Y=0.5, ID=18, Z=0.5, P_mfrr=50, Q_pot=12, P_imb=200, θ=30 → −322.5 €
@@ -122,6 +126,11 @@ PRICE_TOL = 0.01  # 2 dp rounding in data.js
 # =============================================================================
 FROZEN_L1_DEFAULT_EUR = 13_257_221  # X=30, Y=1, winsor 10/90
 FROZEN_L2_DEFAULT_EUR = 13_367_642  # X=30, Y=1, Z=1, θ=30, winsor 10/90
+# L3 default (K=4, L=4, DA_skip=50, S_min=25, σ_max=75, X_cap=5, M=5;
+# rolling source p_mfrr_raw). Shifted vs pre-DA_skip value (€14,653,994)
+# by the small set of high-DA ISPs the gate now filters out (~−€6,800).
+# Re-baseline after any preprocess refresh.
+FROZEN_L3_DEFAULT_EUR = 14_647_167
 FROZEN_APRIL_ROW_COUNT = 30 * 96  # 30 days × 96 ISPs (assumes April fully covered)
 FROZEN_NULL_PIMB_RANGE = (2800, 3100)  # ~2911 in current dataset
 
@@ -410,6 +419,126 @@ def simulate_total(
     return rev.sum() * 0.25
 
 
+# ============================================================================
+#  L3 / S3 (speculative intraday oversell) Python mirror
+# ============================================================================
+def s3_rolling_stats(src: np.ndarray, K: int, L: int):
+    """Mirror engine.js's _getS3Rolling(K, L). Returns (mean, std) per ISP,
+    each of length n, NaN-padded at the start. Window for ISP i is
+    [i-K-L, i-L); sample std (ddof=1). NaN values in src are skipped.
+    A window with <2 valid values yields NaN."""
+    n = len(src)
+    mean = np.full(n, np.nan)
+    std = np.full(n, np.nan)
+    need = K + L
+    for i in range(n):
+        if i < need:
+            continue
+        win = src[i - K - L : i - L]
+        valid = win[~np.isnan(win)]
+        if len(valid) < 2:
+            continue
+        mean[i] = float(np.mean(valid))
+        std[i] = float(np.std(valid, ddof=1))
+    return mean, std
+
+
+def simulate_total_l3(
+    F, ID, P_da, P_mfrr_w, Q_pot, P_imb_w, vwap_1h, P_mfrr_raw,
+    X, Y, Z, theta,
+    s_up=1.0, s_dn=1.0,
+    avg_p_pos_w=None, avg_p_neg_w=None, n_pos_fav=None, n_neg_fav=None,
+    s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    s3_da_skip=50,
+):
+    """L3 vectorised total. Adds S3 on top of L2 math (same shape as engine
+    simulateTotal level=3). Rolling stats are from p_mfrr_raw (NOT p_imb_raw)
+    over window [i-K-L, i-L), matching post-migration engine.js."""
+    # Start from L2 components (re-use the L2 logic locally for clarity).
+    above_X = P_da >= X
+    da_sold = np.floor(np.where(above_X, F, F * (1 - Y)) + 1e-9).astype(np.float64)
+    Q_w = np.floor(np.where(above_X, 0, F - da_sold) + 1e-9)
+    trusted_raw = Z * (ID - F)
+    trusted_extra = np.where(trusted_raw > 0, np.floor(trusted_raw + 1e-9), 0)
+    Q_up_offer = Q_w + trusted_extra
+    Q_dn_offer = da_sold
+    s_up_c = max(0.0, min(1.0, float(s_up)))
+    s_dn_c = max(0.0, min(1.0, float(s_dn)))
+    Q_up_mfrr = np.round(s_up_c * Q_up_offer)
+    Q_up_afrr = Q_up_offer - Q_up_mfrr
+    Q_dn_mfrr = np.round(s_dn_c * Q_dn_offer)
+    Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
+    is_up = P_mfrr_w >= 1
+    is_dn = P_mfrr_w <= -1
+    up_mfrr_active = np.where(is_up, Q_up_mfrr, 0)
+    dn_mfrr_active = np.where(is_dn, Q_dn_mfrr, 0)
+    if avg_p_pos_w is None: avg_p_pos_w = np.zeros_like(F)
+    if avg_p_neg_w is None: avg_p_neg_w = np.zeros_like(F)
+    if n_pos_fav is None: n_pos_fav = np.zeros_like(F)
+    if n_neg_fav is None: n_neg_fav = np.zeros_like(F)
+    up_afrr_active = (avg_p_pos_w > 0) & (Q_up_afrr > 0)
+    dn_afrr_active = (avg_p_neg_w < 0) & (Q_dn_afrr > 0)
+    rev = (
+        da_sold * P_da
+        + up_mfrr_active * P_mfrr_w
+        - dn_mfrr_active * P_mfrr_w
+        + np.where(up_afrr_active, Q_up_afrr * avg_p_pos_w, 0)
+        - np.where(dn_afrr_active, Q_dn_afrr * avg_p_neg_w, 0)
+    )
+    a_frac_pos = n_pos_fav / 225.0
+    a_frac_neg = n_neg_fav / 225.0
+    up_afrr_disp = np.where(up_afrr_active, Q_up_afrr * a_frac_pos, 0)
+    dn_afrr_disp = np.where(dn_afrr_active, Q_dn_afrr * a_frac_neg, 0)
+    Q_pos_l2 = da_sold + up_mfrr_active + up_afrr_disp - dn_mfrr_active - dn_afrr_disp
+
+    # S3 — only when X_cap ≥ 1 AND K ≥ 1.
+    s3_X = np.zeros_like(F)
+    s3_fires = np.zeros_like(F, dtype=bool)
+    s3_intraday = np.zeros_like(F)
+    s3_curtail = np.zeros_like(F)
+    if int(s3_X_cap) >= 1 and int(s3_K) >= 1:
+        mean_arr, std_arr = s3_rolling_stats(P_mfrr_raw, int(s3_K), int(s3_L))
+        gate_vwap_ok = ~np.isnan(vwap_1h)
+        gate_roll_ok = ~np.isnan(mean_arr) & ~np.isnan(std_arr)
+        # Gate 0: skip S3 if da_sold ≥ s3_da_skip
+        gate_da = da_sold < int(s3_da_skip)
+        spread = vwap_1h - mean_arr
+        gate_spread = spread >= s3_S_min
+        gate_sigma = std_arr <= s3_sigma_max
+        # sig = (spread - S_min) / S_min, clipped to ≤ 1; with S_min=0 the
+        # division is infinity, np handles that and the clip → 1.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sig = np.where(s3_S_min == 0, np.inf, (spread - s3_S_min) / max(s3_S_min, 1e-30))
+        x_prop = np.floor(s3_X_cap * np.minimum(1.0, sig) + 1e-9)
+        gates = gate_da & gate_vwap_ok & gate_roll_ok & gate_spread & gate_sigma & (x_prop >= 1)
+        bid_price = vwap_1h + s3_M
+        s3_X = np.where(gates, x_prop, 0)
+        s3_fires = gates & (P_mfrr_w <= bid_price)
+        s3_intraday = np.where(gates, x_prop * vwap_1h, 0)
+        s3_curtail = np.where(s3_fires, x_prop * (-P_mfrr_w), 0)
+        rev += s3_intraday + s3_curtail
+    Q_pos = Q_pos_l2 + np.where(s3_fires, 0, s3_X)
+    short_l2 = np.maximum(0, Q_pos_l2 - Q_pot)
+    short = np.maximum(0, Q_pos - Q_pot)
+    s3_extra_short = short - short_l2
+    valid_imb = ~np.isnan(P_imb_w)
+    imb = np.where(valid_imb, short_l2 * P_imb_w, 0)
+    flat = np.where(valid_imb, short_l2 * theta, 0)
+    s3_extra_cost = np.where(valid_imb, s3_extra_short * (P_imb_w + theta), 0)
+    rev -= imb + flat + s3_extra_cost
+    return {
+        "total": rev.sum() * 0.25,
+        "short_l2": short_l2,
+        "short": short,
+        "s3_extra_short": s3_extra_short,
+        "s3_X": s3_X,
+        "s3_fires": s3_fires,
+        "imb": imb,
+        "flat": flat,
+        "s3_extra_cost": s3_extra_cost,
+    }
+
+
 # =============================================================================
 #  Globals shared across tests
 # =============================================================================
@@ -676,6 +805,194 @@ def test_l2_default_value():
     print(f"\n        L2 (X=30, Y=1, Z=1, θ=30) = {val:,.0f} €")
     assert abs(val - FROZEN_L2_DEFAULT_EUR) < 200, (
         f"L2 default = {val:,.0f} but FROZEN value is {FROZEN_L2_DEFAULT_EUR:,}"
+    )
+
+
+# ============================================================================
+#  L3 / S3 regression tests (added 2026-05-12 along with the lag + p_mfrr
+#  rolling-source migration). The Python mirror (simulate_total_l3) is held
+#  to the same algorithm as engine.js so the JS engine has an independent
+#  oracle; these tests verify the math and the load-bearing invariants.
+# ============================================================================
+def _l3_inputs():
+    F = np.asarray(DATA["da_forecast"], dtype=np.float64)
+    ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
+    P_da = np.asarray(DATA["p_da"], dtype=np.float64)
+    p_mfrr_raw = np.array(DATA["p_mfrr"], dtype=np.float64)
+    p_mfrr = winsorize(p_mfrr_raw.copy(), 10, 90)
+    p_imb_raw = np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64)
+    p_imb = winsorize(p_imb_raw, 10, 90)
+    Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
+    vwap_1h = np.array([np.nan if v is None else v for v in DATA.get("vwap_1h", [None]*len(F))], dtype=np.float64)
+    return F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw
+
+
+def test_l3_default_value():
+    """L3 at default (K=4, L=4, S_min=25, σ_max=75, X_cap=5, M=5) reproduces
+    FROZEN_L3_DEFAULT_EUR. Verifies the post-migration combo of
+    p_mfrr-rolling + lag-aware window."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )
+    val = r["total"]
+    print(f"\n        L3 default = {val:,.0f} €")
+    assert abs(val - FROZEN_L3_DEFAULT_EUR) < 200, (
+        f"L3 default = {val:,.0f} but FROZEN value is {FROZEN_L3_DEFAULT_EUR:,}"
+    )
+
+
+def test_l3_xcap0_equals_l2():
+    """LOAD-BEARING invariant: L3 with X_cap=0 must equal L2 exactly. S3 is
+    short-circuited entirely; no S3 revenue, no S3 extra cost. If this
+    breaks, S3's enable-gate is leaking somewhere."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30, s3_X_cap=0,
+    )
+    l2 = simulate_total(2, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=1, theta=30)
+    assert abs(r["total"] - l2) < 1.0, (
+        f"L3@X_cap=0 = {r['total']:,.2f} but L2 = {l2:,.2f} (diff={r['total']-l2:.2f})"
+    )
+
+
+def test_l3_da_skip0_equals_l2():
+    """LOAD-BEARING invariant (mirror of X_cap=0): L3 with DA_skip=0 must
+    equal L2 exactly. The G0 gate (`da_sold < DA_skip`) always trips when
+    DA_skip = 0 (since da_sold ≥ 0 always), so S3 never runs."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+        s3_da_skip=0,
+    )
+    l2 = simulate_total(2, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=1, theta=30)
+    assert abs(r["total"] - l2) < 1.0, (
+        f"L3@DA_skip=0 = {r['total']:,.2f} but L2 = {l2:,.2f} (diff={r['total']-l2:.2f})"
+    )
+
+
+def test_l3_da_skip_gate_affects_only_high_da_isps():
+    """Sanity: DA_skip=50 vs DA_skip=59 must differ (some high-DA ISPs get
+    blocked under 50). And both must equal an "S3 on every ISP" version
+    where the gate never trips, except for the high-DA ISPs that DA_skip=50
+    skipped. Confirms the gate behaves like a per-ISP filter, not a global
+    on/off."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    common = dict(
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )
+    r_50 = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        s3_da_skip=50, **common,
+    )
+    r_59 = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        s3_da_skip=59, **common,
+    )
+    diff = abs(r_50["total"] - r_59["total"])
+    print(f"\n        DA_skip=50 ⇒ {r_50['total']:,.0f} €,  DA_skip=59 ⇒ {r_59['total']:,.0f} €,  |Δ| = {diff:,.0f}")
+    # On the current dataset some ISPs have da_sold ≥ 50 with S3 active,
+    # so the two MUST differ. (If they coincided, the gate isn't wired.)
+    assert diff > 100, f"DA_skip 50 vs 59 must differ; diff = {diff:.2f}"
+
+
+def test_s3_rolling_source_is_pmfrr_not_pimb():
+    """Switching the rolling source between p_mfrr_raw and p_imb_raw must
+    produce different revenue (regression against accidentally reverting to
+    the pre-migration p_imb-based gate)."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    p_imb_raw = np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64)
+    correct = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )["total"]
+    legacy = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_imb_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )["total"]
+    diff = abs(correct - legacy)
+    print(f"\n        L3 with p_mfrr_raw = {correct:,.0f} €, with p_imb_raw = {legacy:,.0f} €")
+    assert diff > 10_000, (
+        f"Switching rolling source must change L3 by >10k €; diff={diff:,.0f}"
+    )
+
+
+def test_s3_lag_window_shifts_results():
+    """Lag L=0 (legacy) vs L=4 (new default) must produce different revenue.
+    With L=4 the rolling stats look at samples [i-K-L, i-L), so two
+    otherwise-identical runs at L=0 vs L=4 should differ on a meaningful
+    fraction of ISPs."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    no_lag = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=0, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )["total"]
+    with_lag = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )["total"]
+    diff = abs(no_lag - with_lag)
+    print(f"\n        L=0 ⇒ {no_lag:,.0f} €, L=4 ⇒ {with_lag:,.0f} €, |Δ| = {diff:,.0f} €")
+    assert diff > 10_000, f"Lag must change L3 by >10k €; diff={diff:,.0f}"
+
+
+def test_s3_imbalance_decomposition_equals_naive_short_cost():
+    """When the hedge mFRR-dn bid does NOT clear, the SUM of L2 imbalance
+    + L2 flat + S3 extra-cost on a per-ISP basis must equal the naïve
+    short × (p_imb + θ) (for ISPs with valid p_imb and S3 active). This
+    proves the decomp split is mathematically equivalent to a single-line
+    settlement — i.e. there's no double-counting or omission."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    # Use the bad-but-triggering params from the audit so S3 fires often
+    # with the hedge bid mostly missing.
+    theta = 50.0
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=200, Y=0.7, Z=1, theta=theta,
+        s3_K=4, s3_L=4, s3_S_min=0, s3_sigma_max=1000, s3_X_cap=30, s3_M=-50,
+    )
+    # Only check ISPs where p_imb is valid, S3 oversold, and hedge missed.
+    valid = ~np.isnan(p_imb) & (r["s3_X"] > 0) & (~r["s3_fires"]) & (r["short"] > 0)
+    n_samples = int(valid.sum())
+    assert n_samples > 100, f"Need many sample ISPs; got {n_samples}"
+    decomp_sum = r["imb"][valid] + r["flat"][valid] + r["s3_extra_cost"][valid]
+    naive = r["short"][valid] * (p_imb[valid] + theta)
+    diff = np.abs(decomp_sum - naive)
+    max_abs = float(diff.max())
+    print(f"\n        n={n_samples} ISPs; max decomp-vs-naive Δ = {max_abs:.4f} €")
+    # Allow small float-rounding tolerance (winsorized float32 → float64 path).
+    assert max_abs < 1e-6, (
+        f"Decomp split disagrees with naive short×(p_imb+θ) by {max_abs:.6f} €"
+    )
+
+
+def test_s3_nan_pimb_zeroes_all_imbalance_terms():
+    """For ISPs with NaN p_imb (April 2026), both the L2 imbalance and the
+    S3-extra cost must be ZERO regardless of whether S3 fires. Otherwise
+    NaN would poison the total."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=200, Y=0.7, Z=1, theta=50,
+        s3_K=4, s3_L=4, s3_S_min=0, s3_sigma_max=1000, s3_X_cap=30, s3_M=-50,
+    )
+    nan_rows = np.isnan(p_imb)
+    n_nan = int(nan_rows.sum())
+    assert n_nan > 100, f"Expected many NaN p_imb rows; got {n_nan}"
+    assert np.all(r["imb"][nan_rows] == 0), "imb must be 0 where p_imb is NaN"
+    assert np.all(r["flat"][nan_rows] == 0), "flat must be 0 where p_imb is NaN"
+    assert np.all(r["s3_extra_cost"][nan_rows] == 0), (
+        "s3_extra_cost must be 0 where p_imb is NaN"
     )
 
 
@@ -1564,6 +1881,14 @@ R.add("mFRR up & dn never both fire", test_mfrr_up_dn_mutually_exclusive)
 R.add("L1 naive is computable", test_naive_l1_known_value)
 R.add("L1 default (X=30, Y=1) = 13,257,221 €", test_l1_optimum_value)
 R.add("L2 default (X=30, Y=1, Z=1, θ=30) = 13,367,642 €", test_l2_default_value)
+R.add("L3 default (K=4, L=4, S_min=25, σ_max=75, X_cap=5, M=5)", test_l3_default_value)
+R.add("L3 with X_cap=0 ≡ L2 (LOAD-BEARING invariant)", test_l3_xcap0_equals_l2)
+R.add("L3 with DA_skip=0 ≡ L2 (G0 gate trips on every ISP)", test_l3_da_skip0_equals_l2)
+R.add("S3 DA_skip gate filters per-ISP (50 vs 59 must differ)", test_l3_da_skip_gate_affects_only_high_da_isps)
+R.add("S3 rolling source must be p_mfrr (not p_imb)", test_s3_rolling_source_is_pmfrr_not_pimb)
+R.add("S3 lag L: [i-K-L, i-L) window respected", test_s3_lag_window_shifts_results)
+R.add("S3 decomp: imb+flat+s3_extra == short·(p_imb+θ)", test_s3_imbalance_decomposition_equals_naive_short_cost)
+R.add("S3 with NaN p_imb → imb/flat/s3_extra all 0", test_s3_nan_pimb_zeroes_all_imbalance_terms)
 R.add("Window-vectorised total == per-ISP sum", test_window_consistency)
 R.add("April ISPs: NaN p_imb → 0 imb cost in L2", test_april_in_l1_not_in_l2_imbalance)
 

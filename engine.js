@@ -314,31 +314,51 @@ const Engine = (() => {
   let cachedAfrrNegBounds = { lo: 0, hi: 0 };
 
   // ---------- S3 (Level-3 speculative intraday oversell) rolling stats ----
-  // Computed from raw p_imb across the FULL dataset (not the sim window) —
-  // the rolling window looks back K ISPs from each H, which can cross the
-  // window boundary. Independent of winStart/winEnd, so cached forever.
-  // Keyed by K. NaN-aware: a window with <2 valid (non-NaN) values yields
-  // NaN mean/std at that ISP (the S3 evaluator treats that as "skip ISP").
-  // Sample std (ddof=1) per Q6.
+  // Computed from raw p_mfrr across the FULL dataset (not the sim window) —
+  // the rolling window looks back K ISPs from each H (excluding the L most
+  // recent), which can cross the sim-window boundary. Independent of
+  // winStart/winEnd, so cached forever. Keyed by (K, L). NaN-aware: a window
+  // with <2 valid (non-NaN) values yields NaN mean/std at that ISP (the S3
+  // evaluator treats that as "skip ISP"). Sample std (ddof=1) per Q6.
+  //
+  // SOURCE: D.p_mfrr_raw (the past settled mFRR clearing price). Earlier
+  // builds used D.p_imb_raw — that was the imbalance price the wind park
+  // would have paid IF it had been short, not the price it would actually
+  // observe to time an intra-day oversell. Switching to p_mfrr reflects the
+  // actual signal a real trader has available. Raw (not winsorized) because
+  // a live trader sees actual settlement, not capped values.
+  //
+  // LAG L: rolling window is [i-K-L, i-L) — i.e. the K samples ending L ISPs
+  // before the target ISP. Models real-world publication latency: at 08:55
+  // the trader bidding for 09:30 has visibility only through ~08:30 (the
+  // last fully-settled ISP). Default L = 4 (one hour of "dark" period
+  // immediately before the target). L = 0 reproduces the no-lag legacy
+  // behaviour.
   const _s3RollingCache = new Map();
-  function _getS3Rolling(K) {
+  function _getS3Rolling(K, L) {
     if (!D || K < 1) return null;
-    const key = K | 0;
+    const Ki = K | 0;
+    const Lraw = L | 0;
+    const Li = Lraw < 0 ? 0 : Lraw;
+    const key = `${Ki}_${Li}`;
     const hit = _s3RollingCache.get(key);
     if (hit) return hit;
     const n = D.n;
     const mean = new Float32Array(n);
     const std = new Float32Array(n);
-    const src = D.p_imb_raw;
+    const src = D.p_mfrr_raw;
+    const need = Ki + Li;
     for (let i = 0; i < n; i++) {
-      if (i < key) {
+      if (i < need) {
         mean[i] = NaN;
         std[i] = NaN;
         continue;
       }
+      const winLo = i - Ki - Li;
+      const winHi = i - Li; // exclusive
       let sum = 0;
       let cnt = 0;
-      for (let j = i - key; j < i; j++) {
+      for (let j = winLo; j < winHi; j++) {
         const v = src[j];
         if (!isNaN(v)) {
           sum += v;
@@ -352,7 +372,7 @@ const Engine = (() => {
       }
       const m = sum / cnt;
       let sq = 0;
-      for (let j = i - key; j < i; j++) {
+      for (let j = winLo; j < winHi; j++) {
         const v = src[j];
         if (!isNaN(v)) sq += (v - m) * (v - m);
       }
@@ -486,7 +506,15 @@ const Engine = (() => {
     const s3S_min = +params.s3_S_min || 0;
     const s3Sigma_max = +params.s3_sigma_max || 0;
     const s3M = +params.s3_M || 0;
-    const s3Roll = s3Enabled ? _getS3Rolling(s3K) : null;
+    // L = number of most-recent ISPs the trader cannot yet see (publication
+    // latency). Default 4 (~1 h). Independent of K and not optimised.
+    const s3L = params.s3_lag == null ? 4 : (params.s3_lag | 0);
+    // DA-sold skip threshold: when da_sold >= s3DaSkip we don't even attempt
+    // S3 for that ISP. Prevents oversell-on-top-of-near-max-DA cases where
+    // physical headroom is already exhausted. Default 50 MW (park cap is
+    // 58.8 MW). Setting this to 0 disables S3 entirely. Not optimised.
+    const s3DaSkip = params.s3_da_skip == null ? 50 : (params.s3_da_skip | 0);
+    const s3Roll = s3Enabled ? _getS3Rolling(s3K, s3L) : null;
 
     const wLen = Math.max(0, winEnd - winStart);
     const Q_da_sold = new Float32Array(wLen);
@@ -499,8 +527,8 @@ const Engine = (() => {
     const Q_up_afrr_disp = new Float32Array(wLen);
     const Q_dn_afrr_disp = new Float32Array(wLen);
     // S3 per-ISP volumes (positive ints in MW). Q_s3_intraday is the oversold
-    // amount; Q_s3_curtail is the same amount when the defensive bid fires
-    // (else 0). Charts show these as hatched green/red bars.
+    // amount; Q_s3_curtail is the same amount when the hedge mFRR-dn bid
+    // clears (else 0). Charts show these as hatched green/red bars.
     const Q_s3_intraday = new Float32Array(wLen);
     const Q_s3_curtail = new Float32Array(wLen);
     const Q_short = new Float32Array(wLen);
@@ -522,7 +550,7 @@ const Engine = (() => {
       nUpAfrr = 0,
       nDnAfrr = 0,
       nS3Oversold = 0,
-      nS3DefensiveFired = 0;
+      nS3HedgeFired = 0;
     let totalShortMWh = 0;
     let nNegRevWarn = 0;
     // L2 math also applies to L3 (which adds "speculation" on top).
@@ -590,35 +618,41 @@ const Engine = (() => {
       // ----- S3 (Level-3 speculative intraday oversell) ---------------
       // Evaluate the strategy's 3 gates (spread, sigma, ≥1 MW after floor).
       // If all pass, add X_prop MW to position (intraday oversell) and submit
-      // a defensive mFRR-dn bid at vwap+M. Defensive fires iff p_mfrr ≤ -bid.
-      // When defensive fires, the curtailment offsets the oversell exactly
-      // (s3_delta_pos = 0). When it doesn't, position increases by X_prop
-      // and the extra shortfall is settled at p_imb (+ theta_flat).
-      // Uses WINSORIZED p_mfrr (D.p_mfrr) so the user's winsor settings
-      // affect S3 the same way they affect existing mFRR revenue.
+      // a HEDGE mFRR-dn bid at vwap+M. The hedge bid clears iff
+      // p_mfrr ≤ bid_price. When it clears, the curtailment offsets the
+      // oversell exactly (s3_delta_pos = 0). When it doesn't clear, position
+      // increases by X_prop and the extra shortfall is settled at p_imb
+      // (+ theta_flat). Uses WINSORIZED p_mfrr (D.p_mfrr) so the user's
+      // winsor settings affect S3 the same way they affect mFRR revenue.
       let s3_X = 0;
       let s3_fires = false;
       let s3_intraday = 0;
       let s3_curtail = 0;
-      if (s3Enabled) {
+      // Gate 0: skip S3 if DA is already at/above the user's threshold —
+      // the park has little physical headroom to honour an extra X_cap MW.
+      if (s3Enabled && da_sold < s3DaSkip) {
         const P_ID_est = D.vwap_1h[i];
         if (!isNaN(P_ID_est)) {
-          const P_imb_est = s3Roll.mean[i];
-          const P_imb_sigma = s3Roll.std[i];
-          if (!isNaN(P_imb_est) && !isNaN(P_imb_sigma)) {
-            const spread = P_ID_est - P_imb_est;
-            if (spread >= s3S_min && P_imb_sigma <= s3Sigma_max) {
+          // P_mfrr_est / P_mfrr_sigma: rolling mean and std of past raw
+          // p_mfrr, lagged by s3L (see _getS3Rolling above).
+          const P_mfrr_est = s3Roll.mean[i];
+          const P_mfrr_sigma = s3Roll.std[i];
+          if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
+            const spread = P_ID_est - P_mfrr_est;
+            if (spread >= s3S_min && P_mfrr_sigma <= s3Sigma_max) {
               const sig = (spread - s3S_min) / s3S_min;
               const X_raw = s3X_cap * (sig < 1 ? sig : 1);
               const X_prop = Math.floor(X_raw + 1e-9);
               if (X_prop >= 1) {
                 const bid_price = P_ID_est + s3M;
-                // Defensive bid is a "stop-loss" mFRR-dn order:
-                // wind farm accepts being curtailed at any marginal price
+                // The hedge bid is a "stop-loss" mFRR-dn offer that we
+                // wouldn't normally place — at a price above the typical
+                // mFRR-dn clearing — so it costs us when it clears, but
+                // bounds the loss on the oversold MW vs imbalance.
+                // Wind farm accepts being curtailed at any marginal price
                 // ≤ bid_price. Negative P_mfrr → grid pays the wind farm
                 // (windfall); positive P_mfrr ≤ bid_price → wind farm
                 // pays the grid, but cost is capped at bid_price · X.
-                // This caps the worst-case loss vs imbalance settlement.
                 s3_fires = P_mfrr <= bid_price;
                 s3_X = X_prop;
                 s3_intraday = X_prop * P_ID_est;
@@ -694,7 +728,7 @@ const Engine = (() => {
       if (dnAfrrActive) nDnAfrr++;
       if (s3_X > 0) {
         nS3Oversold++;
-        if (s3_fires) nS3DefensiveFired++;
+        if (s3_fires) nS3HedgeFired++;
       }
       if (short > 1e-6) {
         nShort++;
@@ -748,7 +782,7 @@ const Engine = (() => {
         short: nShort,
         negRev: nNegRevWarn,
         s3Oversold: nS3Oversold,
-        s3DefensiveFired: nS3DefensiveFired,
+        s3HedgeFired: nS3HedgeFired,
       },
       totalShortMWh,
     };
@@ -770,7 +804,15 @@ const Engine = (() => {
     const s3Sigma_max = s3Enabled ? +s3.sigma_max : 0;
     const s3X_cap = s3Enabled ? (s3.X_cap | 0) : 0;
     const s3M = s3Enabled ? +s3.M : 0;
-    const s3Roll = s3Enabled ? _getS3Rolling(s3K) : null;
+    // Lag (default 4) — see simulate(). Not optimised; passed from caller.
+    const s3L = s3Enabled
+      ? (s3.lag == null ? 4 : (s3.lag | 0))
+      : 0;
+    // DA-sold skip threshold — see simulate(). Default 50, not optimised.
+    const s3DaSkip = s3Enabled
+      ? (s3.da_skip == null ? 50 : (s3.da_skip | 0))
+      : 0;
+    const s3Roll = s3Enabled ? _getS3Rolling(s3K, s3L) : null;
     const s3MeanArr = s3Roll ? s3Roll.mean : null;
     const s3StdArr = s3Roll ? s3Roll.std : null;
     const vwap_arr = D.vwap_1h;
@@ -821,27 +863,28 @@ const Engine = (() => {
           da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
         // ----- S3 (Level-3 speculative intraday oversell) -----
         // Same logic as simulate(); inlined for hot-path performance.
-        if (s3Enabled) {
+        // Gate 0 (da_sold < s3DaSkip): see simulate() comment.
+        if (s3Enabled && da_sold < s3DaSkip) {
           const P_ID_est = vwap_arr[i];
           if (!isNaN(P_ID_est)) {
-            const P_imb_est = s3MeanArr[i];
-            const P_imb_sigma = s3StdArr[i];
-            if (!isNaN(P_imb_est) && !isNaN(P_imb_sigma)) {
-              const spread = P_ID_est - P_imb_est;
-              if (spread >= s3S_min && P_imb_sigma <= s3Sigma_max) {
+            const P_mfrr_est = s3MeanArr[i];
+            const P_mfrr_sigma = s3StdArr[i];
+            if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
+              const spread = P_ID_est - P_mfrr_est;
+              if (spread >= s3S_min && P_mfrr_sigma <= s3Sigma_max) {
                 const sig = (spread - s3S_min) / s3S_min;
                 const X_raw = s3X_cap * (sig < 1 ? sig : 1);
                 const X_prop = (X_raw + 1e-9) | 0; // floor
                 if (X_prop >= 1) {
                   const bid_price = P_ID_est + s3M;
                   rev += X_prop * P_ID_est;
-                  // Defensive bid is a stop-loss for mFRR-dn: clears
-                  // whenever the marginal price isn't above our ceiling.
+                  // Hedge mFRR-dn bid is a stop-loss: clears whenever
+                  // the marginal price isn't above our ceiling.
                   // Curtailment revenue −P_mfrr can be positive (paid)
                   // or negative (we paid up to bid_price per MWh).
                   if (P_mfrr <= bid_price) {
                     rev += X_prop * (-P_mfrr);
-                    // defensive fires offsets the oversell — no position increase
+                    // hedge clears → curtailment offsets oversell, no position increase
                   } else {
                     Q_pos += X_prop; // shortfall increases by X_prop
                   }
@@ -989,6 +1032,11 @@ const Engine = (() => {
     const theta = fixedMarket.theta_flat;
     const sUp = fixedMarket.s_up == null ? 1 : fixedMarket.s_up;
     const sDn = fixedMarket.s_dn == null ? 1 : fixedMarket.s_dn;
+    // Lag is fixed across the sweep — not an optimised dimension. Default
+    // matches simulate() / simulateTotal().
+    const lag = fixedMarket.lag == null ? 4 : (fixedMarket.lag | 0);
+    // DA-sold skip threshold: also fixed across the sweep (not optimised).
+    const da_skip = fixedMarket.da_skip == null ? 50 : (fixedMarket.da_skip | 0);
     let bestRev = -Infinity,
       bestK = Ks[0],
       bestSmin = S_mins[0],
@@ -1009,6 +1057,8 @@ const Engine = (() => {
                 sigma_max: sigma_maxs[gi],
                 X_cap: X_caps[xi],
                 M: Ms[mi],
+                lag,
+                da_skip,
               });
               if (r > bestRev) {
                 bestRev = r;
@@ -1073,7 +1123,9 @@ const Engine = (() => {
     const s3S_min = +params.s3_S_min || 0;
     const s3Sigma_max = +params.s3_sigma_max || 0;
     const s3M = +params.s3_M || 0;
-    const s3Roll = s3Enabled ? _getS3Rolling(s3K) : null;
+    const s3L = params.s3_lag == null ? 4 : (params.s3_lag | 0);
+    const s3DaSkip = params.s3_da_skip == null ? 50 : (params.s3_da_skip | 0);
+    const s3Roll = s3Enabled ? _getS3Rolling(s3K, s3L) : null;
     for (let i = winStart; i < winEnd; i++) {
       const ts = new Date(start.getTime() + D.offsets[i] * D.step_min * 60000);
       const key = `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`;
@@ -1120,19 +1172,19 @@ const Engine = (() => {
         // S3 contribution per ISP — mirrors simulate() logic.
         let s3_X = 0;
         let s3_fires = false;
-        if (s3Enabled) {
+        if (s3Enabled && da_sold < s3DaSkip) {
           const P_ID_est = D.vwap_1h[i];
           if (!isNaN(P_ID_est)) {
-            const P_imb_est = s3Roll.mean[i];
-            const P_imb_sigma = s3Roll.std[i];
-            if (!isNaN(P_imb_est) && !isNaN(P_imb_sigma)) {
-              const spread = P_ID_est - P_imb_est;
-              if (spread >= s3S_min && P_imb_sigma <= s3Sigma_max) {
+            const P_mfrr_est = s3Roll.mean[i];
+            const P_mfrr_sigma = s3Roll.std[i];
+            if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
+              const spread = P_ID_est - P_mfrr_est;
+              if (spread >= s3S_min && P_mfrr_sigma <= s3Sigma_max) {
                 const sig = (spread - s3S_min) / s3S_min;
                 const X_prop = Math.floor(s3X_cap * (sig < 1 ? sig : 1) + 1e-9);
                 if (X_prop >= 1) {
                   const bid_price = P_ID_est + s3M;
-                  // Stop-loss activation: P_mfrr ≤ bid_price (see simulate()).
+                  // Hedge mFRR-dn bid clears at P_mfrr ≤ bid_price (see simulate()).
                   s3_fires = P_mfrr <= bid_price;
                   s3_X = X_prop;
                   S3Intraday_rev = X_prop * P_ID_est * 0.25;

@@ -10,7 +10,7 @@ The tool is split into two halves, navigable from a top navbar:
 
 | Page              | What it does                                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------------- |
-| **Backtester**    | Strategy P&L over a configurable simulation window. **Levels 1 / 2 / 3.** Trades against DA + mFRR + aFRR (configurable per-direction split). L3 adds an intra-day oversell + defensive-mFRR-dn speculative leg (S3). |
+| **Backtester**    | Strategy P&L over a configurable simulation window. **Levels 1 / 2 / 3.** Trades against DA + mFRR + aFRR (configurable per-direction split). L3 adds an intra-day oversell + hedge-mFRR-dn speculative leg (S3). |
 | **Graphs**        | Box plots and heatmaps of mFRR / aFRR spread (mFRR + aFRR sub-tabs), plus a **mFRR vs aFRR** sub-tab for joint analysis (per-4-s slot-level direction matrix, sign-agreement bars, spread scatter, stats scoreboard). |
 
 ## Repository layout
@@ -297,39 +297,52 @@ the legacy mFRR-only math and the frozen regression values still hold.
 
 L3 sits on top of L2 (same DA / mFRR / aFRR / imbalance math) and adds
 **a per-ISP speculative leg**: when our rolling forecast of the next
-ISP's imbalance price is sufficiently below `VWAP1H`, we oversell up to
-`X_cap` extra MW on intra-day AND submit a defensive mFRR-dn bid at
-`VWAP1H + M`. The defensive bid is a **stop-loss**: it caps our worst-
-case cost on the oversold volume at `bid_price · X` per MWh (vs being
-exposed to potentially much higher imbalance settlement).
+ISP's mFRR clearing price is sufficiently below `VWAP1H`, we oversell
+up to `X_cap` extra MW on intra-day AND submit a **hedge mFRR-dn bid**
+at `VWAP1H + M`. The hedge bid is a stop-loss mFRR-dn offer the wind
+park wouldn't normally place — pitched above the typical clearing — so
+when it clears it costs us, but it caps the worst-case loss on the
+oversold volume at `bid_price · X` per MWh (vs being exposed to
+potentially much higher imbalance settlement).
+
+The rolling stats are taken over **`p_mfrr[H − K − L : H − L]`** (raw,
+unwinsorized). The lag `L` (default 4 ISPs ≈ 1 hour) models the
+real-world publication latency: at 08:55 a trader bidding for the
+09:30 ISP can only see settlement prices through ~08:30. Setting `L = 0`
+reproduces the legacy no-lag behaviour. `L` is a manually-set
+parameter, **not optimised**. Earlier builds used `p_imb` rather than
+`p_mfrr` — `p_imb` is the price the wind park *would have paid if
+short*, not the actual signal a real trader uses to time an intra-day
+oversell; switching to `p_mfrr` aligns the gate with what's observable.
 
 ### Algorithm (per ISP H)
 
 ```
-INPUTS:  VWAP1H[H], p_imb[H-K : H-1]  (winsorized)
-PARAMS:  K, S_min, sigma_max, X_cap, M
+INPUTS:  VWAP1H[H], p_mfrr[H-K-L : H-L]  (raw, NaN-aware)
+PARAMS:  K, L, DA_skip, S_min, sigma_max, X_cap, M
 GATES:
-  G1: spread  = VWAP1H[H] − mean(p_imb[H-K:H-1]) >= S_min
-  G2: sigma   = std(p_imb[H-K:H-1])              <= sigma_max
+  G0: da_sold[H] < DA_skip                            (else skip S3 entirely)
+  G1: spread  = VWAP1H[H] − mean(p_mfrr[H-K-L : H-L]) >= S_min
+  G2: sigma   = std(p_mfrr[H-K-L : H-L])              <= sigma_max
   G3: X_prop  = floor(X_cap · min(1, (spread - S_min) / S_min)) >= 1
-  G4: VWAP1H[H], rolling stats not NaN
+  G4: VWAP1H[H], rolling stats not NaN (need H ≥ K + L)
 IF ALL GATES PASS:
   bid_price        = VWAP1H[H] + M
   intraday_rev     = X_prop · VWAP1H[H]                    (always)
-  defensive_fires  = p_mfrr[H] <= bid_price                (NB sign!)
-  IF defensive_fires:
+  hedge_clears     = p_mfrr[H] <= bid_price                (NB sign!)
+  IF hedge_clears:
     curtail_rev    = X_prop · (−p_mfrr[H])                 (signed)
     Q_position    += 0   (curtailment offsets oversell)
   ELSE:
     Q_position    += X_prop                                (shortfall grows)
 ```
 
-### Sign convention for the defensive bid
+### Sign convention for the hedge bid
 
 `p_mfrr` is **unified across directions** (Latvia single clearing).
-A defensive mFRR-dn bid at `bid_price` clears whenever the marginal
-price is no more than our ceiling — i.e. `p_mfrr ≤ bid_price`. This is
-the stop-loss framing:
+A hedge mFRR-dn bid at `bid_price` clears whenever the marginal price
+is no more than our ceiling — i.e. `p_mfrr ≤ bid_price`. This is the
+stop-loss framing:
 
 - `p_mfrr ≪ 0` (very negative): grid pays us `|p_mfrr|` per MWh
   curtailed — **windfall**.
@@ -341,13 +354,15 @@ the stop-loss framing:
 
 ### S3 parameters (defaults)
 
-| Param      | Default | Range slider     | Notes                                                                      |
-| ---------- | ------- | ---------------- | -------------------------------------------------------------------------- |
-| `K`        | 4       | 2 – 48 ISPs      | Rolling lookback window for the imbalance-price forecast (1 hour default). |
-| `S_min`    | 25      | 0 – 200 EUR/MWh  | Trigger gate. Below this, expected spread too small to bother.             |
-| `sigma_max`| 75      | 0 – 1000 EUR/MWh | Stand-aside gate. Above this, rolling mean is too noisy to trust.          |
-| `X_cap`    | 5       | 0 – 58 MW        | Hard upper limit. **Setting X_cap = 0 disables S3** (L3 reverts to L2).    |
-| `M`        | 5       | −50 – 100 EUR/MWh| Stop-loss margin above VWAP1H. Negative M = tighter stop (windfall-only).  |
+| Param        | Default | Range slider     | Notes                                                                      |
+| ------------ | ------- | ---------------- | -------------------------------------------------------------------------- |
+| `K`          | 4       | 2 – 48 ISPs      | Rolling lookback window for the mFRR-price forecast (1 hour default).      |
+| `L` (lag)    | 4       | 0 – 24 ISPs      | Publication lag — skip the L most-recent ISPs (unobservable at bid time). **Not optimised.** |
+| `DA_skip`    | 50      | 0 – 59 MW        | S3 is skipped on ISPs where `da_sold ≥ DA_skip`. Prevents oversell when the park is already near max DA commitment. **Setting to 0 disables S3 entirely; setting to ≥ 59 turns the gate off. Not optimised.** |
+| `S_min`      | 25      | 0 – 200 EUR/MWh  | Trigger gate. Below this, expected spread too small to bother.             |
+| `sigma_max`  | 75      | 0 – 1000 EUR/MWh | Stand-aside gate. Above this, rolling mean is too noisy to trust.          |
+| `X_cap`      | 5       | 0 – 58 MW        | Hard upper limit. **Setting X_cap = 0 disables S3** (L3 reverts to L2).    |
+| `M`          | 5       | −50 – 100 EUR/MWh| Stop-loss margin above VWAP1H. Negative M = tighter stop (windfall-only).  |
 
 ### Dual optimisers
 
@@ -356,22 +371,35 @@ and S3 speculation levers are tuned independently):
 
 - **Optimise market** — sweeps X / Y / Z / s_up / s_dn while holding
   S3 params fixed at their current values.
-- **Optimise oversell** — sweeps K / S_min / σ_max / X_cap / M while
-  holding market params fixed. Grid runs in ~15 s.
+- **Optimise oversell** — sweeps K / S_min / σ_max / M while holding
+  market params, lag L, **X_cap**, and **DA_skip** fixed. Grid runs in
+  ~3 s. X_cap is intentionally excluded because the backtest has no
+  price-impact term, so any sweep would always select the grid maximum
+  (see "Known quirks" below); X_cap must be set by hand from real-world
+  liquidity considerations. DA_skip is also a physical / risk gate, not
+  an optimisation lever.
 
 ### Frozen regression values
 
 - L1 default (`X=30, Y=1, s_up=s_dn=1`)                = **13,257,221 €**
 - L2 default (`X=30, Y=1, Z=1, θ=30, s_up=s_dn=1`)     = **13,367,642 €**
 - L3 with **`s3_X_cap=0`** (S3 disabled)                = 13,367,642 € (= L2 ✓)
-- L3 default (`K=4, S_min=25, σ_max=75, X_cap=5, M=5`) = **14,419,800 €** (+1.05 M vs L2)
+- L3 with **`s3_da_skip=0`** (S3 fully gated off)       = 13,367,642 € (= L2 ✓)
+- L3 default (`K=4, L=4, DA_skip=50, S_min=25, σ_max=75, X_cap=5, M=5`)
+  = **14,647,167 €**. The DA_skip = 50 gate keeps S3 from firing on
+  ISPs where the park has already committed ≥ 50 MW to DA. On the
+  current dataset that's a small fraction of high-wind hours — the
+  gate trims about €6,800 vs the no-gate run (€14,653,994). Re-
+  baseline after any preprocess refresh.
 
 ### ⚠ Backtest caveat — S3 scales infinitely because price impact isn't modelled
 
-A real, documented finding: when you click **Optimise oversell** with
-the default grid, the optimum lands at multiple boundaries: `S_min = 0`,
-`σ_max = grid-max`, `X_cap = grid-max`. The interior dimensions
-(`K ≈ 4`, `M ≈ 5`) are genuine optima; the others are *not*.
+A real, documented finding: with `X_cap` left in the sweep, the
+optimum would have landed on the grid maximum every time — selling more
+is always net-positive on this dataset. We responded by **pinning
+`X_cap` out of the sweep entirely** (see "Dual optimisers" above);
+`S_min` and `σ_max` still sometimes settle on the grid edge. The
+interior dimensions (`K ≈ 4`, `M ≈ 5`) are genuine optima.
 
 **Why the boundary-optimum is real but unactionable**:
 
@@ -900,35 +928,83 @@ These are non-obvious behaviours by design — read before "fixing".
     offered + dispatched + dispatch-fraction-of-ISP per direction.
     L3 adds two more bars per direction with `marker.pattern.shape =
     "/"` diagonal hatching: **S3 ID oversell** (green hatched, positive
-    y) and **S3 defensive curtail** (red hatched, negative y, only
-    when the defensive bid fires). The tooltip's `ISP P&L` line is
-    rendered as a colour-coded equation breakdown (e.g.
-    `<span style="color:green">150</span> + 30 − 24 = +156 €`) so
-    the user can read which components contributed.
+    y) and **S3 hedge curtail** (red hatched, negative y, only when the
+    hedge mFRR-dn bid clears). The tooltip's `ISP P&L` line is rendered
+    as a colour-coded equation breakdown (e.g.
+    `<span style="color:green">150</span> + 30 − 24 = +156 €`) so the
+    user can read which components contributed.
 
-17. **S3 defensive bid is a stop-loss, NOT a windfall trigger.** The
-    activation condition is `p_mfrr ≤ bid_price` (where
-    `bid_price = VWAP1H + M`, typically a positive number). This
-    means the bid clears whenever the mFRR-dn marginal price isn't
-    above our ceiling — which includes both the windfall case
-    (`p_mfrr < 0`, grid pays us) AND the bounded-loss case
-    (`0 < p_mfrr ≤ bid_price`, we pay up to `bid_price` per MWh).
-    The earlier draft of S3 had the activation condition flipped
-    (`p_mfrr ≤ −bid_price`) which only fired in the windfall sub-case;
-    that bug is fixed and the verification trail lives in the slot-
-    level comparison's co-fire numbers (defensive fires ~89% of S3
-    oversells at defaults, vs ~6% under the wrong sign).
+17. **S3 hedge mFRR-dn bid is a stop-loss, NOT a windfall trigger.**
+    The hedge is an mFRR-dn offer the wind park wouldn't normally place
+    — pitched above the typical clearing — so it costs the park when it
+    clears, but bounds the loss on the oversold MW. The activation
+    condition is `p_mfrr ≤ bid_price` (where `bid_price = VWAP1H + M`,
+    typically a positive number). This means the bid clears whenever
+    the mFRR-dn marginal price isn't above our ceiling — which includes
+    both the windfall case (`p_mfrr < 0`, grid pays us) AND the
+    bounded-loss case (`0 < p_mfrr ≤ bid_price`, we pay up to
+    `bid_price` per MWh). The earlier draft of S3 had the activation
+    condition flipped (`p_mfrr ≤ −bid_price`) which only fired in the
+    windfall sub-case; that bug is fixed and the verification trail
+    lives in the slot-level comparison's co-fire numbers (hedge clears
+    ~89% of S3 oversells at defaults, vs ~6% under the wrong sign).
 
-18. **S3 optimiser hits grid boundaries — that's a feature of the
-    backtest model, not a bug.** When `Optimise oversell` is clicked,
-    the result consistently picks `S_min = grid-min`, `σ_max = grid-max`,
-    `X_cap = grid-max`. This is because the backtest has **no
-    price-impact term** — selling more is always net-positive on this
-    dataset's frozen liquidity assumption. The interior dimensions
-    (`K ≈ 4`, `M ≈ 5`) ARE genuine optima. Live trading must add
-    a separate price-impact / liquidity model to set sensible
-    `X_cap` and tighten `S_min`. The formula still correctly identifies
-    *when* to oversell; only the *size* is unconstrained.
+17b. **S3 imbalance settlement is decomposed but mathematically equivalent
+     to one line.** When the hedge bid doesn't clear and the wind park
+     ends short, the engine splits the cost between three rows:
+     `imb = short_l2 × p_imb`, `flat = short_l2 × θ`,
+     `s3_extra_cost = (short − short_l2) × (p_imb + θ)`. By construction
+     this sums to `short × (p_imb + θ)` — i.e. exactly the naïve
+     "total short at the imbalance settlement price" cost, no double-
+     counting, no omission. The decomposition exists so the L3 stats
+     panel can attribute cost to L2 vs S3 separately, not because the
+     economics differ. Two consequences worth knowing:
+     - When `p_imb` is NEGATIVE (system pays the park to be short),
+       `s3_extra_cost` goes negative → S3 oversell becomes a windfall,
+       because the wind park profits from the shortfall it created.
+     - When `p_imb` is NaN (April-2026 rows), all three terms are
+       zeroed in lockstep — S3 looks artificially profitable in those
+       windows. The L2 NaN-handling caveat (Known quirks #14) extends
+       to S3.
+     Both behaviours are tested in `tests.py`
+     (`test_s3_imbalance_decomposition_equals_naive_short_cost`,
+     `test_s3_nan_pimb_zeroes_all_imbalance_terms`).
+
+17c. **`S_min = 0` makes the proportional-sizing formula degenerate.**
+     The S3 sizing rule is
+     `X_prop = floor(X_cap · min(1, (spread − S_min) / S_min))`.
+     When `S_min = 0`, the inner division is `spread / 0 = ±∞`; with a
+     positive spread `(spread − S_min) / S_min = +∞ → min(1, ∞) = 1`, so
+     `X_prop = X_cap` whenever the spread is positive (gates G2/G4 still
+     apply). This is a *feature*, not a bug — it means "no minimum
+     spread; just always go full size" — but it makes `S_min` a step
+     function around 0. Avoid `S_min = 0` in serious analysis; use
+     `S_min ≥ 1` if you want a smooth size response.
+
+17d. **S3 can sell at negative `VWAP1H` if `mean(past p_mfrr)` is more
+     negative.** The spread gate uses `spread = VWAP1H − mean(past
+     p_mfrr) ≥ S_min`. In ISPs where the recent mFRR settled deeply
+     negative (e.g. −100 €/MWh during a series of mFRR-dn clearings),
+     even a slightly negative `VWAP1H` (say −5 €/MWh) yields a positive
+     spread of +95, so S3 fires. The strategy then SELLS at `VWAP1H` =
+     −5 €/MWh — i.e. pays the intra-day market €5/MWh to take the
+     power. Whether this is a real opportunity or a data artefact
+     depends on the use case; the audit found such ISPs in the dataset
+     (e.g. ISP 10349, 2025-05-24 11:15). If a live strategy should
+     refuse to sell at negative prices, add a gate `bid_price > 0` or
+     `VWAP1H > 0` outside the engine.
+
+18. **S3 optimiser doesn't sweep `X_cap`.** When `Optimise oversell`
+    is clicked, the sweep covers (K, S_min, σ_max, M) only and pins
+    `X_cap` at the user's current slider value. This is because the
+    backtest has **no price-impact term** — selling more is always
+    net-positive on this dataset's frozen liquidity assumption, so
+    sweeping `X_cap` would just pick the grid max every time. The
+    interior dimensions (`K ≈ 4`, `M ≈ 5`) are still genuine optima
+    in the live sweep; `S_min` and `σ_max` may still hit boundaries
+    occasionally. Live trading must set `X_cap` from a real
+    price-impact / liquidity model. The formula correctly identifies
+    *when* to oversell; only the *size* needs an outside input.
 
 19. **mFRR vs aFRR comparison is slot-level by default.** When the
     user opens the "mFRR vs aFRR" Graphs sub-tab, `graphs-app.js`
