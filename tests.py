@@ -124,13 +124,12 @@ PRICE_TOL = 0.01  # 2 dp rounding in data.js
 #  visually verified the Backtester pages still look reasonable, copy the
 #  new totals from the L1/L2 stat panels here.
 # =============================================================================
-FROZEN_L1_DEFAULT_EUR = 13_257_221  # X=30, Y=1, winsor 10/90
-FROZEN_L2_DEFAULT_EUR = 13_367_642  # X=30, Y=1, Z=1, θ=30, winsor 10/90
+FROZEN_L1_DEFAULT_EUR = 13_760_612  # X=30, Y=1, winsor 5/95
+FROZEN_L2_DEFAULT_EUR = 13_932_199  # X=30, Y=1, Z=1, θ=30, winsor 5/95
 # L3 default (K=4, L=4, DA_skip=50, S_min=25, σ_max=75, X_cap=5, M=5;
-# rolling source p_mfrr_raw). Shifted vs pre-DA_skip value (€14,653,994)
-# by the small set of high-DA ISPs the gate now filters out (~−€6,800).
-# Re-baseline after any preprocess refresh.
-FROZEN_L3_DEFAULT_EUR = 14_647_167
+# rolling source p_mfrr_raw; winsor 5/95). Re-baseline after any preprocess
+# refresh or any change to the UI default winsor.
+FROZEN_L3_DEFAULT_EUR = 15_185_134
 FROZEN_APRIL_ROW_COUNT = 30 * 96  # 30 days × 96 ISPs (assumes April fully covered)
 FROZEN_NULL_PIMB_RANGE = (2800, 3100)  # ~2911 in current dataset
 
@@ -763,8 +762,8 @@ def test_naive_l1_known_value():
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
-    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
-    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 5, 95)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
     naive = simulate_total(1, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=0, Y=0, Z=0)
     print(f"\n        L1 naive = {naive:,.0f} €")
@@ -780,8 +779,8 @@ def test_l1_optimum_value():
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
-    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
-    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 5, 95)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
     val = simulate_total(1, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=0)
     print(f"\n        L1 (X=30, Y=1) = {val:,.0f} €")
@@ -798,8 +797,8 @@ def test_l2_default_value():
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
-    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
-    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 5, 95)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
     val = simulate_total(2, F, ID, P_da, p_mfrr, Q_pot, p_imb, X=30, Y=1, Z=1, theta=30)
     print(f"\n        L2 (X=30, Y=1, Z=1, θ=30) = {val:,.0f} €")
@@ -819,9 +818,9 @@ def _l3_inputs():
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
     p_mfrr_raw = np.array(DATA["p_mfrr"], dtype=np.float64)
-    p_mfrr = winsorize(p_mfrr_raw.copy(), 10, 90)
+    p_mfrr = winsorize(p_mfrr_raw.copy(), 5, 95)
     p_imb_raw = np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64)
-    p_imb = winsorize(p_imb_raw, 10, 90)
+    p_imb = winsorize(p_imb_raw, 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
     vwap_1h = np.array([np.nan if v is None else v for v in DATA.get("vwap_1h", [None]*len(F))], dtype=np.float64)
     return F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw
@@ -1001,8 +1000,8 @@ def test_window_consistency():
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
-    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
-    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 5, 95)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
 
     # Pick a 30-day window in mid-summer
@@ -1769,12 +1768,12 @@ def test_l1_default_value_with_default_s_unchanged():
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
-    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
-    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 5, 95)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
     if HAS_AFRR_15MIN:
-        avg_pos = winsorize(np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64), 10, 90)
-        avg_neg = winsorize(np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64), 10, 90)
+        avg_pos = winsorize(np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64), 5, 95)
+        avg_neg = winsorize(np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64), 5, 95)
         # Favourable-only counts from data-afrr-15min.js (mirrors
         # engine.js's preference). Falls back to AFRR's all-non-NaN
         # counts if the new arrays aren't present.
@@ -1817,11 +1816,11 @@ def test_l1_s0_produces_meaningful_afrr_revenue():
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
-    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 10, 90)
-    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 10, 90)
+    p_mfrr = winsorize(np.array(DATA["p_mfrr"], dtype=np.float64), 5, 95)
+    p_imb = winsorize(np.array([np.nan if v is None else v for v in DATA["p_imb"]], dtype=np.float64), 5, 95)
     Q_pot = np.asarray(DATA["q_pot"], dtype=np.float64)
-    avg_pos = winsorize(np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64), 10, 90)
-    avg_neg = winsorize(np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64), 10, 90)
+    avg_pos = winsorize(np.asarray(AFRR_15MIN["avg_p_pos"], dtype=np.float64), 5, 95)
+    avg_neg = winsorize(np.asarray(AFRR_15MIN["avg_p_neg"], dtype=np.float64), 5, 95)
     # Favourable-only counts from data-afrr-15min.js.
     if "n_pos_fav" in AFRR_15MIN:
         n_pos_fav = np.asarray(AFRR_15MIN["n_pos_fav"], dtype=np.float64)

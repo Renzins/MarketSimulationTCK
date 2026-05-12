@@ -14,9 +14,6 @@
 //   drawHistogram(targetId, perISPRev)
 //     Per-ISP revenue distribution (log-Y, ~80 bins).
 //
-//   drawHeatmap(targetId, grid, xs, ys, axisLabels, markX, markY, onClick)
-//     Optimisation-surface heatmap (Plotly heatmap + click handler).
-//
 // TOOLTIP DESIGN
 // ==============
 // All four visible traces have hoverinfo:'skip'. A 5th invisible scatter at
@@ -902,75 +899,10 @@ const Charts = (() => {
     Plotly.react(targetId, traces, layout, PLOTLY_CONFIG);
   }
 
-  // ------------ HEATMAP -------------------------------------------------
-  // grid: 2D array [xi][yi] of revenue values
-  // xs, ys: axis tick values
-  // axisLabels: { x: 'X (EUR/MWh)', y: 'Y (withhold)' }
-  // markX, markY: current parameter location to highlight
-  // onClick: optional callback (x, y) => void
-  function drawHeatmap(targetId, grid, xs, ys, axisLabels, markX, markY, onClick) {
-    // Plotly heatmap expects z[y][x] if x and y are swapped — let's transpose
-    // so grid[xi][yi] becomes z[yi][xi]
-    const z = [];
-    for (let yi = 0; yi < ys.length; yi++) {
-      const row = [];
-      for (let xi = 0; xi < xs.length; xi++) row.push(grid[xi][yi]);
-      z.push(row);
-    }
-    const traces = [
-      {
-        z,
-        x: xs,
-        y: ys,
-        type: "heatmap",
-        colorscale: "Viridis",
-        hovertemplate:
-          axisLabels.x +
-          ": %{x}<br>" +
-          axisLabels.y +
-          ": %{y}<br>Revenue: %{z:,.0f} €<extra></extra>",
-        colorbar: { title: { text: "EUR", side: "right" } },
-      },
-    ];
-    if (markX !== null && markY !== null) {
-      traces.push({
-        x: [markX],
-        y: [markY],
-        mode: "markers",
-        type: "scatter",
-        marker: {
-          symbol: "x",
-          size: 16,
-          color: "#ffd166",
-          line: { color: "#000", width: 1.5 },
-        },
-        name: "Current",
-        showlegend: false,
-        hoverinfo: "skip",
-      });
-    }
-    const layout = Object.assign({}, PLOTLY_LAYOUT_DEFAULTS, {
-      xaxis: { ...PLOTLY_LAYOUT_DEFAULTS.xaxis, title: axisLabels.x },
-      yaxis: { ...PLOTLY_LAYOUT_DEFAULTS.yaxis, title: axisLabels.y },
-    });
-    Plotly.react(targetId, traces, layout, PLOTLY_CONFIG).then(() => {
-      const el = document.getElementById(targetId);
-      if (onClick) {
-        el.removeAllListeners && el.removeAllListeners("plotly_click");
-        el.on("plotly_click", (e) => {
-          if (!e.points || !e.points.length) return;
-          const p = e.points[0];
-          if (p.curveNumber === 0) onClick(p.x, p.y);
-        });
-      }
-    });
-  }
-
   return {
     drawTimeSeries,
     drawMonthly,
     drawHistogram,
-    drawHeatmap,
     fmtEUR,
     fmtMW,
     fmtPrice,

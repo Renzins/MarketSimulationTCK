@@ -66,8 +66,8 @@
       label: "Winsorize mFRR price (percentiles)",
       unit: "%",
       isWinsor: true,
-      defaultLo: 10,
-      defaultHi: 90,
+      defaultLo: 5,
+      defaultHi: 95,
       description:
         "Caps extreme mFRR clearing prices at the chosen percentiles within the simulation window. The 2025 data has a few −10 000 / +10 000 EUR/MWh outliers that would otherwise dominate.",
       extremes: [
@@ -80,8 +80,8 @@
       label: "Winsorize imbalance price (percentiles)",
       unit: "%",
       isWinsor: true,
-      defaultLo: 10,
-      defaultHi: 90,
+      defaultLo: 5,
+      defaultHi: 95,
       description:
         "Same idea as mFRR winsorization, applied to the Latvian imbalance price within the window.",
       extremes: [
@@ -94,8 +94,8 @@
       label: "Winsorize aFRR upward (avg) price (percentiles)",
       unit: "%",
       isWinsor: true,
-      defaultLo: 10,
-      defaultHi: 90,
+      defaultLo: 5,
+      defaultHi: 95,
       description:
         "Caps the per-ISP averaged aFRR upward price (sum of AST_POS, NaN→0, ÷225) at the chosen percentiles. Only matters when s < 1 (any volume offered to aFRR).",
       extremes: [
@@ -108,8 +108,8 @@
       label: "Winsorize aFRR downward (avg) price (percentiles)",
       unit: "%",
       isWinsor: true,
-      defaultLo: 10,
-      defaultHi: 90,
+      defaultLo: 5,
+      defaultHi: 95,
       description:
         "Same idea on the aFRR downward (AST_NEG) average. Downward prices can be very negative — winsorization is especially relevant here.",
       extremes: [
@@ -119,6 +119,7 @@
     },
     X: {
       group: "market",
+      section: "da-withhold",
       label: "DA price threshold X",
       unit: "EUR/MWh",
       min: -100,
@@ -135,6 +136,7 @@
     },
     Y: {
       group: "market",
+      section: "da-withhold",
       label: "Withhold fraction Y",
       unit: "0–1",
       min: 0,
@@ -151,6 +153,7 @@
     },
     Z: {
       group: "market",
+      section: "id-trust",
       label: "ID trust coefficient Z",
       unit: "0–1",
       min: 0,
@@ -190,6 +193,7 @@
     },
     s_up: {
       group: "market",
+      section: "split",
       label: "mFRR ↔ aFRR split — UPWARD (s_up)",
       unit: "0–1",
       min: 0,
@@ -207,6 +211,7 @@
     },
     s_dn: {
       group: "market",
+      section: "split",
       label: "mFRR ↔ aFRR split — DOWNWARD (s_dn)",
       unit: "0–1",
       min: 0,
@@ -372,14 +377,14 @@
         Y: 1.0,
         s_up: 1.0,
         s_dn: 1.0,
-        w_mfrr_lo: 10,
-        w_mfrr_hi: 90,
-        w_imb_lo: 10,
-        w_imb_hi: 90,
-        w_afrr_pos_lo: 10,
-        w_afrr_pos_hi: 90,
-        w_afrr_neg_lo: 10,
-        w_afrr_neg_hi: 90,
+        w_mfrr_lo: 5,
+        w_mfrr_hi: 95,
+        w_imb_lo: 5,
+        w_imb_hi: 95,
+        w_afrr_pos_lo: 5,
+        w_afrr_pos_hi: 95,
+        w_afrr_neg_lo: 5,
+        w_afrr_neg_hi: 95,
       },
       imbalanceDisabled: true,
       hasImbalance: false,
@@ -406,14 +411,14 @@
         theta_flat: 30,
         s_up: 1.0,
         s_dn: 1.0,
-        w_mfrr_lo: 10,
-        w_mfrr_hi: 90,
-        w_imb_lo: 10,
-        w_imb_hi: 90,
-        w_afrr_pos_lo: 10,
-        w_afrr_pos_hi: 90,
-        w_afrr_neg_lo: 10,
-        w_afrr_neg_hi: 90,
+        w_mfrr_lo: 5,
+        w_mfrr_hi: 95,
+        w_imb_lo: 5,
+        w_imb_hi: 95,
+        w_afrr_pos_lo: 5,
+        w_afrr_pos_hi: 95,
+        w_afrr_neg_lo: 5,
+        w_afrr_neg_hi: 95,
       },
       imbalanceDisabled: false,
       hasImbalance: true,
@@ -450,14 +455,14 @@
         theta_flat: 30,
         s_up: 1.0,
         s_dn: 1.0,
-        w_mfrr_lo: 10,
-        w_mfrr_hi: 90,
-        w_imb_lo: 10,
-        w_imb_hi: 90,
-        w_afrr_pos_lo: 10,
-        w_afrr_pos_hi: 90,
-        w_afrr_neg_lo: 10,
-        w_afrr_neg_hi: 90,
+        w_mfrr_lo: 5,
+        w_mfrr_hi: 95,
+        w_imb_lo: 5,
+        w_imb_hi: 95,
+        w_afrr_pos_lo: 5,
+        w_afrr_pos_hi: 95,
+        w_afrr_neg_lo: 5,
+        w_afrr_neg_hi: 95,
         s3_K: 4,
         s3_lag: 4,
         s3_da_skip: 50,
@@ -469,6 +474,30 @@
       imbalanceDisabled: false,
       hasImbalance: true,
     },
+  };
+
+  // Market-parameter sub-sections. Each strategy gets its own visually
+  // separated .param-group, ordered per level. Setup is rendered ONCE
+  // above the tabs (shared across levels); oversell is L3-only and lives
+  // in its own group, separate from these.
+  const SECTION_LABELS = {
+    "da-withhold": "DA withhold on low prices",
+    split: "mFRR ↔ aFRR universal offer split",
+    "id-trust": "ID trust coefficient",
+  };
+  const SECTION_DESCRIPTIONS = {
+    "da-withhold":
+      "When DA clears at or below price threshold X, hold back fraction Y of the forecast from DA and offer it to balancing instead. Above X, sell the full forecast to DA as usual.",
+    split:
+      "Per-direction routing of balancing volume between mFRR and aFRR. Independent ratios for upward (s_up) and downward (s_dn) because the two markets price each direction differently.",
+    "id-trust":
+      "How much of the intraday forecast revision (ID − DA) to act on as additional mFRR-up volume. Negative revisions are not acted on (no buy-back modelled).",
+  };
+  // Display order of the per-strategy sub-sections per level.
+  const SECTION_ORDER = {
+    1: ["da-withhold", "split"],
+    2: ["da-withhold", "split", "id-trust"],
+    3: ["da-withhold", "split", "id-trust"],
   };
 
   // Decomposition table column definitions (per level).
@@ -543,7 +572,7 @@
   // =====================================================================
   const D = Engine.init(WIND_DATA);
   console.log(`Loaded ${D.n} ISPs`);
-  Engine.maybeWinsorize(10, 90, 10, 90);
+  Engine.maybeWinsorize(5, 95, 5, 95);
 
   const startTs = Engine.tsAt(0);
   const endTs = Engine.tsAt(D.n - 1);
@@ -579,6 +608,11 @@
   // =====================================================================
   //  STATE: per-level. Built from config defaults.
   // =====================================================================
+  // activeLevel tracks which panel is currently visible. The shared setup
+  // controls call scheduleUpdate(activeLevel) on change — other levels'
+  // state stays in sync (they pick up changes when next activated).
+  let activeLevel = 1;
+
   const state = {};
   for (const lvl of [1, 2, 3]) {
     const cfg = LEVEL_CONFIG[lvl];
@@ -592,20 +626,34 @@
       lastSweep: null,
     };
   }
+  // L1's defaults omit theta_flat (L1 has no imbalance). Now that the
+  // shared setup writes theta_flat to all three levels, seed L1's params
+  // with the same default so the in-sync invariant holds from the start.
+  // L1's engine path ignores theta_flat (no flat penalty without imbalance).
+  if (state[1].params.theta_flat == null) {
+    state[1].params.theta_flat = LEVEL_CONFIG[2].defaults.theta_flat;
+  }
 
   // =====================================================================
   //  GENERATE PARAMETER CARDS
   //  Each level fills its own #l{N}-params container from PARAM_DEFS.
   // =====================================================================
-  function paramCardHTML(level, key) {
+  // Render one parameter card.
+  //   idPrefix: ID prefix for the inputs ("setup" for shared setup, "l1"/"l2"/"l3" for per-level).
+  //   sourceLevel: which level's defaults / simRange to seed from. For shared setup,
+  //                we pass 2 because L2's defaults include every setup key (incl. theta_flat
+  //                which L1 doesn't have).
+  //   isShared: when true (shared-setup render), the imbalanceDisabled flag on L1 is ignored —
+  //             the shared w_imb input is always active because it applies to L2/L3 too.
+  function paramCardHTML(idPrefix, sourceLevel, key, isShared = false) {
     const def = PARAM_DEFS[key];
-    const cfg = LEVEL_CONFIG[level];
-    const idBase = `l${level}-${key}`;
+    const cfg = LEVEL_CONFIG[sourceLevel];
+    const idBase = `${idPrefix}-${key}`;
 
     // ---- date-range card ----
     if (def.isDateRange) {
-      const from = state[level].simRange.from;
-      const to = state[level].simRange.to;
+      const from = state[sourceLevel].simRange.from;
+      const to = state[sourceLevel].simRange.to;
       return `
         <div class="control sim-range">
           <label>${def.label}<span class="unit">DD/MM/YYYY</span></label>
@@ -633,8 +681,11 @@
     // (e.g. "≤ −23 €/MWh" / "≥ 234 €/MWh"), updated by updateWinsorCaps()
     // after every Engine.maybeWinsorize call.
     if (def.isWinsor) {
+      // Shared setup never disables — the input applies to L2/L3 even if L1
+      // ignores it. The legacy per-level disabled-on-L1 path is kept for
+      // safety but isn't reachable after the shared-setup refactor.
       const disabled =
-        key === "w_imb" && cfg.imbalanceDisabled ? "disabled" : "";
+        !isShared && key === "w_imb" && cfg.imbalanceDisabled ? "disabled" : "";
       const lo = cfg.defaults[`${key}_lo`];
       const hi = cfg.defaults[`${key}_hi`];
       return `
@@ -652,7 +703,7 @@
             </span>
           </div>
           <div class="param-desc">
-            <p>${def.description}${cfg.imbalanceDisabled && key === "w_imb" ? " <em>Disabled in Level 1.</em>" : ""}</p>
+            <p>${def.description}</p>
             <ul class="extremes">
               ${def.extremes.map(([v, m]) => `<li><b>${v}:</b> ${m}</li>`).join("")}
             </ul>
@@ -678,24 +729,43 @@
       </div>`;
   }
 
+  // Render the shared Setup section ONCE (above the tabs). Pulls the setup
+  // keys from any level that has them all — we use L2 because its paramKeys
+  // include theta_flat (L1 omits it). The shared setup writes to all three
+  // state[].params objects on change, keeping them in sync.
+  function renderSharedSetup() {
+    const setupKeys = LEVEL_CONFIG[2].paramKeys.filter(
+      (k) => PARAM_DEFS[k].group === "setup",
+    );
+    document.getElementById("setup-params").innerHTML = setupKeys
+      .map((k) => paramCardHTML("setup", 2, k, true))
+      .join("");
+  }
+
+  // Render per-level market + oversell controls. Setup is no longer rendered
+  // per level — it lives once in the shared setup box. Market params are
+  // split across sub-sections (one .controls-grid per sub-section), keyed by
+  // PARAM_DEFS[key].section and ordered via SECTION_ORDER[level].
   function renderParamCards(level) {
     const cfg = LEVEL_CONFIG[level];
-    const setupKeys = cfg.paramKeys.filter((k) => PARAM_DEFS[k].group === "setup");
     const marketKeys = cfg.paramKeys.filter((k) => PARAM_DEFS[k].group === "market");
     const oversellKeys = cfg.paramKeys.filter(
       (k) => PARAM_DEFS[k].group === "oversell",
     );
-    document.getElementById(`l${level}-setup-params`).innerHTML = setupKeys
-      .map((k) => paramCardHTML(level, k))
-      .join("");
-    document.getElementById(`l${level}-market-params`).innerHTML = marketKeys
-      .map((k) => paramCardHTML(level, k))
-      .join("");
+    // Each market sub-section has its own container: #l{level}-{section}-params.
+    for (const section of SECTION_ORDER[level]) {
+      const container = document.getElementById(`l${level}-${section}-params`);
+      if (!container) continue;
+      const keys = marketKeys.filter((k) => PARAM_DEFS[k].section === section);
+      container.innerHTML = keys.map((k) => paramCardHTML(`l${level}`, level, k)).join("");
+    }
     // Oversell section is L3-only; the container element may not exist on
     // L1 / L2 (only L3's HTML scaffolding renders it).
     const overEl = document.getElementById(`l${level}-oversell-params`);
     if (overEl) {
-      overEl.innerHTML = oversellKeys.map((k) => paramCardHTML(level, k)).join("");
+      overEl.innerHTML = oversellKeys
+        .map((k) => paramCardHTML(`l${level}`, level, k))
+        .join("");
     }
     document.getElementById(`l${level}-reset`).textContent =
       level === 1 ? "⇄ Reset market params (Y=0)" : "⇄ Reset market params (Y=0, Z=0)";
@@ -751,9 +821,10 @@
   }
 
   // Update the "(≤ X €/MWh)" / "(≥ Y €/MWh)" preview spans next to every
-  // winsor input in the given level. Called after Engine.maybeWinsorize.
-  // Map from PARAM_DEFS key → bounds object key on the maybeWinsorize result.
-  function updateWinsorCaps(level, bounds) {
+  // winsor input. Called after Engine.maybeWinsorize. Caps live in the
+  // shared setup (one set of inputs for all three levels), so the IDs use
+  // the "setup-" prefix and are level-independent.
+  function updateWinsorCaps(bounds) {
     const map = [
       ["w_mfrr", bounds && bounds.mfrrBounds],
       ["w_imb", bounds && bounds.imbBounds],
@@ -761,8 +832,8 @@
       ["w_afrr_neg", bounds && bounds.afrrNegBounds],
     ];
     for (const [key, b] of map) {
-      const loEl = document.getElementById(`l${level}-${key}-cap-lo`);
-      const hiEl = document.getElementById(`l${level}-${key}-cap-hi`);
+      const loEl = document.getElementById(`setup-${key}-cap-lo`);
+      const hiEl = document.getElementById(`setup-${key}-cap-hi`);
       if (!loEl || !hiEl) continue;
       if (!b) {
         loEl.textContent = "(…)";
@@ -833,7 +904,7 @@
       p.w_afrr_neg_lo,
       p.w_afrr_neg_hi,
     );
-    updateWinsorCaps(level, bounds);
+    updateWinsorCaps(bounds);
 
     // 2. Always recompute naive at current θ_flat AND current splits.
     const naive = Engine.simulateTotal(
@@ -931,18 +1002,23 @@
     updateTimers[level] = setTimeout(() => updateLevel(level), 60);
   }
 
-  function bindParamCards(level) {
-    const cfg = LEVEL_CONFIG[level];
-    for (const key of cfg.paramKeys) {
+  // Bind the shared Setup controls. Each change writes to ALL THREE level
+  // state objects (so they stay in sync) and re-runs the currently active
+  // level. The other levels pick up the new state next time the user
+  // switches to them.
+  function bindSharedSetup() {
+    const setupKeys = LEVEL_CONFIG[2].paramKeys.filter(
+      (k) => PARAM_DEFS[k].group === "setup",
+    );
+    for (const key of setupKeys) {
       const def = PARAM_DEFS[key];
-      const idBase = `l${level}-${key}`;
+      const idBase = `setup-${key}`;
 
       if (def.isDateRange) {
         const fromEl = document.getElementById(`${idBase}-from`);
         const toEl = document.getElementById(`${idBase}-to`);
         const resetEl = document.getElementById(`${idBase}-reset`);
         const onChange = () => {
-          // Parse DD/MM/YYYY; fall back to the dataset bounds on bad input
           let fIso = parseEU(fromEl.value) || dataMinDate;
           let tIso = parseEU(toEl.value) || dataMaxDate;
           fIso = clampDate(fIso, dataMinDate, dataMaxDate);
@@ -950,10 +1026,12 @@
           if (fIso > tIso) [fIso, tIso] = [tIso, fIso];
           fromEl.value = isoToEU(fIso);
           toEl.value = isoToEU(tIso);
-          state[level].simRange = { from: fIso, to: tIso };
-          // Invalidate the chart range so updateLevel re-anchors to the new window
-          state[level].tsRange = { from: null, to: null };
-          scheduleUpdate(level);
+          for (const lvl of [1, 2, 3]) {
+            state[lvl].simRange = { from: fIso, to: tIso };
+            // Invalidate chart range so updateLevel re-anchors to the new window.
+            state[lvl].tsRange = { from: null, to: null };
+          }
+          scheduleUpdate(activeLevel);
         };
         fromEl.addEventListener("change", onChange);
         toEl.addEventListener("change", onChange);
@@ -968,20 +1046,51 @@
       if (def.isWinsor) {
         const lo = document.getElementById(`${idBase}-lo`);
         const hi = document.getElementById(`${idBase}-hi`);
-        if (lo.disabled) continue;
         const onChange = () => {
-          state[level].params[`${key}_lo`] = clamp(parseFloat(lo.value) || 0, 0, 50);
-          state[level].params[`${key}_hi`] = clamp(parseFloat(hi.value) || 100, 50, 100);
-          lo.value = state[level].params[`${key}_lo`];
-          hi.value = state[level].params[`${key}_hi`];
-          scheduleUpdate(level);
+          const loV = clamp(parseFloat(lo.value) || 0, 0, 50);
+          const hiV = clamp(parseFloat(hi.value) || 100, 50, 100);
+          for (const lvl of [1, 2, 3]) {
+            state[lvl].params[`${key}_lo`] = loV;
+            state[lvl].params[`${key}_hi`] = hiV;
+          }
+          lo.value = loV;
+          hi.value = hiV;
+          scheduleUpdate(activeLevel);
         };
         lo.addEventListener("change", onChange);
         hi.addEventListener("change", onChange);
         continue;
       }
 
-      // numeric (slider+number)
+      // numeric (slider+number) — e.g. theta_flat
+      const slider = document.getElementById(idBase);
+      const num = document.getElementById(`${idBase}-num`);
+      const onSet = (raw) => {
+        let v = parseFloat(raw);
+        if (isNaN(v)) return;
+        v = clamp(v, def.min, def.max);
+        slider.value = v;
+        num.value = v;
+        for (const lvl of [1, 2, 3]) {
+          state[lvl].params[key] = v;
+        }
+        scheduleUpdate(activeLevel);
+      };
+      slider.addEventListener("input", (e) => onSet(e.target.value));
+      num.addEventListener("change", (e) => onSet(e.target.value));
+    }
+  }
+
+  // Bind per-level market + oversell controls. Setup keys are skipped — they
+  // live in the shared setup section and are wired by bindSharedSetup.
+  function bindParamCards(level) {
+    const cfg = LEVEL_CONFIG[level];
+    for (const key of cfg.paramKeys) {
+      const def = PARAM_DEFS[key];
+      if (def.group === "setup") continue;
+      const idBase = `l${level}-${key}`;
+
+      // numeric (slider+number) — all market and oversell params are numeric.
       const slider = document.getElementById(idBase);
       const num = document.getElementById(`${idBase}-num`);
       const onSet = (raw) => {
@@ -1018,217 +1127,402 @@
     });
   }
 
+  // =====================================================================
+  //  OPTIMISER — random search + MULTI-START coord-descent refine.
+  //  Single algorithm for all three levels. Seeded RNG (Mulberry32) so
+  //  clicking Optimise twice produces identical results.
+  //
+  //  Pipeline:
+  //    1. Random search: N uniform samples over the optimised parameter
+  //       space. Track the top-K samples by revenue (a small sorted array).
+  //    2. Multi-start refine: run coord-descent from EACH of the top-K
+  //       samples. Return the best of the refined samples.
+  //
+  //  Why multi-start? A variance test (3 seeds × 3 levels) showed near-zero
+  //  revenue spread (< 0.07 % on L1/L2, 0 % on L3) with single-start. The
+  //  landscape on the current dataset has one dominant basin and refine
+  //  converges reliably. Multi-start is **belt-and-suspenders against
+  //  future data changes** introducing additional basins: if a second
+  //  basin appears with a competitive local optimum, top-K will include
+  //  samples from both, refining catches both, and we return the better
+  //  one. Cost is cheap relative to the random search itself.
+  //
+  //  Per-level config (measured per-sim cost: L1 0.65 ms, L2 1.26 ms,
+  //  L3 2.10 ms — L3 is dearer because S3's rolling stats run per-ISP):
+  //
+  //  | Level | N    | K | Random | Refine (K×~) | Wall  |
+  //  |-------|------|---|--------|--------------|-------|
+  //  | L1    | 2000 | 3 | 1.3 s  | 3 × 0.4 s    | 2.5 s |
+  //  | L2    | 4000 | 3 | 5 s    | 3 × 0.7 s    | 7 s   |
+  //  | L3    | 4000 | 5 | 8.4 s  | 5 × 3 s      | 23 s  |
+  //
+  //  The math P(random sample ∈ top X %) = 1 − (1 − X/100)^N is
+  //  dim-independent: N = 2000 random samples on a 4-D space already gives
+  //  ≥ 99 % confidence of hitting the top 0.25 %; refine then polishes
+  //  whatever the random search found.
+  //
+  //  X_cap, s3_lag and s3_da_skip are held at user values:
+  //   - X_cap: model has no price-impact term; any sweep picks the grid
+  //     boundary. User must set this manually based on real liquidity.
+  //   - lag, da_skip: physical / risk constraints, not strategy levers.
+  // =====================================================================
+  const RANDOM_N = { 1: 2000, 2: 4000, 3: 4000 };
+  const REFINE_STARTS = { 1: 3, 2: 3, 3: 5 };
+  // Fraction of the progress bar reserved for the random search phase.
+  // The remainder is split evenly across the K refine starts. Calibrated
+  // per level so the bar advances at roughly even wall-time speed (on L3
+  // the refines take longer than the random phase, so random gets less of
+  // the bar).
+  const RAND_PROGRESS = { 1: 0.5, 2: 0.7, 3: 0.35 };
+
+  // Cooperative yield primitive. setTimeout(0) gets clamped to 4 ms after
+  // nesting (HTML spec) AND is heavily throttled in some headless / hidden
+  // browser contexts (we've measured > 300 ms / yield in the preview's
+  // server). MessageChannel bypasses both, posting onto the macrotask
+  // queue with minimal overhead. We share one channel across the whole
+  // optimiser run; the single in-flight resolver is safe because we only
+  // ever have one pending yield at a time (the optimiser is sequential).
+  const _yieldChannel =
+    typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+  let _yieldResolve = null;
+  if (_yieldChannel) {
+    _yieldChannel.port1.onmessage = () => {
+      const r = _yieldResolve;
+      _yieldResolve = null;
+      if (r) r();
+    };
+  }
+  function yieldToBrowser() {
+    if (_yieldChannel) {
+      return new Promise((r) => {
+        _yieldResolve = r;
+        _yieldChannel.port2.postMessage(null);
+      });
+    }
+    return new Promise((r) => setTimeout(r, 0));
+  }
+
+  // Tiny seeded PRNG (Mulberry32). Same seed across runs ⇒ reproducible
+  // optimise output.
+  function mulberry32(seed) {
+    let s = seed | 0;
+    return () => {
+      s = (s + 0x6d2b79f5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Uniform sample of the optimised params for `level`. Values are
+  // pre-snapped to each slider's step so setSliderValue won't introduce
+  // a state/DOM mismatch on apply.
+  function randomSample(level, rng) {
+    const sample = {
+      X: -100 + Math.floor(rng() * 401),
+      Y: Math.round(rng() * 100) / 100,
+      s_up: Math.round(rng() * 100) / 100,
+      s_dn: Math.round(rng() * 100) / 100,
+      Z: level >= 2 ? Math.round(rng() * 100) / 100 : 0,
+    };
+    if (level === 3) {
+      sample.s3_K = 2 + Math.floor(rng() * 47);
+      sample.s3_S_min = Math.floor(rng() * 201);
+      sample.s3_sigma_max = Math.floor(rng() * 201) * 5;
+      sample.s3_M = -50 + Math.floor(rng() * 151);
+    }
+    return sample;
+  }
+
+  // Wrap simulateTotal: lift the sample's optimised dims + the user's
+  // held-fixed dims (theta_flat, X_cap, lag, da_skip) into engine args.
+  function evaluateSample(level, sample, userParams) {
+    const s3 =
+      level === 3
+        ? {
+            K: sample.s3_K,
+            S_min: sample.s3_S_min,
+            sigma_max: sample.s3_sigma_max,
+            X_cap: userParams.s3_X_cap,
+            M: sample.s3_M,
+            lag: userParams.s3_lag,
+            da_skip: userParams.s3_da_skip,
+          }
+        : null;
+    return Engine.simulateTotal(
+      level,
+      sample.X,
+      sample.Y,
+      sample.Z,
+      userParams.theta_flat || 0,
+      sample.s_up,
+      sample.s_dn,
+      s3,
+    );
+  }
+
+  function rangeArr(lo, hi, step) {
+    const out = [];
+    for (let v = lo; v <= hi + step * 1e-6; v += step) {
+      out.push(Math.round((v / step) * 1) * step);
+    }
+    return out;
+  }
+  function range01(step) {
+    const out = [];
+    for (let v = 0; v <= 1 + 1e-9; v += step) out.push(parseFloat(v.toFixed(4)));
+    return out;
+  }
+
+  // Per-axis refine grids — moderate step over full range. Coordinate
+  // descent sweeps each axis once per pass; if a pass found no improvement
+  // we stop early. maxPasses=3 caps the cost.
+  function refineDims(level) {
+    const dims = [
+      { key: "X", values: rangeArr(-100, 300, 5) },
+      { key: "Y", values: range01(0.02) },
+      { key: "s_up", values: range01(0.02) },
+      { key: "s_dn", values: range01(0.02) },
+    ];
+    if (level >= 2) dims.push({ key: "Z", values: range01(0.02) });
+    if (level === 3) {
+      dims.push({ key: "s3_K", values: rangeArr(2, 48, 1) });
+      dims.push({ key: "s3_S_min", values: rangeArr(0, 200, 5) });
+      dims.push({ key: "s3_sigma_max", values: rangeArr(0, 1000, 25) });
+      dims.push({ key: "s3_M", values: rangeArr(-50, 100, 5) });
+    }
+    return dims;
+  }
+
+  // Coordinate-descent refine starting from `startSample`. Sweeps each
+  // axis over its refine grid holding others at current best, updates the
+  // best, repeats until a full pass found no improvement or maxPasses is
+  // hit. async + internal yields keep the UI responsive — on L3 a single
+  // refine run costs ~3 s, and we run K of them, so without yields the
+  // browser would freeze for 15 s.
+  async function coordRefine(level, startSample, userParams, maxPasses = 3) {
+    let cur = { ...startSample };
+    let curRev = evaluateSample(level, cur, userParams);
+    const dims = refineDims(level);
+    let lastYield = performance.now();
+    for (let pass = 0; pass < maxPasses; pass++) {
+      let improved = false;
+      for (const dim of dims) {
+        let bestVal = cur[dim.key];
+        let bestR = curRev;
+        for (const v of dim.values) {
+          if (v === cur[dim.key]) continue;
+          const probe = { ...cur, [dim.key]: v };
+          const r = evaluateSample(level, probe, userParams);
+          if (r > bestR) {
+            bestR = r;
+            bestVal = v;
+          }
+          if (performance.now() - lastYield > 200) {
+            await yieldToBrowser();
+            lastYield = performance.now();
+          }
+        }
+        if (bestVal !== cur[dim.key]) {
+          cur[dim.key] = bestVal;
+          curRev = bestR;
+          improved = true;
+        }
+      }
+      if (!improved) break;
+    }
+    return { sample: cur, revenue: curRev };
+  }
+
+  // Render the progress bar inside the level's #l{level}-progress div.
+  // On first call we inject the bar HTML; subsequent calls just update
+  // width + text. The bar persists at 100 % with the result text after
+  // optimise completes.
+  function renderProgressBar(progEl, fraction, label) {
+    if (!progEl.querySelector(".progress-bar")) {
+      progEl.innerHTML =
+        '<div class="progress-bar">' +
+        '<div class="progress-bar-fill"></div>' +
+        '<div class="progress-bar-text"></div>' +
+        "</div>";
+    }
+    const fill = progEl.querySelector(".progress-bar-fill");
+    const text = progEl.querySelector(".progress-bar-text");
+    const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+    fill.style.width = `${pct}%`;
+    text.textContent = label;
+  }
+
+  // Apply optimised sample to sliders. Always writes X/Y/s_up/s_dn, plus
+  // Z (L2/L3) and S3 dims (L3). X_cap, lag, DA-skip are intentionally not
+  // touched — they're held-fixed inputs, not optimisation targets.
+  function applyOptimisedSample(level, sample) {
+    setSliderValue(level, "X", sample.X);
+    setSliderValue(level, "Y", sample.Y);
+    setSliderValue(level, "s_up", sample.s_up);
+    setSliderValue(level, "s_dn", sample.s_dn);
+    if (level >= 2) setSliderValue(level, "Z", sample.Z);
+    if (level === 3) {
+      setSliderValue(level, "s3_K", sample.s3_K);
+      setSliderValue(level, "s3_S_min", sample.s3_S_min);
+      setSliderValue(level, "s3_sigma_max", sample.s3_sigma_max);
+      setSliderValue(level, "s3_M", sample.s3_M);
+    }
+  }
+
+  // Main optimiser entry point. Runs random search then coord-descent
+  // refine, with a progress bar that fills as the sweep advances.
+  async function optimiseLevel(level) {
+    const optimiseBtn = document.getElementById(`l${level}-optimise`);
+    const resetBtn = document.getElementById(`l${level}-reset`);
+    const progEl = document.getElementById(`l${level}-progress`);
+    optimiseBtn.disabled = true;
+    resetBtn.disabled = true;
+
+    const p = state[level].params;
+    // maybeWinsorize re-runs only if percentiles changed since the last
+    // call; cheap when nothing's moved. updateLevel calls it too, but the
+    // optimiser bypasses updateLevel for its inner loop so we re-prime
+    // the winsorised arrays here.
+    Engine.maybeWinsorize(
+      p.w_mfrr_lo,
+      p.w_mfrr_hi,
+      p.w_imb_lo,
+      p.w_imb_hi,
+      p.w_afrr_pos_lo,
+      p.w_afrr_pos_hi,
+      p.w_afrr_neg_lo,
+      p.w_afrr_neg_hi,
+    );
+
+    const N = RANDOM_N[level];
+    const K = REFINE_STARTS[level];
+    const RAND_FRACTION = RAND_PROGRESS[level];
+    // Time-budget chunking: yield ~5 times / second so the bar paints
+    // smoothly without spending the run inside throttled timer callbacks.
+    const YIELD_INTERVAL_MS = 200;
+    const t0 = performance.now();
+    const rng = mulberry32(0xc0ffee);
+
+    renderProgressBar(progEl, 0, "optimising 0%");
+    await yieldToBrowser();
+
+    // Random search: maintain a sorted top-K array (descending by revenue).
+    // K is small (3–5), insertion sort is trivially fast. We avoid a heap
+    // because the marginal complexity wins nothing at this scale.
+    const topK = [];
+    let lastYield = performance.now();
+    for (let i = 0; i < N; i++) {
+      const s = randomSample(level, rng);
+      const r = evaluateSample(level, s, p);
+      if (topK.length < K) {
+        topK.push({ sample: s, revenue: r });
+        topK.sort((a, b) => b.revenue - a.revenue);
+      } else if (r > topK[K - 1].revenue) {
+        topK[K - 1] = { sample: s, revenue: r };
+        topK.sort((a, b) => b.revenue - a.revenue);
+      }
+      if (performance.now() - lastYield > YIELD_INTERVAL_MS) {
+        const f = ((i + 1) / N) * RAND_FRACTION;
+        renderProgressBar(progEl, f, `optimising ${Math.round(f * 100)}%`);
+        await yieldToBrowser();
+        lastYield = performance.now();
+      }
+    }
+
+    // Multi-start refine: run coord-descent from each of the top-K
+    // samples, keep the best refined result. The progress bar advances
+    // one step per refine completed (1/K, 2/K, …).
+    renderProgressBar(progEl, RAND_FRACTION, `refining 1/${K}…`);
+    await yieldToBrowser();
+    let best = null;
+    for (let k = 0; k < topK.length; k++) {
+      const refined = await coordRefine(level, topK[k].sample, p);
+      if (!best || refined.revenue > best.revenue) best = refined;
+      const f = RAND_FRACTION + ((k + 1) / K) * (1 - RAND_FRACTION);
+      const label =
+        k + 1 < topK.length
+          ? `refining ${k + 2}/${K}…`
+          : "finalising…";
+      renderProgressBar(progEl, f, label);
+      await yieldToBrowser();
+    }
+    const ms = Math.round(performance.now() - t0);
+
+    applyOptimisedSample(level, best.sample);
+    state[level].lastSweep = {
+      best: { ...best.sample, revenue: best.revenue },
+    };
+    updateLevel(level);
+
+    renderProgressBar(
+      progEl,
+      1,
+      `done in ${(ms / 1000).toFixed(1)}s — ${fmtEUR(best.revenue)}`,
+    );
+    optimiseBtn.disabled = false;
+    resetBtn.disabled = false;
+  }
+
   function bindOptimise(level) {
     const btn = document.getElementById(`l${level}-optimise`);
-    const progEl = document.getElementById(`l${level}-progress`);
     btn.addEventListener("click", () => {
-      btn.disabled = true;
-      const p = state[level].params;
-      Engine.maybeWinsorize(
-        p.w_mfrr_lo,
-        p.w_mfrr_hi,
-        p.w_imb_lo,
-        p.w_imb_hi,
-        p.w_afrr_pos_lo,
-        p.w_afrr_pos_hi,
-        p.w_afrr_neg_lo,
-        p.w_afrr_neg_hi,
-      );
-      const xs = [];
-      for (let x = -100; x <= 300; x += 10) xs.push(x);
-      const ys = [];
-      for (let y = 0; y <= 1.0001; y += 0.05) ys.push(parseFloat(y.toFixed(2)));
-      // Per-direction split grids. The split parameters are 2-D in the
-      // sweep (s_up × s_dn) so the optimiser can pick asymmetric ratios.
-      // L1: 6 × 6 = 36 split combos (was 11). 41 × 21 × 36 ≈ 31 k → ~12 s.
-      // L2: 4 × 4 = 16 split combos. 41 × 21 × 11 × 16 ≈ 152 k → ~60 s.
-      const ssL1 = [0, 0.2, 0.4, 0.6, 0.8, 1.0];
-      const ssL2 = [0, 0.33, 0.67, 1.0];
-      progEl.textContent = "computing…";
-      if (level === 1) {
-        setTimeout(() => {
-          const t0 = performance.now();
-          const result = Engine.sweepLevel1(xs, ys, ssL1, ssL1);
-          const ms = Math.round(performance.now() - t0);
-          progEl.textContent =
-            `done in ${ms} ms — best at X=${result.best.X}, Y=${result.best.Y.toFixed(2)},` +
-            ` s_up=${result.best.s_up.toFixed(2)}, s_dn=${result.best.s_dn.toFixed(2)}` +
-            ` → ${fmtEUR(result.best.revenue)}`;
-          setSliderValue(1, "X", result.best.X);
-          setSliderValue(1, "Y", result.best.Y);
-          setSliderValue(1, "s_up", result.best.s_up);
-          setSliderValue(1, "s_dn", result.best.s_dn);
-          state[1].lastSweep = result;
-          updateLevel(1);
-          btn.disabled = false;
-        }, 30);
-      } else {
-        // L2 + L3 share the same sweep (L3 = L2 math until speculation lands).
-        // Pass `level` through to simulateTotal so when L3's engine path
-        // diverges, this call site automatically picks up the new behaviour.
-        const zs = [];
-        for (let z = 0; z <= 1.0001; z += 0.1) zs.push(parseFloat(z.toFixed(1)));
-        let xi = 0;
-        // 5-D sweep over (X, Y, Z, s_up, s_dn). Only the running best is
-        // tracked — saving the full grid would cost > 50 MB at this
-        // resolution. The heatmap is redrawn on demand from simulateTotal
-        // and uses the CURRENT slider values for the un-pinned dimensions.
-        let bestRev = -Infinity,
-          bestX = 0,
-          bestY = 0,
-          bestZ = 0,
-          bestSup = 1,
-          bestSdn = 1;
-        const tStart = performance.now();
-        function runRow() {
-          if (xi >= xs.length) {
-            const ms = Math.round(performance.now() - tStart);
-            const result = {
-              best: {
-                X: bestX,
-                Y: bestY,
-                Z: bestZ,
-                s_up: bestSup,
-                s_dn: bestSdn,
-                revenue: bestRev,
-              },
-            };
-            progEl.textContent =
-              `done in ${ms} ms — best at X=${bestX}, Y=${bestY.toFixed(2)},` +
-              ` Z=${bestZ.toFixed(2)}, s_up=${bestSup.toFixed(2)},` +
-              ` s_dn=${bestSdn.toFixed(2)} → ${fmtEUR(bestRev)}`;
-            setSliderValue(level, "X", bestX);
-            setSliderValue(level, "Y", bestY);
-            setSliderValue(level, "Z", bestZ);
-            setSliderValue(level, "s_up", bestSup);
-            setSliderValue(level, "s_dn", bestSdn);
-            state[level].lastSweep = result;
-            updateLevel(level);
-            btn.disabled = false;
-            return;
-          }
-          // Build S3 settings object once per row (constant within this sweep).
-          // The market-optimise sweep holds S3 params fixed at their current
-          // values — only X/Y/Z/s_up/s_dn vary here.
-          const s3Curr =
-            level === 3
-              ? {
-                  K: p.s3_K,
-                  S_min: p.s3_S_min,
-                  sigma_max: p.s3_sigma_max,
-                  X_cap: p.s3_X_cap,
-                  M: p.s3_M,
-                  lag: p.s3_lag,
-                  da_skip: p.s3_da_skip,
-                }
-              : null;
-          for (let yi = 0; yi < ys.length; yi++) {
-            for (let zi = 0; zi < zs.length; zi++) {
-              for (let ui = 0; ui < ssL2.length; ui++) {
-                for (let di = 0; di < ssL2.length; di++) {
-                  const r = Engine.simulateTotal(
-                    level,
-                    xs[xi],
-                    ys[yi],
-                    zs[zi],
-                    p.theta_flat,
-                    ssL2[ui],
-                    ssL2[di],
-                    s3Curr,
-                  );
-                  if (r > bestRev) {
-                    bestRev = r;
-                    bestX = xs[xi];
-                    bestY = ys[yi];
-                    bestZ = zs[zi];
-                    bestSup = ssL2[ui];
-                    bestSdn = ssL2[di];
-                  }
-                }
-              }
-            }
-          }
-          xi++;
-          progEl.textContent = `computing… ${Math.round((xi / xs.length) * 100)}%`;
-          setTimeout(runRow, 0);
-        }
-        runRow();
-      }
+      optimiseLevel(level).catch((err) => {
+        console.error("optimise failed", err);
+        btn.disabled = false;
+        document.getElementById(`l${level}-reset`).disabled = false;
+      });
     });
   }
 
-  // =====================================================================
-  //  OVERSELL OPTIMISER (L3 only) — sweeps (K, S_min, sigma_max, M) while
-  //  holding market params + X_cap + lag fixed at their current values.
-  //  X_cap is NOT swept: the backtest model has no price-impact term, so
-  //  more volume is always net-positive on this dataset; sweeping it just
-  //  picks the grid boundary. The user sets X_cap manually based on real
-  //  liquidity constraints (default 5 MW). Per Q7, market + oversell each
-  //  have their own button so they're tuned independently.
-  // =====================================================================
-  function bindOptimiseOversell(level) {
-    const btn = document.getElementById(`l${level}-optimise-oversell`);
-    if (!btn) return; // L3 only
-    const progEl = document.getElementById(`l${level}-progress-oversell`);
-    btn.addEventListener("click", () => {
-      btn.disabled = true;
-      const p = state[level].params;
-      Engine.maybeWinsorize(
-        p.w_mfrr_lo,
-        p.w_mfrr_hi,
-        p.w_imb_lo,
-        p.w_imb_hi,
-        p.w_afrr_pos_lo,
-        p.w_afrr_pos_hi,
-        p.w_afrr_neg_lo,
-        p.w_afrr_neg_hi,
-      );
-      // Coarse grids — total ~2 k combos, ~3 s. K covers minutes-to-half-day
-      // history; S_min and σ_max widely; M covers windfall-only (-50) up to
-      // loose-stop (30). X_cap is held at the user's current setting (see
-      // function header).
-      const Ks = [2, 4, 6, 8, 12, 16, 24, 36];
-      const Smins = [0, 10, 20, 40, 80, 120];
-      const Sigmas = [50, 150, 300, 600, 1000];
-      const Xcaps = [p.s3_X_cap];
-      const Ms = [-50, -20, -10, -5, 0, 5, 10, 20, 30];
-      progEl.textContent = "computing…";
-      setTimeout(() => {
-        const t0 = performance.now();
-        const result = Engine.sweepLevel3Oversell(
-          Ks,
-          Smins,
-          Sigmas,
-          Xcaps,
-          Ms,
-          {
-            X: p.X,
-            Y: p.Y,
-            Z: p.Z,
-            theta_flat: p.theta_flat,
-            s_up: p.s_up,
-            s_dn: p.s_dn,
-            lag: p.s3_lag,
-            da_skip: p.s3_da_skip,
-          },
-        );
-        const ms = Math.round(performance.now() - t0);
-        progEl.textContent =
-          `done in ${ms} ms — best at K=${result.best.K}, S_min=${result.best.S_min},` +
-          ` σ_max=${result.best.sigma_max}, M=${result.best.M}` +
-          ` (X_cap fixed @ ${result.best.X_cap})` +
-          ` → ${fmtEUR(result.best.revenue)}`;
-        setSliderValue(level, "s3_K", result.best.K);
-        setSliderValue(level, "s3_S_min", result.best.S_min);
-        setSliderValue(level, "s3_sigma_max", result.best.sigma_max);
-        // s3_X_cap intentionally not updated — held at user setting.
-        setSliderValue(level, "s3_M", result.best.M);
-        state[level].lastSweepOversell = result;
-        updateLevel(level);
-        btn.disabled = false;
-      }, 30);
-    });
-  }
+  // Debug hook: run the optimiser with a chosen seed WITHOUT touching the
+  // UI (no progress bar, no slider updates, no updateLevel). Mirrors the
+  // multi-start logic in optimiseLevel exactly — used for variance
+  // analysis across different seeds. Returns {revenue, sample, ms}.
+  window.__optimiseSilent = async function (level, seed) {
+    const p = state[level].params;
+    Engine.maybeWinsorize(
+      p.w_mfrr_lo,
+      p.w_mfrr_hi,
+      p.w_imb_lo,
+      p.w_imb_hi,
+      p.w_afrr_pos_lo,
+      p.w_afrr_pos_hi,
+      p.w_afrr_neg_lo,
+      p.w_afrr_neg_hi,
+    );
+    const N = RANDOM_N[level];
+    const K = REFINE_STARTS[level];
+    const rng = mulberry32(seed | 0);
+    const t0 = performance.now();
+    const topK = [];
+    let lastYield = t0;
+    for (let i = 0; i < N; i++) {
+      const s = randomSample(level, rng);
+      const r = evaluateSample(level, s, p);
+      if (topK.length < K) {
+        topK.push({ sample: s, revenue: r });
+        topK.sort((a, b) => b.revenue - a.revenue);
+      } else if (r > topK[K - 1].revenue) {
+        topK[K - 1] = { sample: s, revenue: r };
+        topK.sort((a, b) => b.revenue - a.revenue);
+      }
+      if (performance.now() - lastYield > 200) {
+        await yieldToBrowser();
+        lastYield = performance.now();
+      }
+    }
+    let best = null;
+    for (let k = 0; k < topK.length; k++) {
+      const refined = await coordRefine(level, topK[k].sample, p);
+      if (!best || refined.revenue > best.revenue) best = refined;
+    }
+    return {
+      revenue: best.revenue,
+      sample: best.sample,
+      ms: Math.round(performance.now() - t0),
+    };
+  };
 
   // =====================================================================
   //  DATE RANGE NAVIGATION
@@ -1307,129 +1601,6 @@
   }
 
   // =====================================================================
-  //  HEATMAP
-  // =====================================================================
-  function computeAndDrawHeatmap(level, pair) {
-    const p = state[level].params;
-    Engine.maybeWinsorize(p.w_mfrr_lo, p.w_mfrr_hi, p.w_imb_lo, p.w_imb_hi);
-    const progEl = document.getElementById(`l${level}-heatmap-progress`);
-    progEl.textContent = "computing…";
-    const xs = [];
-    for (let x = -100; x <= 300; x += 10) xs.push(x);
-    const ys = [];
-    for (let y = 0; y <= 1.0001; y += 0.05) ys.push(parseFloat(y.toFixed(2)));
-    const zs = [];
-    for (let z = 0; z <= 1.0001; z += 0.05) zs.push(parseFloat(z.toFixed(2)));
-    setTimeout(() => {
-      const t0 = performance.now();
-      // L3 heatmap reflects the current S3 settings (sweep one of X/Y/Z
-      // at a time while everything else, including S3, stays fixed).
-      const s3Curr =
-        level === 3
-          ? {
-              K: p.s3_K,
-              S_min: p.s3_S_min,
-              sigma_max: p.s3_sigma_max,
-              X_cap: p.s3_X_cap,
-              M: p.s3_M,
-              lag: p.s3_lag,
-              da_skip: p.s3_da_skip,
-            }
-          : null;
-      let grid, axisXs, axisYs, axisLabels, markX, markY;
-      if (level === 1 || pair === "XY") {
-        grid = [];
-        for (let xi = 0; xi < xs.length; xi++) {
-          const row = new Float64Array(ys.length);
-          for (let yi = 0; yi < ys.length; yi++) {
-            row[yi] = Engine.simulateTotal(
-              level,
-              xs[xi],
-              ys[yi],
-              p.Z || 0,
-              p.theta_flat || 0,
-              p.s_up == null ? 1 : p.s_up,
-              p.s_dn == null ? 1 : p.s_dn,
-              s3Curr,
-            );
-          }
-          grid.push(row);
-        }
-        axisXs = xs;
-        axisYs = ys;
-        axisLabels = { x: "X (DA threshold, EUR/MWh)", y: "Y (withhold fraction)" };
-        markX = p.X;
-        markY = p.Y;
-      } else if (pair === "XZ") {
-        grid = [];
-        for (let xi = 0; xi < xs.length; xi++) {
-          const row = new Float64Array(zs.length);
-          for (let zi = 0; zi < zs.length; zi++) {
-            row[zi] = Engine.simulateTotal(
-              level,
-              xs[xi],
-              p.Y,
-              zs[zi],
-              p.theta_flat,
-              p.s_up == null ? 1 : p.s_up,
-              p.s_dn == null ? 1 : p.s_dn,
-              s3Curr,
-            );
-          }
-          grid.push(row);
-        }
-        axisXs = xs;
-        axisYs = zs;
-        axisLabels = { x: "X (DA threshold, EUR/MWh)", y: "Z (ID trust)" };
-        markX = p.X;
-        markY = p.Z;
-      } else {
-        grid = [];
-        for (let yi = 0; yi < ys.length; yi++) {
-          const row = new Float64Array(zs.length);
-          for (let zi = 0; zi < zs.length; zi++) {
-            row[zi] = Engine.simulateTotal(
-              level,
-              p.X,
-              ys[yi],
-              zs[zi],
-              p.theta_flat,
-              p.s_up == null ? 1 : p.s_up,
-              p.s_dn == null ? 1 : p.s_dn,
-              s3Curr,
-            );
-          }
-          grid.push(row);
-        }
-        axisXs = ys;
-        axisYs = zs;
-        axisLabels = { x: "Y (withhold fraction)", y: "Z (ID trust)" };
-        markX = p.Y;
-        markY = p.Z;
-      }
-      const ms = Math.round(performance.now() - t0);
-      progEl.textContent = `done in ${ms} ms`;
-      Charts.drawHeatmap(`l${level}-heatmap`, grid, axisXs, axisYs, axisLabels, markX, markY,
-        (xv, yv) => {
-          if (level === 1) {
-            setSliderValue(1, "X", xv);
-            setSliderValue(1, "Y", yv);
-          } else if (pair === "XY") {
-            setSliderValue(level, "X", xv);
-            setSliderValue(level, "Y", yv);
-          } else if (pair === "XZ") {
-            setSliderValue(level, "X", xv);
-            setSliderValue(level, "Z", yv);
-          } else {
-            setSliderValue(level, "Y", xv);
-            setSliderValue(level, "Z", yv);
-          }
-          updateLevel(level);
-        });
-    }, 30);
-  }
-
-  // =====================================================================
   //  TABS
   // =====================================================================
   // Resize fix: Level 2 charts are pre-rendered ~200 ms after page load
@@ -1446,6 +1617,7 @@
       document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
       const level = parseInt(btn.dataset.level);
+      activeLevel = level;
       const panel = document.getElementById(`panel-${level}`);
       panel.classList.add("active");
       // rAF: wait for the browser's layout pass on the now-visible panel so
@@ -1480,29 +1652,19 @@
   // =====================================================================
   //  INIT
   // =====================================================================
+  // Shared setup renders + binds ONCE, before any level-specific work — so
+  // updateLevel() can read shared inputs and updateWinsorCaps() can write
+  // to shared IDs without a "container not found" race.
+  renderSharedSetup();
+  bindSharedSetup();
   for (const lvl of [1, 2, 3]) {
     renderParamCards(lvl);
     renderStatsTables(lvl);
     bindParamCards(lvl);
     bindReset(lvl);
     bindOptimise(lvl);
-    bindOptimiseOversell(lvl);
     bindDateNav(lvl);
   }
-
-  document
-    .getElementById("l1-show-heatmap")
-    .addEventListener("click", () => computeAndDrawHeatmap(1, "XY"));
-  document
-    .getElementById("l2-show-heatmap")
-    .addEventListener("click", () =>
-      computeAndDrawHeatmap(2, document.getElementById("l2-heatmap-pair").value),
-    );
-  document
-    .getElementById("l3-show-heatmap")
-    .addEventListener("click", () =>
-      computeAndDrawHeatmap(3, document.getElementById("l3-heatmap-pair").value),
-    );
 
   updateLevel(1);
   setTimeout(() => updateLevel(2), 200);

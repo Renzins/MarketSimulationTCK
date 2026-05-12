@@ -33,7 +33,7 @@ The tool is split into two halves, navigable from a top navbar:
 ├── engine.js                   Backtester simulation engine (window, winsor, simulate,
 │                               aFRR averaging + per-direction split, sweeps)
 ├── charts.js                   Backtester Plotly renderers (timeseries, monthly,
-│                               heatmap, histogram). Tooltip shows DA + mFRR-up/dn +
+│                               histogram). Tooltip shows DA + mFRR-up/dn +
 │                               aFRR-up/dn rows; bars stack mFRR + aFRR per direction.
 ├── app.js                      Backtester UI controller (config-driven param cards;
 │                               handles s_up / s_dn split + aFRR winsor + live cap previews)
@@ -257,16 +257,22 @@ that makes the revenue formula correct.
 
 ### Default parameters
 
+Setup lives in one **shared box above the level selector** — anything you
+change there (sim window, the four winsor pairs, θ_flat) applies to all
+three levels at once. The reset / optimise buttons in each panel only
+touch market params; setup is preserved across resets and across tab
+switches.
+
 Setup (experiment environment — NOT reset by "Reset to naïve" / "Reset
 market params"):
 
 | Param                     | Default            | Notes                                                      |
 | ------------------------- | ------------------ | ---------------------------------------------------------- |
 | Sim window                | full dataset       | configurable from/to text inputs                           |
-| mFRR winsor               | 10 / 90 percentile | clips the −10 000 / +10 000 EUR/MWh outliers               |
-| Imbalance winsor          | 10 / 90 percentile | same idea, on Latvia imbalance price (L2 / L3 only)        |
-| aFRR upward avg winsor    | 10 / 90 percentile | clips the per-ISP averaged AST_POS extremes                |
-| aFRR downward avg winsor  | 10 / 90 percentile | same on AST_NEG (after favourable-only filter, ≤ 0)        |
+| mFRR winsor               | 5 / 95 percentile  | clips the −10 000 / +10 000 EUR/MWh outliers               |
+| Imbalance winsor          | 5 / 95 percentile  | same idea, on Latvia imbalance price (L2 / L3 only)        |
+| aFRR upward avg winsor    | 5 / 95 percentile  | clips the per-ISP averaged AST_POS extremes                |
+| aFRR downward avg winsor  | 5 / 95 percentile  | same on AST_NEG (after favourable-only filter, ≤ 0)        |
 | θ_flat                    | 30 EUR/MWh         | flat penalty per MWh of shortfall (L2 / L3). **Moved to Setup**: it's NOT swept by the optimiser and NOT touched by Reset — it bounds the cost model rather than being a strategy lever. |
 
 Every winsor input shows a live cap preview alongside the percentile
@@ -364,33 +370,70 @@ stop-loss framing:
 | `X_cap`      | 5       | 0 – 58 MW        | Hard upper limit. **Setting X_cap = 0 disables S3** (L3 reverts to L2).    |
 | `M`          | 5       | −50 – 100 EUR/MWh| Stop-loss margin above VWAP1H. Negative M = tighter stop (windfall-only).  |
 
-### Dual optimisers
+### Unified optimiser
 
-L3 has **two ⚡ Optimise buttons**, by design (mFRR / aFRR market levers
-and S3 speculation levers are tuned independently):
+Each level has **one ⚡ Optimise button** that sweeps every optimised
+parameter in that level at once: on L3 that's `(X, Y, Z, s_up, s_dn,
+K, S_min, σ_max, M)` — 9 dimensions. `X_cap`, lag `L` and `DA_skip`
+are held at the user's slider values because they're physical /
+liquidity constraints, not strategy levers (see "Known quirks" #18).
 
-- **Optimise market** — sweeps X / Y / Z / s_up / s_dn while holding
-  S3 params fixed at their current values.
-- **Optimise oversell** — sweeps K / S_min / σ_max / M while holding
-  market params, lag L, **X_cap**, and **DA_skip** fixed. Grid runs in
-  ~3 s. X_cap is intentionally excluded because the backtest has no
-  price-impact term, so any sweep would always select the grid maximum
-  (see "Known quirks" below); X_cap must be set by hand from real-world
-  liquidity considerations. DA_skip is also a physical / risk gate, not
-  an optimisation lever.
+The algorithm is **seeded random search + multi-start coord-descent
+refine**:
+
+1. Draw N uniform random samples over the optimised parameter space.
+   Track the top-K samples by revenue (sorted insertion into a
+   small array — K = 3 on L1 / L2, K = 5 on L3).
+2. For each of the top-K samples, run coordinate-descent refine:
+   sweep each axis over its grid holding others at the current best,
+   update the best, repeat for up to 3 passes (stop early if a full
+   pass yielded no improvement).
+3. Return the highest-revenue refined sample.
+
+**Why multi-start?** A variance test (3 RNG seeds × 3 levels) found
+near-zero spread (<0.07 % on L1 / L2, 0 € on L3) — the landscape
+on the current dataset has one dominant basin and refine converges
+reliably from a wide range of starting points. Multi-start is
+**belt-and-suspenders** against future data introducing additional
+basins: if a second basin appears with a competitive optimum, top-K
+will include samples from both, refining catches both, and we
+return the better one.
+
+**Per-level config** (measured per-sim costs: L1 0.65 ms, L2 1.26 ms,
+L3 2.10 ms — L3 is dearer because S3's rolling stats run per-ISP):
+
+| Level | N    | K | Random | Refine (K × ~)   | Wall  |
+|-------|------|---|--------|------------------|-------|
+| L1    | 2000 | 3 | 1.3 s  | 3 × 0.4 s = 1.2s | 2.5 s |
+| L2    | 4000 | 3 | 5 s    | 3 × 0.7 s = 2.1s | 7 s   |
+| L3    | 4000 | 5 | 8.4 s  | 5 × 3 s   = 15s  | 23 s  |
+
+**Reproducibility**: a seeded Mulberry32 PRNG (default seed
+`0xC0FFEE`) drives all sampling, so clicking Optimise twice on the
+same Setup produces identical results. The debug hook
+`window.__optimiseSilent(level, seed)` runs the same logic with a
+chosen seed and returns `{revenue, sample, ms}` without touching the
+UI — used for the variance analysis above.
+
+**UI yielding**: the optimiser cooperatively yields every 200 ms via
+`MessageChannel.postMessage` (faster than `setTimeout(0)`, which gets
+throttled in some browser contexts). Both the random loop and the
+inner refine loop carry yields, so the UI stays responsive even
+during the 15 s of refine on L3.
 
 ### Frozen regression values
 
-- L1 default (`X=30, Y=1, s_up=s_dn=1`)                = **13,257,221 €**
-- L2 default (`X=30, Y=1, Z=1, θ=30, s_up=s_dn=1`)     = **13,367,642 €**
-- L3 with **`s3_X_cap=0`** (S3 disabled)                = 13,367,642 € (= L2 ✓)
-- L3 with **`s3_da_skip=0`** (S3 fully gated off)       = 13,367,642 € (= L2 ✓)
+(At the current Setup defaults — 5 / 95 winsor, θ_flat = 30.)
+
+- L1 default (`X=30, Y=1, s_up=s_dn=1`)                = **13,760,612 €**
+- L2 default (`X=30, Y=1, Z=1, θ=30, s_up=s_dn=1`)     = **13,932,199 €**
+- L3 with **`s3_X_cap=0`** (S3 disabled)                = 13,932,199 € (= L2 ✓)
+- L3 with **`s3_da_skip=0`** (S3 fully gated off)       = 13,932,199 € (= L2 ✓)
 - L3 default (`K=4, L=4, DA_skip=50, S_min=25, σ_max=75, X_cap=5, M=5`)
-  = **14,647,167 €**. The DA_skip = 50 gate keeps S3 from firing on
-  ISPs where the park has already committed ≥ 50 MW to DA. On the
-  current dataset that's a small fraction of high-wind hours — the
-  gate trims about €6,800 vs the no-gate run (€14,653,994). Re-
-  baseline after any preprocess refresh.
+  = **15,185,134 €**. The DA_skip = 50 gate keeps S3 from firing on
+  ISPs where the park has already committed ≥ 50 MW to DA. Re-
+  baseline after any preprocess refresh **or any change to the UI
+  default winsor**.
 
 ### ⚠ Backtest caveat — S3 scales infinitely because price impact isn't modelled
 
@@ -526,7 +569,7 @@ window**, so changing the bucket count (4 → 8) re-derives the
 boundaries and produces evenly-populated bins. Setup controls:
 
 - Simulation date range (DD/MM/YYYY text inputs)
-- Winsorize spread (10 / 90 default)
+- Winsorize spread (5 / 95 default)
 - Surplus / Deficit thresholds (−30 / +30 MW default)
 - Day type filter — All days (default) / Weekends + holidays / Workdays only
 - Bucket counts: Wind, Solar, DA price bands, Levels (matched panels)
@@ -598,7 +641,7 @@ takes over the moment the 4-s file finishes loading (via a
    to ≤ 8 k points by stride.
 
 **Winsorisation**: two independent percentile pairs (mFRR + aFRR, both
-default 10 / 90). Both are applied to every sign-agreement count,
+default 5 / 95). Both are applied to every sign-agreement count,
 correlation, and scatter point. Without this, ±10 000 €/MWh outliers
 in `p_mfrr` dominate the Pearson term and squash the scatter cloud to
 a single pixel. Cap previews show the live clip values per direction
@@ -994,17 +1037,21 @@ These are non-obvious behaviours by design — read before "fixing".
      refuse to sell at negative prices, add a gate `bid_price > 0` or
      `VWAP1H > 0` outside the engine.
 
-18. **S3 optimiser doesn't sweep `X_cap`.** When `Optimise oversell`
-    is clicked, the sweep covers (K, S_min, σ_max, M) only and pins
-    `X_cap` at the user's current slider value. This is because the
-    backtest has **no price-impact term** — selling more is always
-    net-positive on this dataset's frozen liquidity assumption, so
-    sweeping `X_cap` would just pick the grid max every time. The
-    interior dimensions (`K ≈ 4`, `M ≈ 5`) are still genuine optima
-    in the live sweep; `S_min` and `σ_max` may still hit boundaries
-    occasionally. Live trading must set `X_cap` from a real
-    price-impact / liquidity model. The formula correctly identifies
-    *when* to oversell; only the *size* needs an outside input.
+18. **Optimiser doesn't sweep `X_cap`, lag `L`, or `DA_skip`.** When
+    `Optimise` is clicked on L3, the sweep covers `(X, Y, Z, s_up,
+    s_dn, K, S_min, σ_max, M)` only — the three held-fixed dims are
+    physical / liquidity constraints, not strategy levers. `X_cap`
+    in particular is excluded because the backtest has **no
+    price-impact term** — selling more is always net-positive on this
+    dataset's frozen liquidity assumption, so sweeping `X_cap` would
+    just pick the grid max every time. Interior dims (`K ≈ 2-4`,
+    `M ≈ 0-5`) are genuine optima; `S_min` and `σ_max` may still
+    settle on grid edges where the gates never trip (`σ_max ≈ 900-950`
+    on the current data — the rolling-std rarely gets that high so
+    σ_max in that range is in a flat region of the objective). Live
+    trading must set `X_cap` from a real price-impact / liquidity
+    model. The formula correctly identifies *when* to oversell; only
+    the *size* needs an outside input.
 
 19. **mFRR vs aFRR comparison is slot-level by default.** When the
     user opens the "mFRR vs aFRR" Graphs sub-tab, `graphs-app.js`
@@ -1049,11 +1096,16 @@ forces clients to re-fetch after a deploy.
 - Winsorized arrays are cached and re-derived only when bounds /
   window / day-type filter change. Cap values are returned even on
   cache hits so the live preview can update without recomputing.
-- Backtester sweep grids:
-  - L1 sweep over (X × Y × s_up × s_dn) = 41 × 21 × 6 × 6 ≈ 31 k
-    combos × 43 k ISPs → ~12-17 s on Opus-tier hardware.
-  - L2 sweep over (X × Y × Z × s_up × s_dn) = 41 × 21 × 11 × 4 × 4 ≈
-    150 k combos → ~60-90 s, chunked across animation frames.
+- Backtester optimiser cost (random + multi-start refine, see
+  "Unified optimiser" above):
+  - L1: N=2000 random + 3 refines → ~2.5 s wall on the current dataset.
+  - L2: N=4000 random + 3 refines → ~7 s wall.
+  - L3: N=4000 random + 5 refines → ~23 s wall (refines dominate at
+    9 dims, so the bar pauses at the refine boundary; the inner loop
+    still yields every 200 ms so the UI stays responsive).
+  - Cooperative yields via `MessageChannel.postMessage` (the
+    `setTimeout(0)` clamp / background-tab throttling makes
+    `setTimeout`-based yields ~50× slower in some browser contexts).
 - Time-series chart: bar mode for ranges ≤ 600 ISPs (~6 days),
   scattergl for longer windows. Full-dataset render (43 k points,
   4 stacked bar series) in ~1.7 s.

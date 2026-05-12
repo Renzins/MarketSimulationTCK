@@ -98,13 +98,13 @@ def main():
     D = load_data()
     print(f"Loaded {D['n']} ISPs.")
 
-    # Apply winsorization (10/90 default for both)
-    p_mfrr_w, mfrr_bounds = winsorize(D["P_mfrr_raw"], 10, 90)
-    p_imb_w, imb_bounds = winsorize(D["P_imb_raw"], 10, 90)
+    # Apply winsorization (5/95 default for both)
+    p_mfrr_w, mfrr_bounds = winsorize(D["P_mfrr_raw"], 5, 95)
+    p_imb_w, imb_bounds = winsorize(D["P_imb_raw"], 5, 95)
     D["P_mfrr"] = p_mfrr_w
     D["P_imb"] = p_imb_w
-    print(f"mFRR winsor bounds (10/90): [{mfrr_bounds[0]:.2f}, {mfrr_bounds[1]:.2f}]")
-    print(f"imb  winsor bounds (10/90): [{imb_bounds[0]:.2f}, {imb_bounds[1]:.2f}]")
+    print(f"mFRR winsor bounds (5/95): [{mfrr_bounds[0]:.2f}, {mfrr_bounds[1]:.2f}]")
+    print(f"imb  winsor bounds (5/95): [{imb_bounds[0]:.2f}, {imb_bounds[1]:.2f}]")
 
     # ===== Naive baselines =====
     print()

@@ -115,6 +115,86 @@ a {
   z-index: 10;
 }
 
+/* Shared Setup section — sits below the level selector and applies to all
+   levels. Spans full viewport width (no max-width) per user request so it
+   visually anchors the page; the accent border-left reads as "experiment
+   scope, not a strategy lever". */
+.setup-wrapper {
+  padding: 14px 28px 0;
+}
+
+.setup-box {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 14px 18px;
+}
+
+.setup-box .param-group.setup {
+  padding: 0;
+}
+
+.setup-box .param-group.setup + .param-group.setup {
+  border-top: none;
+  margin-top: 0;
+  padding-top: 0;
+}
+
+/* Progress bar shown during Optimise. Lives in the same .actions row as
+   the buttons; fills green left-to-right as the random+refine sweep
+   advances. When the run completes, the bar holds at 100 % with the
+   result text overlaid (so the user sees "done in N s — best at X=…"
+   on a green background). */
+.progress-bar {
+  position: relative;
+  flex: 1 1 280px;
+  min-width: 240px;
+  max-width: 520px;
+  height: 28px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-bar-fill {
+  position: absolute;
+  inset: 0;
+  background: var(--good);
+  width: 0%;
+  transition: width 80ms linear;
+}
+
+.progress-bar-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  font-weight: 600;
+  pointer-events: none;
+  padding: 0 10px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Action bar at the bottom of the strategy stack — thinner card so the
+   Optimise / Reset buttons read as a distinct affordance, not as part of
+   a strategy group. */
+.controls-card.actions-card {
+  padding: 12px 18px;
+}
+
+.controls-card.actions-card .actions {
+  margin-top: 0;
+}
+
 .tab {
   background: transparent;
   border: none;

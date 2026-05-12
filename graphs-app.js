@@ -9,7 +9,7 @@
 // GraphsCharts.
 //
 // The page is structured into:
-//   - Setup group:   sim date range, winsorize spread (10/90), surplus/deficit thresholds (±30)
+//   - Setup group:   sim date range, winsorize spread (5/95), surplus/deficit thresholds (±30)
 //   - Bucket counts: wind / solar / DA price bands / matched-panel levels
 //   - 7 charts:
 //       1-2: 1-D box plot, spread by wind, SURPLUS / DEFICIT
@@ -61,8 +61,8 @@
   // ---------- state ------------------------------------------------------
   const state = {
     sim: { from: dataMinDate, to: dataMaxDate },
-    winsorMfrrLo: 10,
-    winsorMfrrHi: 90,
+    winsorMfrrLo: 5,
+    winsorMfrrHi: 95,
     deficitThr: -30, // baltic_imb_vol ≤ this → deficit
     surplusThr: 30, // baltic_imb_vol ≥ this → surplus
     // Day-type filter: "all" | "weekend-holiday" | "workday".
@@ -115,7 +115,7 @@
           <p>Caps the spread (P<sub>mFRR</sub> − P<sub>DA</sub>) at the chosen percentiles within the window. Tames the −10 000 / +10 000 EUR/MWh outliers in the 2025–2026 data.</p>
           <ul class="extremes">
             <li><b>0 / 100:</b> raw outliers retained.</li>
-            <li><b>10 / 90:</b> default — typical robustness for box plots.</li>
+            <li><b>5 / 95:</b> default — typical robustness for box plots.</li>
           </ul>
         </div>
       </div>
@@ -463,8 +463,8 @@
     },
     // Winsorization is unused so far (no price-related charts yet) but kept
     // here so the same shape applies if/when we add 4-second price plots.
-    winsorAfrrLo: 10,
-    winsorAfrrHi: 90,
+    winsorAfrrLo: 5,
+    winsorAfrrHi: 95,
     // LV imbalance is ~1/3 magnitude of Baltic (LV alone, not summed).
     // Defaults reflect that.
     lvDeficit: -10,
@@ -533,7 +533,7 @@
              upcoming 4-second price plots have a parameter ready.</p>
           <ul class="extremes">
             <li><b>0 / 100:</b> no winsorization.</li>
-            <li><b>10 / 90:</b> default for box plots.</li>
+            <li><b>5 / 95:</b> default for box plots.</li>
           </ul>
         </div>
       </div>
@@ -1175,10 +1175,10 @@
     // both ISP and slot modes (per-ISP distribution is the same in both).
     // aFRR uses different bounds per mode because the per-ISP-aggregated
     // and per-4-s-entry distributions are quantitatively different.
-    winsorMfrrLo: 10,
-    winsorMfrrHi: 90,
-    winsorAfrrLo: 10,
-    winsorAfrrHi: 90,
+    winsorMfrrLo: 5,
+    winsorMfrrHi: 95,
+    winsorAfrrLo: 5,
+    winsorAfrrHi: 95,
   };
 
   function cmpSetupHTML() {

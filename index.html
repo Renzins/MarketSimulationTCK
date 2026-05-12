@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Market Strategy Backtester</title>
-    <link rel="stylesheet" href="style.css?v=30" />
+    <link rel="stylesheet" href="style.css?v=34" />
   </head>
   <body>
     <nav class="site-nav">
@@ -29,36 +29,65 @@
       <button class="tab" data-level="3">Level 3 — DA + Actual power + imbalance penalties + speculation</button>
     </nav>
 
+    <!-- =================================================================
+         SHARED SETUP — sits below the level selector and applies to all
+         three levels. Changing anything here propagates to L1/L2/L3 state
+         (sim window, winsorisation, θ_flat) so switching tabs uses the same
+         experiment scope. These bound the analysis but aren't optimised.
+         Spans full viewport width to anchor the page visually.
+         ================================================================= -->
+    <div class="setup-wrapper">
+      <section class="setup-box">
+        <div class="param-group setup">
+          <div class="group-head">
+            <h3>Setup</h3>
+            <p class="group-desc">
+              Define the experiment environment — what data is fed into the
+              simulation. Setup applies to all three levels: change anything
+              here and the next tab you open uses the same window /
+              winsorisation / θ. Not varied by the optimiser; not touched by
+              "Reset to naïve".
+            </p>
+          </div>
+          <div class="controls-grid" id="setup-params"></div>
+        </div>
+      </section>
+    </div>
+
     <main>
       <!-- =================================================================
            LEVEL 1 PANEL
            ================================================================= -->
       <section id="panel-1" class="panel active">
         <div class="controls-card">
-          <div class="param-group setup">
-            <div class="group-head">
-              <h3>Setup</h3>
-              <p class="group-desc">
-                Define the experiment environment — what data is fed into the
-                simulation. These bound the analysis but aren't varied by the
-                optimiser.
-              </p>
-            </div>
-            <div class="controls-grid" id="l1-setup-params"></div>
-          </div>
-
           <div class="param-group market">
             <div class="group-head">
-              <h3>Market parameters <span class="badge">optimised</span></h3>
+              <h3>DA withhold on low prices <span class="badge">optimised</span></h3>
               <p class="group-desc">
-                The strategy levers — the Optimise button searches over these.
-                Reset rolls just these back to the naïve values; setup parameters
-                keep their current values.
+                When DA clears at or below price threshold X, hold back fraction
+                Y of the forecast from DA and offer it to balancing instead.
+                Above X, sell the full forecast to DA as usual.
               </p>
             </div>
-            <div class="controls-grid" id="l1-market-params"></div>
+            <div class="controls-grid" id="l1-da-withhold-params"></div>
           </div>
+        </div>
 
+        <div class="controls-card">
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>mFRR ↔ aFRR universal offer split <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Per-direction routing of balancing volume between mFRR and aFRR.
+                Independent ratios for upward (s_up) and downward (s_dn) because
+                the two markets price each direction differently.
+              </p>
+            </div>
+            <div class="controls-grid" id="l1-split-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card actions-card">
           <div class="actions">
             <button id="l1-optimise" class="btn primary">⚡ Optimise</button>
             <button id="l1-reset" class="btn">⇄ Reset to naïve</button>
@@ -172,16 +201,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h2>Optimisation surface</h2>
-            <div>
-              <button id="l1-show-heatmap" class="btn">Compute heatmap</button>
-              <span id="l1-heatmap-progress" class="progress"></span>
-            </div>
-          </div>
-          <div id="l1-heatmap" class="chart"></div>
-        </div>
       </section>
 
       <!-- =================================================================
@@ -189,30 +208,48 @@
            ================================================================= -->
       <section id="panel-2" class="panel">
         <div class="controls-card">
-          <div class="param-group setup">
-            <div class="group-head">
-              <h3>Setup</h3>
-              <p class="group-desc">
-                Define the experiment environment — what data is fed into the
-                simulation. These bound the analysis but aren't varied by the
-                optimiser.
-              </p>
-            </div>
-            <div class="controls-grid" id="l2-setup-params"></div>
-          </div>
-
           <div class="param-group market">
             <div class="group-head">
-              <h3>Market parameters <span class="badge">optimised</span></h3>
+              <h3>DA withhold on low prices <span class="badge">optimised</span></h3>
               <p class="group-desc">
-                The strategy levers — the Optimise button searches over these.
-                Reset rolls just these back to the naïve values; setup parameters
-                keep their current values.
+                When DA clears at or below price threshold X, hold back fraction
+                Y of the forecast from DA and offer it to balancing instead.
+                Above X, sell the full forecast to DA as usual.
               </p>
             </div>
-            <div class="controls-grid" id="l2-market-params"></div>
+            <div class="controls-grid" id="l2-da-withhold-params"></div>
           </div>
+        </div>
 
+        <div class="controls-card">
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>mFRR ↔ aFRR universal offer split <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Per-direction routing of balancing volume between mFRR and aFRR.
+                Independent ratios for upward (s_up) and downward (s_dn) because
+                the two markets price each direction differently.
+              </p>
+            </div>
+            <div class="controls-grid" id="l2-split-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card">
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>ID trust coefficient <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                How much of the intra-day forecast revision (ID − DA) to act on
+                as additional mFRR-up volume. Negative revisions are not acted on
+                (no buy-back modelled).
+              </p>
+            </div>
+            <div class="controls-grid" id="l2-id-trust-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card actions-card">
           <div class="actions">
             <button id="l2-optimise" class="btn primary">⚡ Optimise</button>
             <button id="l2-reset" class="btn">⇄ Reset to naïve</button>
@@ -326,23 +363,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h2>Optimisation surface</h2>
-            <div>
-              <label>Heatmap pair:
-                <select id="l2-heatmap-pair">
-                  <option value="XY">X × Y (at current Z)</option>
-                  <option value="XZ">X × Z (at current Y)</option>
-                  <option value="YZ">Y × Z (at current X)</option>
-                </select>
-              </label>
-              <button id="l2-show-heatmap" class="btn">Compute heatmap</button>
-              <span id="l2-heatmap-progress" class="progress"></span>
-            </div>
-          </div>
-          <div id="l2-heatmap" class="chart"></div>
-        </div>
       </section>
 
       <!-- =================================================================
@@ -355,36 +375,48 @@
            ================================================================= -->
       <section id="panel-3" class="panel">
         <div class="controls-card">
-          <div class="param-group setup">
-            <div class="group-head">
-              <h3>Setup</h3>
-              <p class="group-desc">
-                Define the experiment environment — what data is fed into the
-                simulation. These bound the analysis but aren't varied by the
-                optimiser.
-              </p>
-            </div>
-            <div class="controls-grid" id="l3-setup-params"></div>
-          </div>
-
           <div class="param-group market">
             <div class="group-head">
-              <h3>Market parameters <span class="badge">optimised</span></h3>
+              <h3>DA withhold on low prices <span class="badge">optimised</span></h3>
               <p class="group-desc">
-                The L2 strategy levers — DA withholding, ID-forecast trust,
-                mFRR↔aFRR per-direction split. The "Optimise market" button
-                sweeps over these while holding the oversell strategy fixed
-                at its current values.
+                When DA clears at or below price threshold X, hold back fraction
+                Y of the forecast from DA and offer it to balancing instead.
+                Above X, sell the full forecast to DA as usual.
               </p>
             </div>
-            <div class="controls-grid" id="l3-market-params"></div>
-            <div class="actions">
-              <button id="l3-optimise" class="btn primary">⚡ Optimise market</button>
-              <button id="l3-reset" class="btn">⇄ Reset to naïve</button>
-              <span id="l3-progress" class="progress"></span>
-            </div>
+            <div class="controls-grid" id="l3-da-withhold-params"></div>
           </div>
+        </div>
 
+        <div class="controls-card">
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>mFRR ↔ aFRR universal offer split <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Per-direction routing of balancing volume between mFRR and aFRR.
+                Independent ratios for upward (s_up) and downward (s_dn) because
+                the two markets price each direction differently.
+              </p>
+            </div>
+            <div class="controls-grid" id="l3-split-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card">
+          <div class="param-group market">
+            <div class="group-head">
+              <h3>ID trust coefficient <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                How much of the intra-day forecast revision (ID − DA) to act on
+                as additional mFRR-up volume. Negative revisions are not acted on
+                (no buy-back modelled).
+              </p>
+            </div>
+            <div class="controls-grid" id="l3-id-trust-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card">
           <div class="param-group oversell">
             <div class="group-head">
               <h3>Intra-day oversell <span class="badge">optimised</span></h3>
@@ -400,19 +432,21 @@
                 publication lag L (default 4 ISPs ≈ 1 h) models the fact
                 that an intra-day trader cannot see settlement prices of
                 the ISPs immediately preceding the target. Set X_cap = 0
-                to disable S3 and revert L3 to L2 behaviour. The
-                "Optimise oversell" button sweeps 4 S3 params (K, S_min,
-                σ_max, M) while holding market params, L, and X_cap
-                fixed — X_cap stays at the user-set value because the
-                backtest has no price-impact term and a sweep would
-                always pick the grid boundary.
+                to disable S3 and revert L3 to L2 behaviour. The single
+                Optimise button at the bottom sweeps K, S_min, σ_max and
+                M jointly with the market params — X_cap, L and DA-skip
+                stay at their user-set values.
               </p>
             </div>
             <div class="controls-grid" id="l3-oversell-params"></div>
-            <div class="actions">
-              <button id="l3-optimise-oversell" class="btn primary">⚡ Optimise oversell</button>
-              <span id="l3-progress-oversell" class="progress"></span>
-            </div>
+          </div>
+        </div>
+
+        <div class="controls-card actions-card">
+          <div class="actions">
+            <button id="l3-optimise" class="btn primary">⚡ Optimise</button>
+            <button id="l3-reset" class="btn">⇄ Reset to naïve</button>
+            <span id="l3-progress" class="progress"></span>
           </div>
         </div>
 
@@ -522,23 +556,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h2>Optimisation surface</h2>
-            <div>
-              <label>Heatmap pair:
-                <select id="l3-heatmap-pair">
-                  <option value="XY">X × Y (at current Z)</option>
-                  <option value="XZ">X × Z (at current Y)</option>
-                  <option value="YZ">Y × Z (at current X)</option>
-                </select>
-              </label>
-              <button id="l3-show-heatmap" class="btn">Compute heatmap</button>
-              <span id="l3-heatmap-progress" class="progress"></span>
-            </div>
-          </div>
-          <div id="l3-heatmap" class="chart"></div>
-        </div>
       </section>
     </main>
 
@@ -555,7 +572,7 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="data.js?v=30"></script>
+    <script src="data.js?v=34"></script>
     <!--
       data-afrr.js: per-ISP aFRR activation counts (n_pos, n_neg, n_total).
       Engine reads n_pos / n_neg to scale aFRR position contribution
@@ -565,10 +582,10 @@
       mFRR↔aFRR split parameter s < 1. Both files are gracefully optional
       — engine.js falls back to zero arrays if either is missing.
     -->
-    <script src="data-afrr.js?v=30"></script>
-    <script src="data-afrr-15min.js?v=30"></script>
-    <script src="engine.js?v=30"></script>
-    <script src="charts.js?v=30"></script>
-    <script src="app.js?v=30"></script>
+    <script src="data-afrr.js?v=34"></script>
+    <script src="data-afrr-15min.js?v=34"></script>
+    <script src="engine.js?v=34"></script>
+    <script src="charts.js?v=34"></script>
+    <script src="app.js?v=34"></script>
   </body>
 </html>

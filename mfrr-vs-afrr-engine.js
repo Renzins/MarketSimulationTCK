@@ -11,7 +11,7 @@
 //   afrrNegSpread[i] = avg_p_neg_raw[i] − p_da[i]           (only when avg_p_neg < 0; else NaN)
 //
 // Raw mFRR is used (not winsorized) because the agreement question is
-// about ALL clearings — capping outliers at the 10/90 percentile would
+// about ALL clearings — capping outliers at the 5/95 percentile would
 // distort the sign-agreement counts.
 //
 // DIRECTION CLASSIFICATION
@@ -276,7 +276,7 @@ const MfrrAfrrEngine = (() => {
   //   npos = mFRR − / aFRR +                      (disagreement)
   //
   // Spreads are CLIPPED to the winsor bounds before sign-checking. With
-  // mild winsorization (default 10/90) this rarely flips a sign; with
+  // mild winsorization (default 5/95) this rarely flips a sign; with
   // aggressive winsorization (e.g. 25/75 where the lower bound lands above
   // zero) it can flip negative values to positive — that's the user's
   // explicit choice and matches the rest of the codebase's convention.
