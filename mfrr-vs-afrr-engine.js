@@ -482,6 +482,27 @@ const MfrrAfrrEngine = (() => {
   // requested direction and tally the 2×2 sign×sign matrix between mFRR
   // spread (broadcast from each entry's ISP) and aFRR spread (per entry,
   // = spread_x10 / 10).
+  // "Near-DA" band: both prices are within ±10% of DA (or, equivalently,
+  // 0.9·|DA| ≤ |price − 0| relative). Captures the user's false-disagreement
+  // example: DA=100, aFRR=101, mFRR=99 — strictly the signs of the two
+  // spreads disagree, but both prices are essentially AT DA, so it would
+  // be misleading to bucket them as "mFRR− / aFRR+". The "near" category
+  // collects those cases. Uses absolute-difference test so it also handles
+  // negative-p_da rows symmetrically.
+  function _isNearDa(price, p_da) {
+    return Math.abs(price - p_da) <= 0.1 * Math.abs(p_da);
+  }
+
+  // Counts for the slot-level sign-agreement chart. Now SIX buckets:
+  //   ppos, pneg, npos, nneg — strict sign-comparison (excluding near-DA)
+  //   near_da               — BOTH prices within ±10% of DA (band)
+  //   na                    — aFRR direction not activated in that 4-s slot
+  //                            (AST_POS or AST_NEG was null upstream)
+  //
+  // The `na` count is derived from AFRR_DATA (per-ISP n_total − n_dir),
+  // since AFRR_PRICES only contains *active* slot entries. All NA slots
+  // in a given ISP share the same p_mfrr/p_da, so we don't need per-slot
+  // info — just count slots and use the per-ISP mFRR.
   function slotLevelSignAgreement(direction) {
     if (!isSlotDataLoaded()) return null;
     const win = Engine.getWindow();
@@ -492,21 +513,81 @@ const MfrrAfrrEngine = (() => {
     const kStart = direction === "neg" ? AFRR_PRICES.n_pos_entries : 0;
     const kEnd =
       direction === "neg" ? AFRR_PRICES.n_entries : AFRR_PRICES.n_pos_entries;
-    const c = { ppos: 0, pneg: 0, npos: 0, nneg: 0 };
+    const c = { ppos: 0, pneg: 0, npos: 0, nneg: 0, near_da: 0, na: 0 };
+    // Pass 1 — active slots from AFRR_PRICES.
     for (let k = kStart; k < kEnd; k++) {
       const i = isp[k];
       if (i < win.start || i >= win.end) continue;
       if (!_acceptsDay(i)) continue;
       const pmf = D.p_mfrr_raw[i];
       if (isNaN(pmf)) continue;
-      const ms = _clip(pmf - D.p_da[i], mB);
+      const pda = D.p_da[i];
+      const ast = pda + sp[k] * 0.1; // recover AST_{POS|NEG} from spread
+      // "near DA" gate triggers ONLY when BOTH prices sit in the ±10% band.
+      // Otherwise fall through to the strict sign comparison so the chart
+      // still surfaces genuine market disagreements.
+      const mfrrNear = _isNearDa(pmf, pda);
+      const astNear = _isNearDa(ast, pda);
+      if (mfrrNear && astNear) {
+        c.near_da++;
+        continue;
+      }
+      const ms = _clip(pmf - pda, mB);
       const as = _clip(sp[k] * 0.1, aB);
       if (ms >= 0 && as >= 0) c.ppos++;
       else if (ms >= 0 && as < 0) c.pneg++;
       else if (ms < 0 && as >= 0) c.npos++;
       else c.nneg++;
     }
-    return { counts: c, total: c.ppos + c.pneg + c.npos + c.nneg };
+    // Pass 2 — NA slots, summed per-ISP. Use AFRR_DATA's n_total / n_pos /
+    // n_neg counts (per-ISP; total non-null 4-s rows and per-direction
+    // active counts). NA count for the requested direction = n_total - n_dir.
+    if (D.afrr_n_total && (D.afrr_n_pos || D.afrr_n_neg)) {
+      const nTotal = D.afrr_n_total;
+      const nActive = direction === "neg" ? D.afrr_n_neg : D.afrr_n_pos;
+      for (let i = win.start; i < win.end; i++) {
+        if (!_acceptsDay(i)) continue;
+        const naCount = (nTotal[i] | 0) - (nActive[i] | 0);
+        if (naCount <= 0) continue;
+        const pmf = D.p_mfrr_raw[i];
+        if (isNaN(pmf)) continue;
+        c.na += naCount;
+      }
+    }
+    const total = c.ppos + c.pneg + c.npos + c.nneg + c.near_da + c.na;
+    return { counts: c, total };
+  }
+
+  // Distribution of mFRR's sign-vs-DA, restricted to 4-s slots where the
+  // requested aFRR direction was N/A. Same per-ISP broadcast trick: every
+  // NA slot in an ISP inherits the ISP's p_mfrr / p_da. Buckets are three
+  // categorical bins (up / near DA / down) using the same ±10% band as
+  // the sign-agreement chart, so a slot where mFRR cleared essentially
+  // at DA doesn't get arbitrarily lumped into "up" or "down".
+  function mfrrSignWhenAfrrNa(direction) {
+    if (!isSlotDataLoaded()) return null;
+    if (!D.afrr_n_total || !(D.afrr_n_pos || D.afrr_n_neg)) return null;
+    const win = Engine.getWindow();
+    const mB = _getMfrrBounds();
+    const nTotal = D.afrr_n_total;
+    const nActive = direction === "neg" ? D.afrr_n_neg : D.afrr_n_pos;
+    const c = { up: 0, near: 0, down: 0 };
+    for (let i = win.start; i < win.end; i++) {
+      if (!_acceptsDay(i)) continue;
+      const naCount = (nTotal[i] | 0) - (nActive[i] | 0);
+      if (naCount <= 0) continue;
+      const pmf = D.p_mfrr_raw[i];
+      if (isNaN(pmf)) continue;
+      const pda = D.p_da[i];
+      if (_isNearDa(pmf, pda)) {
+        c.near += naCount;
+        continue;
+      }
+      const ms = _clip(pmf - pda, mB);
+      if (ms >= 0) c.up += naCount;
+      else c.down += naCount;
+    }
+    return { counts: c, total: c.up + c.near + c.down };
   }
 
   // Scatter of (mFRR spread broadcast, aFRR spread) at slot level for
@@ -549,6 +630,7 @@ const MfrrAfrrEngine = (() => {
     }
     return { x: xs, y: ys, n: nValid, subsampled: stride > 1 };
   }
+
 
   // Combined slot-level stats. Single pass over AFRR_PRICES entries
   // (~8.5M) plus one pass over ISPs in the window (for total-slot count
@@ -664,6 +746,7 @@ const MfrrAfrrEngine = (() => {
     slotLevelSignAgreement,
     slotLevelScatter,
     slotLevelStats,
+    mfrrSignWhenAfrrNa,
   };
 })();
 

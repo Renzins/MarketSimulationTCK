@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Graphs</title>
-    <link rel="stylesheet" href="style.css?v=19" />
+    <link rel="stylesheet" href="style.css?v=25" />
   </head>
   <body>
     <nav class="site-nav">
@@ -419,20 +419,53 @@
             <h2>Sign agreement of the DA-spread</h2>
           </div>
           <p class="card-desc">
-            For each ISP where both spreads are defined, we record the
-            sign of <em>mFRR spread</em> (= p_mfrr − p_da) and the sign of
-            <em>aFRR spread</em> (= avg_p_pos − p_da on the left chart,
-            avg_p_neg − p_da on the right). Four mutually-exclusive
-            buckets: both positive (markets above DA → upward signal),
-            both negative (below DA → downward signal), or mixed.
-            <strong>Caveat:</strong> aFRR-down spread is structurally
-            ≤ 0 (since avg_p_neg ≤ 0 and p_da is usually positive), so
-            the right-hand chart is heavily dominated by "both negative"
-            — informative for verifying that, less so for new insight.
+            For each 4-s aFRR slot where the directional clearing is
+            defined, we record the sign of <em>mFRR spread</em>
+            (= p_mfrr − p_da, broadcast from the encompassing ISP) and
+            the sign of <em>aFRR spread</em> (= AST_POS − p_da on the
+            left chart, AST_NEG − p_da on the right). Four
+            mutually-exclusive buckets: both positive (both markets
+            above DA → upward signal), both negative (below DA →
+            downward signal), or mixed.
+            <strong>Note on data:</strong> these slot-level charts use
+            the <em>raw</em> per-4-s AST_POS / AST_NEG clearings — the
+            favourable-only filter (which drops unfavourable slots) is
+            applied only in the L3 P&L backtest, not here. So
+            "aFRR-down" can land in any of the four buckets, including
+            <em>both positive</em> (this happens when AST_NEG itself
+            cleared above DA — the system priced curtailment at a level
+            the wind park wouldn't bid into for profit, but the market
+            still cleared there). During the brief window where the
+            page falls back to per-ISP averages (while the chunked 4-s
+            file is still loading), the favourable-filtered values DO
+            force the right chart into "both negative" — that fallback
+            distribution is not market truth.
           </p>
           <div class="two-col">
             <div id="g-cmp-sign-pos" class="chart"></div>
             <div id="g-cmp-sign-neg" class="chart"></div>
+          </div>
+        </div>
+
+        <!-- ===== mFRR / DA spread when aFRR is N/A ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>mFRR / DA spread when aFRR is N/A</h2>
+          </div>
+          <p class="card-desc">
+            For 4-s slots where the corresponding aFRR direction was
+            <em>not activated</em> (the AST_{POS,NEG} field was null
+            upstream), the sign-agreement chart above can't compare two
+            spreads — there's only the mFRR price. These charts show how
+            mFRR positioned itself vs DA in those silent-aFRR slots:
+            above DA (green), near DA within ±10% (yellow), or below DA
+            (red). Together with the gray N/A slice in the chart above,
+            they answer: "when aFRR didn't fire, was mFRR signalling
+            anything?"
+          </p>
+          <div class="two-col">
+            <div id="g-cmp-sign-na-pos" class="chart"></div>
+            <div id="g-cmp-sign-na-neg" class="chart"></div>
           </div>
         </div>
 
@@ -453,6 +486,7 @@
             <div id="g-cmp-scatter-neg" class="chart"></div>
           </div>
         </div>
+
       </section>
     </main>
 
@@ -476,22 +510,22 @@
       a console.info in that case but keeps working.
     -->
     <script src="https://cdn.jsdelivr.net/npm/date-holidays@3.28.0/dist/umd.min.js"></script>
-    <script src="data.js?v=19"></script>
-    <script src="data-afrr.js?v=19"></script>
+    <script src="data.js?v=25"></script>
+    <script src="data-afrr.js?v=25"></script>
     <!--
       data-afrr-15min.js: per-ISP averaged AST_POS / AST_NEG (NaN→0, ÷225)
       from preprocess-afrr-15min.py. Engine.init wraps it into typed arrays;
       Graphs page doesn't currently use these prices but engine.js reads
       them up front so the Backtester and Graphs share one engine init path.
     -->
-    <script src="data-afrr-15min.js?v=19"></script>
-    <script src="engine.js?v=19"></script>
-    <script src="graphs-engine.js?v=19"></script>
-    <script src="graphs-charts.js?v=19"></script>
-    <script src="afrr-engine.js?v=19"></script>
-    <script src="afrr-charts.js?v=19"></script>
-    <script src="afrr-spread-engine.js?v=19"></script>
-    <script src="mfrr-vs-afrr-engine.js?v=19"></script>
-    <script src="graphs-app.js?v=19"></script>
+    <script src="data-afrr-15min.js?v=25"></script>
+    <script src="engine.js?v=25"></script>
+    <script src="graphs-engine.js?v=25"></script>
+    <script src="graphs-charts.js?v=25"></script>
+    <script src="afrr-engine.js?v=25"></script>
+    <script src="afrr-charts.js?v=25"></script>
+    <script src="afrr-spread-engine.js?v=25"></script>
+    <script src="mfrr-vs-afrr-engine.js?v=25"></script>
+    <script src="graphs-app.js?v=25"></script>
   </body>
 </html>

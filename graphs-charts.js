@@ -230,10 +230,25 @@ const GraphsCharts = (() => {
           "Wind: %{x}<br>Solar: %{y}<br>Median spread: %{z:.1f} EUR/MWh<extra></extra>",
       },
     ];
+    // The y-axis bin labels are long ranges like "320–727 MW" or ">1,101 MW"
+    // that don't fit inside the default 60 px left margin — they were
+    // overrunning the rotated "Solar DA Forecast (MW)" axis title and
+    // getting visually clipped. Widen the left margin and use `automargin`
+    // + `standoff` so the title sits well clear of the tick labels at any
+    // chart width.
     const layout = Object.assign({}, LAYOUT, {
       title: { text: title, font: { size: 14, color: "#e6edf3" } },
-      xaxis: { ...LAYOUT.xaxis, title: "Wind DA Forecast (MW)" },
-      yaxis: { ...LAYOUT.yaxis, title: "Solar DA Forecast (MW)" },
+      margin: { t: 50, r: 18, b: 70, l: 140 },
+      xaxis: {
+        ...LAYOUT.xaxis,
+        title: { text: "Wind DA Forecast (MW)", standoff: 12 },
+        automargin: true,
+      },
+      yaxis: {
+        ...LAYOUT.yaxis,
+        title: { text: "Solar DA Forecast (MW)", standoff: 18 },
+        automargin: true,
+      },
       annotations,
     });
     Plotly.react(targetId, traces, layout, CFG);

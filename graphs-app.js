@@ -1369,9 +1369,15 @@
     Plotly.react(targetId, traces, layout, CMP_CFG);
   }
 
-  // Sign-agreement bar: 4 segments, one stack.
-  // Colour code: agreement greens, disagreement reds (matches the rest
-  // of the site's palette).
+  // Sign-agreement bar: 6 segments, one stack. Colours:
+  //   green   = both above DA (genuine upward agreement)
+  //   red     = both below DA (genuine downward agreement)
+  //   orange  = mFRR+ / aFRR− (disagreement, mFRR-up biased)
+  //   purple  = mFRR− / aFRR+ (disagreement, mFRR-dn biased)
+  //   yellow  = "near DA" — both prices within ±10% of DA, signs misleading
+  //   gray    = N/A — that aFRR direction didn't activate for this 4-s slot
+  // The "near DA" bucket dedupes the user's example case (DA=100, aFRR=101,
+  // mFRR=99: strict signs disagree, but both prices are essentially at DA).
   function drawCmpSignBar(targetId, result, title, subtitle) {
     const { counts, total } = result;
     const tot = total || 1;
@@ -1380,6 +1386,8 @@
       ["mFRR+ / aFRR− (disagree)", "#f0883e", counts.pneg],
       ["mFRR− / aFRR+ (disagree)", "#bc8cff", counts.npos],
       ["Both NEG (agree, mkts below DA)", "#f85149", counts.nneg],
+      ["Both near DA (±10%, signs not meaningful)", "#ffd166", counts.near_da || 0],
+      ["aFRR N/A (direction not activated)", "#7d8590", counts.na || 0],
     ];
     const traces = segs.map(([name, colour, n]) => ({
       type: "bar",
@@ -1389,7 +1397,7 @@
       customdata: [[n, tot]],
       marker: { color: colour, line: { color: "#0d1117", width: 1 } },
       hovertemplate:
-        `<b>${name}</b><br>%{y:.2f}%<br>%{customdata[0]:,} / %{customdata[1]:,} ISPs<extra></extra>`,
+        `<b>${name}</b><br>%{y:.2f}%<br>%{customdata[0]:,} / %{customdata[1]:,} slots<extra></extra>`,
     }));
     const annotations = [];
     let cum = 0;
@@ -1417,6 +1425,71 @@
       yaxis: {
         ...CMP_LAYOUT.yaxis,
         title: "% of ISPs",
+        range: [0, 100],
+        ticksuffix: "%",
+      },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "category", showticklabels: false },
+      annotations,
+      legend: {
+        orientation: "h",
+        x: 0,
+        y: -0.2,
+        bgcolor: "rgba(0,0,0,0)",
+        font: { color: "#e6edf3", size: 11 },
+      },
+      showlegend: true,
+    });
+    Plotly.react(targetId, traces, layout, CMP_CFG);
+  }
+
+  // Single-direction (mFRR-only) sign bar — used for the "mFRR / DA spread
+  // when aFRR is N/A" charts. 3 categorical buckets: mFRR above DA, mFRR
+  // near DA (±10% band), mFRR below DA. Stacks to 100%. Same colour
+  // language as the 6-bar chart (green / yellow / red).
+  function drawCmpMfrrOnlyBar(targetId, result, title, subtitle) {
+    const { counts, total } = result;
+    const tot = total || 1;
+    const segs = [
+      ["mFRR above DA", "#3fb950", counts.up],
+      ["mFRR near DA (±10%)", "#ffd166", counts.near],
+      ["mFRR below DA", "#f85149", counts.down],
+    ];
+    const traces = segs.map(([name, colour, n]) => ({
+      type: "bar",
+      name,
+      x: ["mfrr"],
+      y: [(n / tot) * 100],
+      customdata: [[n, tot]],
+      marker: { color: colour, line: { color: "#0d1117", width: 1 } },
+      hovertemplate:
+        `<b>${name}</b><br>%{y:.2f}%<br>%{customdata[0]:,} / %{customdata[1]:,} slots<extra></extra>`,
+    }));
+    const annotations = [];
+    let cum = 0;
+    for (const [, , n] of segs) {
+      const pct = (n / tot) * 100;
+      if (pct >= 4) {
+        annotations.push({
+          x: "mfrr",
+          y: cum + pct / 2,
+          xref: "x",
+          yref: "y",
+          text: `<b>${pct.toFixed(1)}%</b>`,
+          showarrow: false,
+          font: { color: "#0d1117", size: 13 },
+        });
+      }
+      cum += pct;
+    }
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: {
+        text: `${title}<br><span style="font-size:11px;color:#9aa5b1">${subtitle} · n = ${tot.toLocaleString("en-US")}</span>`,
+        font: { size: 14, color: "#e6edf3" },
+      },
+      barmode: "stack",
+      yaxis: {
+        ...CMP_LAYOUT.yaxis,
+        title: "% of slots",
         range: [0, 100],
         ticksuffix: "%",
       },
@@ -1671,6 +1744,18 @@
           MfrrAfrrEngine.slotLevelSignAgreement("neg"),
           "Sign agreement — aFRR NEG slots",
           "Per 4-s NEG slot: sign(p_mfrr − p_da) vs sign(AST_NEG − p_da)",
+        );
+        drawCmpMfrrOnlyBar(
+          "g-cmp-sign-na-pos",
+          MfrrAfrrEngine.mfrrSignWhenAfrrNa("pos"),
+          "mFRR sign vs DA — when aFRR POS was N/A",
+          "4-s slots where AST_POS was null (POS direction idle)",
+        );
+        drawCmpMfrrOnlyBar(
+          "g-cmp-sign-na-neg",
+          MfrrAfrrEngine.mfrrSignWhenAfrrNa("neg"),
+          "mFRR sign vs DA — when aFRR NEG was N/A",
+          "4-s slots where AST_NEG was null (NEG direction idle)",
         );
         drawCmpScatter(
           "g-cmp-scatter-pos",
