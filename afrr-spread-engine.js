@@ -216,6 +216,15 @@ const AfrrSpreadEngine = (() => {
   // --------- box-plot stats (re-implementation matching graphs-engine.js) -
   // Accepts a Float32Array (sorted in place — caller must not reuse afterwards)
   // or any array-like (which is copied into a Float32Array first).
+  // Cap outliers rendered per box. Plotly draws each retained outlier as
+  // a scatter dot and hit-tests against all of them on hover; with the
+  // 5/95 winsor and aFRR's fat tails we saw 2.2 M total outliers across
+  // the page (≈ 600 k per matched-panel chart) which froze hover and
+  // triggered "Page Unresponsive" dialogs. 300 evenly-strided outliers
+  // preserve the visual tail without the hit-test cost. Total bounded
+  // at ~30 k points across the page.
+  const MAX_OUTLIERS_PER_BOX = 300;
+
   function boxStats(values) {
     if (values.length === 0) {
       return {
@@ -239,15 +248,21 @@ const AfrrSpreadEngine = (() => {
     const lowFence = q1 - 1.5 * iqr;
     const highFence = q3 + 1.5 * iqr;
     let whiskerLow = q1, whiskerHigh = q3;
-    const outliers = [];
+    const allOutliers = [];
     for (let i = 0; i < n; i++) {
       const v = arr[i];
-      if (v < lowFence || v > highFence) outliers.push(v);
+      if (v < lowFence || v > highFence) allOutliers.push(v);
       else {
         if (v < whiskerLow) whiskerLow = v;
         if (v > whiskerHigh) whiskerHigh = v;
       }
     }
+    // Subsample if more than the cap. Stride-based + sorted input → kept
+    // points span the full tail (first kept = min outlier, last = max).
+    const outliers =
+      allOutliers.length > MAX_OUTLIERS_PER_BOX
+        ? _strideSubsample(allOutliers, MAX_OUTLIERS_PER_BOX)
+        : allOutliers;
     let sum = 0;
     for (let i = 0; i < n; i++) sum += arr[i];
     const mean = sum / n;
@@ -258,6 +273,19 @@ const AfrrSpreadEngine = (() => {
     }
     const std = n > 1 ? Math.sqrt(varSum / (n - 1)) : 0;
     return { min: whiskerLow, q1, median, q3, max: whiskerHigh, mean, std, n, outliers };
+  }
+
+  // Deterministic stride subsample. Input must be sorted ascending; the
+  // first kept point is the minimum, the last is the maximum, so the tail
+  // tips are always preserved.
+  function _strideSubsample(sorted, target) {
+    const n = sorted.length;
+    if (n <= target) return sorted;
+    const out = new Array(target);
+    for (let i = 0; i < target; i++) {
+      out[i] = sorted[Math.round((i * (n - 1)) / (target - 1))];
+    }
+    return out;
   }
 
   // --------- quantile edges, mirrored from graphs-engine.js ---------------

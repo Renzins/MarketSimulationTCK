@@ -871,7 +871,36 @@
   // Yield to the event loop so the browser can paint between charts. Keeps
   // each main-thread task short enough that the "page unresponsive" dialog
   // never triggers.
-  const _yieldUI = () => new Promise((r) => setTimeout(r, 0));
+  //
+  // Uses MessageChannel.postMessage instead of setTimeout(r, 0). The
+  // setTimeout-based primitive used to be ~0–4 ms per call in a foreground
+  // tab, but in headless / background / throttled contexts the HTML spec's
+  // 4 ms nesting clamp compounds with browser-specific throttling — we've
+  // measured > 600 ms per setTimeout(0) yield in the preview server's
+  // browser, which made the 12-yield matched-by-DA recompute take 53 s
+  // instead of the ~3 s of actual compute. MessageChannel posts go onto
+  // the macrotask queue without that clamp (~0.01 ms / yield measured),
+  // so the bar progresses smoothly without the recompute appearing
+  // "stuck". Same pattern as app.js's optimiser yields.
+  const _yieldChannel =
+    typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+  let _yieldResolve = null;
+  if (_yieldChannel) {
+    _yieldChannel.port1.onmessage = () => {
+      const r = _yieldResolve;
+      _yieldResolve = null;
+      if (r) r();
+    };
+  }
+  const _yieldUI = () => {
+    if (_yieldChannel) {
+      return new Promise((r) => {
+        _yieldResolve = r;
+        _yieldChannel.port2.postMessage(null);
+      });
+    }
+    return new Promise((r) => setTimeout(r, 0));
+  };
 
   async function _runAfrrUpdate() {
     const t0 = performance.now();
@@ -1914,9 +1943,17 @@
       // Re-pin the engine window to whichever tab we just activated
       if (section === "afrr") {
         scheduleAfrrUpdate();
-        // Kick off the lazy load of the 86 MB price file in the background.
-        // Safe to call repeatedly — early-returns if already loaded/loading.
-        loadAfrrPriceData();
+        // Only kick the 86 MB price file load if it hasn't been loaded yet.
+        // If it IS already loaded, scheduleAfrrUpdate → updateAfr's chain
+        // handles refreshing the price charts. Calling loadAfrrPriceData()
+        // unconditionally here would cause it to also call
+        // updateAfrrPriceCharts() concurrently with updateAfr's chain;
+        // the do-while inside updateAfrrPriceCharts would then schedule
+        // a redundant second pass (the first call's _pending flag gets
+        // set during the run, triggering an immediate re-run with the
+        // same params). Skipping the redundant call halves wall time on
+        // tab switches after the file is loaded.
+        if (!afrrState.pricesLoaded) loadAfrrPriceData();
       } else if (section === "compare") {
         scheduleCmpUpdate();
       } else {

@@ -200,6 +200,13 @@ const GraphsEngine = (() => {
   // Returns { min, q1, median, q3, max, mean, std, n, outliers }.
   // Outliers = values outside [q1-1.5*IQR, q3+1.5*IQR]. min/max are the
   // whisker limits (closest non-outlier values to q1/q3).
+  // Cap outliers rendered per box. Plotly draws each retained outlier as
+  // a scatter dot and hit-tests against all of them on hover; thousands
+  // per box × dozens of boxes freezes the page. 300 evenly-strided
+  // outliers preserve the visual distribution of the tail without the
+  // hover cost. Total cost across the page bounded at ~30 k points.
+  const MAX_OUTLIERS_PER_BOX = 300;
+
   function boxStats(values) {
     if (values.length === 0) {
       return { min: 0, q1: 0, median: 0, q3: 0, max: 0, mean: 0, std: 0, n: 0, outliers: [] };
@@ -222,15 +229,21 @@ const GraphsEngine = (() => {
     const highFence = q3 + 1.5 * iqr;
     let whiskerLow = q1;
     let whiskerHigh = q3;
-    const outliers = [];
+    const allOutliers = [];
     for (let i = 0; i < n; i++) {
       const v = arr[i];
-      if (v < lowFence || v > highFence) outliers.push(v);
+      if (v < lowFence || v > highFence) allOutliers.push(v);
       else {
         if (v < whiskerLow) whiskerLow = v;
         if (v > whiskerHigh) whiskerHigh = v;
       }
     }
+    // Subsample outliers if too many (deterministic stride keeps the
+    // extremes; arr is sorted so first/last outliers are the tail tips).
+    const outliers =
+      allOutliers.length > MAX_OUTLIERS_PER_BOX
+        ? _strideSubsample(allOutliers, MAX_OUTLIERS_PER_BOX)
+        : allOutliers;
     let sum = 0;
     for (let i = 0; i < n; i++) sum += arr[i];
     const mean = sum / n;
@@ -241,6 +254,18 @@ const GraphsEngine = (() => {
     }
     const std = n > 1 ? Math.sqrt(varSum / (n - 1)) : 0;
     return { min: whiskerLow, q1, median, q3, max: whiskerHigh, mean, std, n, outliers };
+  }
+
+  // Deterministic stride subsample that always keeps the first and last
+  // element (the tail extremes). Input must be sorted.
+  function _strideSubsample(sorted, target) {
+    const n = sorted.length;
+    if (n <= target) return sorted;
+    const out = new Array(target);
+    for (let i = 0; i < target; i++) {
+      out[i] = sorted[Math.round((i * (n - 1)) / (target - 1))];
+    }
+    return out;
   }
 
   // ---------- spread by 1-D buckets (graphs 1-4) ------------------------
