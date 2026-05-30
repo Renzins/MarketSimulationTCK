@@ -24,6 +24,29 @@ data files being present so the suite still passes on a stripped repo.
        flat + s3_extra_cost decomp ≡ short·(p_imb+θ) when hedge bid misses;
        NaN p_imb zeroes all 3 imbalance terms; L3 frozen default value.
 
+POST-REWORK NOTE — engine.js API change
+=======================================
+The JS engine no longer takes a `level` argument. Behaviour is now
+expressed via two source selectors and per-strategy enable flags:
+
+  Legacy engine call               ≡  New engine call
+  -------------------------------     ------------------------------------
+  simulate(1, params)                 simulate({...params,
+                                        actualSource: 'da', idSource: 'da',
+                                        enabled: {..., s3: false}})
+  simulate(2, params)                 simulate({...params,
+                                        actualSource: 'real', idSource: 'real',
+                                        enabled: {..., s3: false}})
+  simulate(3, params)                 simulate({...params,
+                                        actualSource: 'real', idSource: 'real',
+                                        enabled: {..., s3: true}})
+
+The Python mirror in this file still takes `level: int` (1/2/3) since
+it is structured around the math, not the JS API. The math is
+unchanged — so the frozen regression values below still hold without
+needing to recompute. Treat `level` here as a private flag that
+selects the equivalent legacy configuration of the new engine.
+
   C. SPEC EXAMPLES (the two from the original brief)
      - Example 1: F=20, X=10, Y=0.5, ID=18, Z=0.5, P_mfrr=50, Q_pot=12, P_imb=200, θ=30 → −322.5 €
      - Example 2: F=20, X=10, P_da=100 (above X), Q_pot=10, P_imb=20, θ=30 → +375.0 €

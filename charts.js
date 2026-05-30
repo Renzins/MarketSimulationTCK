@@ -190,6 +190,23 @@ const Charts = (() => {
       params && params.s_up != null ? Math.max(0, Math.min(1, params.s_up)) : 1;
     const sDnParam =
       params && params.s_dn != null ? Math.max(0, Math.min(1, params.s_dn)) : 1;
+    // Q_pot tracks the engine's actualSource selector: DA forecast / ID
+    // forecast / real generation. Keeps the chart's "potential" line and
+    // shortfall arithmetic in lockstep with what simulate() actually used.
+    const actualSource = (params && params.actualSource) || "real";
+    const qPotArr =
+      actualSource === "da"
+        ? D.da_forecast
+        : actualSource === "id"
+          ? D.id_forecast
+          : D.q_pot;
+    // ID forecast line also tracks the engine's idSource selector:
+    // "da" → ID == DA forecast (line overlaps DA-sold); "real" → SciPHER
+    // intra-day P50. Without this the chart would always show the real ID
+    // curve even when the engine isn't using it — confusing because the
+    // ID-trust strategy can't fire if ID = F.
+    const idSource = (params && params.idSource) || "real";
+    const idArr = idSource === "da" ? D.da_forecast : D.id_forecast;
     for (let k = 0; k < N; k++) {
       const i = clampedStart + k; // global ISP index
       const k_p = i - winStart; // perISP-array index
@@ -222,9 +239,9 @@ const Charts = (() => {
       s3Curtail[k] = -(simResult.perISP.Q_s3_curtail
         ? simResult.perISP.Q_s3_curtail[k_p]
         : 0);
-      pot[k] = D.q_pot[i];
+      pot[k] = qPotArr[i];
       f_arr[k] = D.da_forecast[i];
-      id_arr[k] = D.id_forecast[i];
+      id_arr[k] = idArr[i];
       pda_arr[k] = D.p_da[i];
       pmfrr_arr[k] = D.p_mfrr[i];
       pimb_arr[k] = D.p_imb[i];
@@ -575,6 +592,19 @@ const Charts = (() => {
           },
           hoverinfo: "skip",
         },
+        // Intra-day forecast — dotted purple line. Always shown so the
+        // chart conveys the real ID curve even when idSource = "DA"
+        // makes the engine ignore it. Q_pot is pushed afterwards so it
+        // draws on top.
+        {
+          x: ts,
+          y: id_arr,
+          type: "scatter",
+          mode: "lines",
+          name: "ID forecast (MW)",
+          line: { color: "#bc8cff", dash: "dot", width: 1.5 },
+          hoverinfo: "skip",
+        },
       ];
       if (level >= 2) {
         traces.push({
@@ -667,6 +697,17 @@ const Charts = (() => {
           line: { color: "#f85149", width: 1.2, dash: "longdashdot" },
           fill: "tozeroy",
           fillcolor: "rgba(248,81,73,0.30)",
+          hoverinfo: "skip",
+        },
+        // Intra-day forecast — dotted purple line, scattergl variant.
+        // Same trace-order rationale as the bar-mode block above.
+        {
+          x: ts,
+          y: id_arr,
+          type: "scattergl",
+          mode: "lines",
+          name: "ID forecast (MW)",
+          line: { color: "#bc8cff", dash: "dot", width: 1.0 },
           hoverinfo: "skip",
         },
       ];

@@ -276,9 +276,139 @@ main {
   margin-right: 6px;
 }
 
-.param-group.market .group-head h3::before {
-  content: "📈";
+/* ---------- Strategy toggle (checkbox replaces the old 📈 icon) ----------
+   The checkbox lives inside .group-head and controls whether the engine
+   uses this strategy. Unchecked → .controls-card gains .disabled which
+   greys the card and disables pointer events on its inner controls.
+   The checkbox itself stays clickable (it's outside .controls-grid).      */
+.strategy-toggle {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
   margin-right: 6px;
+  vertical-align: middle;
+}
+
+.strategy-toggle input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.strategy-toggle input[type="checkbox"]:hover {
+  border-color: var(--accent);
+}
+
+.strategy-toggle input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.strategy-toggle input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0px;
+  width: 5px;
+  height: 10px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+/* The .strategy-toggle-box span is reserved for future label text next to
+   the box; currently only the checkbox is visible. */
+.strategy-toggle-box {
+  display: none;
+}
+
+/* Card-level grey-out when the strategy is disabled. The .group-head
+   stays interactive (so the user can re-enable) — only the controls
+   grid is pointer-event-blocked and visually dimmed.                    */
+.controls-card.disabled .controls-grid,
+.controls-card.disabled .group-desc {
+  opacity: 0.4;
+  pointer-events: none;
+  user-select: none;
+}
+
+.controls-card.disabled .group-head h3 {
+  color: var(--text-dim);
+}
+
+.controls-card.disabled .group-head .badge {
+  opacity: 0.5;
+}
+
+/* ---------- Source selectors (radio-button rows in Setup) -------------- */
+.source-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.source-selector .source-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.source-selector label.source-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 12px;
+  background: var(--bg);
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.source-selector label.source-option:hover {
+  border-color: var(--accent);
+}
+
+.source-selector label.source-option input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.source-selector label.source-option input[type="radio"]:checked {
+  border-color: var(--accent);
+}
+
+.source-selector label.source-option input[type="radio"]:checked::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.source-selector label.source-option:has(input[type="radio"]:checked) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(88, 166, 255, 0.08);
 }
 
 .group-head {

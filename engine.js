@@ -1,7 +1,33 @@
 // engine.js — pure simulation logic for the Vanessa wind-park Backtester.
 //
-// No DOM access. Reads from a pre-loaded WIND_DATA global plus parameter
-// objects. Returns per-ISP arrays, totals and decompositions.
+// No DOM access. Reads from a pre-loaded WIND_DATA global plus a params
+// object. Returns per-ISP arrays, totals and decompositions.
+//
+// UNIFIED ENGINE (post-rework)
+// ============================
+// There is no longer a Level 1 / Level 2 / Level 3 distinction inside the
+// engine. A single simulate() always runs the full L3-style codepath
+// (DA + mFRR + aFRR + imbalance/flat + S3 speculation). The legacy "levels"
+// are now expressible via two source selectors in params:
+//
+//   actualSource:  'da' | 'id' | 'real'   — what feeds Q_pot
+//   idSource:      'da' | 'real'          — what feeds the ID input to
+//                                            the Z·(ID − F) revision
+//
+// And per-strategy enable flags in params.enabled:
+//   daWithhold:  false → Y is forced to 0 (always sell full forecast to DA)
+//   split:       false → s_up = s_dn = 1 (all volume to mFRR, never aFRR)
+//   idTrust:     false → Z is forced to 0 (no ID revision)
+//   s3:          false → s3_X_cap is forced to 0 (S3 leg disabled)
+//
+// Equivalences:
+//   Legacy L1 ≡ actualSource='da', idSource='da', enabled.s3=false
+//   Legacy L2 ≡ actualSource='real', idSource='real', enabled.s3=false
+//   Legacy L3 ≡ actualSource='real', idSource='real', all enabled
+//
+// When (actualSource='da', idSource='da'), trustedRev = Z·(F−F) = 0 and
+// Q_position ≤ floor(F) ≤ F = Q_pot, so short = 0 and imb/flat costs are
+// structurally 0 — matching the legacy L1 result without an L1 flag.
 //
 // SIGN CONVENTIONS (verified by tests.py + the spec's two worked examples)
 //   DA revenue:    Q_da_sold * P_da                           [≥ 0]
@@ -14,31 +40,27 @@
 //   per-ISP rev = (DA + up + dn - imb - flat) * 0.25          [MW * h]
 //
 // MFRR ↔ AFRR SPLIT (two parameters: s_up, s_dn ∈ [0, 1]; 1 = all mFRR)
-//   The mFRR-vs-aFRR economics differ between directions (mFRR-up clears
-//   only on upside spikes, aFRR-up earns continuously on positive avg;
-//   the downward direction has its own separate price dynamics), so the
-//   strategy parameter is per-direction:
+//   Round-and-remainder per direction:
 //     Q_up_mfrr = round(s_up * Q_up_offer)      Q_up_afrr = Q_up_offer - Q_up_mfrr
 //     Q_dn_mfrr = round(s_dn * Q_dn_offer)      Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
-//   With s_up = s_dn = 1 (default) both aFRR terms are 0 and the engine
-//   reduces to its pre-feature behaviour (frozen regression values still
-//   hold). aFRR prices come from data-afrr-15min.js: avg_p_pos[i] /
-//   avg_p_neg[i] are the time-weighted means of AST_POS / AST_NEG over
-//   each ISP's 4-s slots, with NaN treated as 0 (sum / 225). See
-//   preprocess-afrr-15min.py for the derivation.
+//   With s_up = s_dn = 1 (default) both aFRR terms are 0. aFRR prices come
+//   from data-afrr-15min.js: avg_p_pos[i] / avg_p_neg[i] are the
+//   time-weighted means of AST_POS / AST_NEG over each ISP's 4-s slots,
+//   with the FAVOURABLE-ONLY filter at preprocess time (see init() / the
+//   preprocess-afrr-15min.py docstring).
 //
 // PHYSICAL CONSTRAINTS (audit-applied, do NOT regress)
 //   * Whole-MW market quantities. Balancing market accepts integer MW only,
-//     so Q_da_sold, Q_w, trusted_rev and Q_dn_offer are floored. Fractional
-//     MW between floor(F) and the actual forecast are simply not traded.
-//     The s-split also produces integer Q_*_mfrr / Q_*_afrr (round + remainder).
-//   * mFRR-dn capped at the DA position. A wind park can drop from Q_da_sold
-//     to 0 but cannot go below 0. Therefore Q_dn_offer = Q_da_sold (NOT Q_w),
-//     independent of Y. When Q_da_sold = 0 there is no mFRR-dn revenue.
+//     so Q_da_sold, Q_w, trusted_rev and Q_dn_offer are floored. The
+//     s-split also produces integer Q_*_mfrr / Q_*_afrr (round + remainder).
+//   * mFRR-dn capped at the DA position. A wind park can drop from
+//     Q_da_sold to 0 but cannot go below 0. Therefore Q_dn_offer = Q_da_sold
+//     (NOT Q_w), independent of Y. When Q_da_sold = 0 there is no mFRR-dn
+//     revenue.
 //   * Q_position = Q_da_sold + Q_up_active - Q_dn_active. mFRR-up and
 //     mFRR-dn cannot both fire in the same ISP (P_mfrr is single-signed).
-//     aFRR contributions are scaled by activity fraction (n_pos/225 for
-//     upward, n_neg/225 for downward) since aFRR is partial-dispatch.
+//     aFRR contributions are scaled by activity fraction (n_*_fav/225)
+//     since aFRR is partial-dispatch.
 //
 // SIMULATION WINDOW
 //   The engine carries a half-open ISP-index window [winStart, winEnd) set
@@ -52,7 +74,7 @@
 //   upstream source ran out (mostly April 2026). simulate() and
 //   simulateTotal() detect NaN p_imb and treat its imbalance + flat
 //   penalty as 0 for that ISP, so April rows still contribute DA + mFRR
-//   revenue to the L2 totals. Tests verify this.
+//   revenue to the totals. Tests verify this.
 //
 // EXPORTS
 //   init(rawData)                  — bootstrap typed-array views, reset window
@@ -62,17 +84,12 @@
 //   maybeWinsorize(mfrrLo, mfrrHi, imbLo, imbHi, posLo, posHi, negLo, negHi)
 //                                  — keyed-cache; ALWAYS returns current bounds (for live UI)
 //   forceRewinsor()                — invalidate cache (rare)
-//   simulate(level, params)        — full per-ISP detail (params.s_up / params.s_dn)
-//   simulateTotal(level, X,Y,Z,θ,s_up,s_dn)
-//                                  — fast total-only (sweeps)
-//   naiveRevenue(level, θ, s_up, s_dn)
-//                                  — simulateTotal at X=0,Y=0,Z=0 with current splits
-//   sweepLevel1(xs, ys, ss_up, ss_dn) — 4-D grid for the L1 optimiser
-//   sweepLevel2(xs, ys, zs, ss_up, ss_dn, θ)
-//                                  — 5-D grid for the L2 optimiser
+//   simulate(params)               — full per-ISP detail
+//   simulateTotal(params)          — fast total-only (for sweeps / optimiser)
+//   naiveRevenue(params)           — simulateTotal at X=0, Y=0, Z=0 with current splits + sources
 //   topConcentration(perISP, frac) — top-N% revenue share (robustness)
-//   monthlyAggregation(level, p)   — month-bucketed decomposition (incl. aFRR)
-//   totalPotMWhInWindow()          — sum of q_pot in current window
+//   monthlyAggregation(params)     — month-bucketed decomposition (incl. aFRR + S3)
+//   totalPotMWhInWindow(params)    — sum of Q_pot in current window (Q_pot depends on actualSource)
 //   tsAt(i)                        — Date object for global ISP index i
 
 const Engine = (() => {
@@ -103,10 +120,10 @@ const Engine = (() => {
       p_mfrr_raw: _toFloat32WithNaN(rawData.p_mfrr),
       q_pot: new Float32Array(rawData.q_pot),
       // p_imb may contain null (April lacks the imbalance-price source).
-      // Engine treats NaN p_imb as zero imbalance cost in L2.
+      // Engine treats NaN p_imb as zero imbalance cost.
       p_imb_raw: _toFloat32WithNaN(rawData.p_imb),
-      // vwap_1h is the LV intraday 1h-VWAP. NaN where missing — L3's S3
-      // (speculative oversell) strategy skips those ISPs.
+      // vwap_1h is the LV intraday 1h-VWAP. NaN where missing — S3
+      // (speculative oversell) skips those ISPs.
       vwap_1h: Array.isArray(rawData.vwap_1h)
         ? _toFloat32WithNaN(rawData.vwap_1h)
         : new Float32Array(rawData.n).fill(NaN),
@@ -125,15 +142,8 @@ const Engine = (() => {
     // avg_p_pos ≥ 0 and avg_p_neg ≤ 0 by construction.
     //
     // n_pos_fav / n_neg_fav are the matching FAVOURABLE-ONLY 4-s counts
-    // (slots where AST_POS > 0 / AST_NEG < 0). They scale the L2
-    // position contribution: Q_*_afrr × n_*_fav / 225. Distinct from
-    // data-afrr.js's n_pos / n_neg, which count ALL non-NaN slots
-    // regardless of sign.
-    //
-    // If a refreshed data-afrr-15min.js doesn't have the new
-    // *_fav arrays (older preprocess version), we fall back to
-    // AFRR_DATA's n_pos / n_neg — slightly inaccurate for the mixed-
-    // sign ISPs the new filter targets, but the engine still runs.
+    // (slots where AST_POS > 0 / AST_NEG < 0). They scale the position
+    // contribution: Q_*_afrr × n_*_fav / 225.
     if (typeof AFRR_15MIN !== "undefined" && AFRR_15MIN && AFRR_15MIN.n === D.n) {
       D.avg_p_pos_raw = new Float32Array(AFRR_15MIN.avg_p_pos);
       D.avg_p_neg_raw = new Float32Array(AFRR_15MIN.avg_p_neg);
@@ -144,7 +154,6 @@ const Engine = (() => {
     D.avg_p_pos = new Float32Array(D.n); // winsorized
     D.avg_p_neg = new Float32Array(D.n); // winsorized
 
-    // Favourable counts (preferred) with fallback to legacy n_pos / n_neg.
     let havePosFav = false, haveNegFav = false;
     if (typeof AFRR_15MIN !== "undefined" && AFRR_15MIN && AFRR_15MIN.n === D.n) {
       if (Array.isArray(AFRR_15MIN.n_pos_fav)) {
@@ -168,10 +177,6 @@ const Engine = (() => {
     if (!havePosFav) D.afrr_n_pos_fav = D.afrr_n_pos;
     if (!haveNegFav) D.afrr_n_neg_fav = D.afrr_n_neg;
 
-    // Day-type classification per ISP — used by the Graphs page's day-type
-    // filter (workdays / weekends+holidays / all). Computed once here from
-    // timestamps + the date-holidays plugin (if present); 1 ms work, no
-    // dependence on user-set filter state.
     D.dayTypeMask = _computeDayTypeMask(rawData);
     winStart = 0;
     winEnd = D.n;
@@ -188,23 +193,8 @@ const Engine = (() => {
   }
 
   // ---------- day-type mask (workday / weekend / public holiday) ---------
-  // Mask values:
-  //   0 = workday (Mon–Fri AND not a public holiday in LV/EE/LT)
-  //   1 = weekend (Saturday or Sunday — UTC day-of-week)
-  //   2 = holiday (Mon–Fri but a public holiday in any of LV / EE / LT)
-  //
-  // We classify by UTC calendar date — the dataset's offsets[] are in UTC
-  // throughout, and date-holidays returns a YYYY-MM-DD prefix in the
-  // country's local time. Local-vs-UTC boundary error is at most ~3 hours
-  // per holiday (LV/EE/LT are UTC+2 / +3); below the 15-min ISP sensitivity
-  // for nearly all aggregate analyses. If exact local-time classification
-  // becomes required, this is the function to upgrade.
-  //
-  // If the date-holidays plugin is missing (e.g. on the Backtester page,
-  // which doesn't load it), the holiday set stays empty and the mask
-  // degrades to weekend-only — every Mon–Fri counts as a workday. The
-  // graphs page's day-type filter still works in that mode; "weekends +
-  // holidays" simply matches Sat/Sun.
+  // Mask values: 0 = workday, 1 = weekend, 2 = holiday. See README for the
+  // full rationale (Latvia/Estonia/Lithuania holidays via date-holidays).
   function _computeDayTypeMask(rawData) {
     const n = rawData.n;
     const startMs = new Date(rawData.start_iso).getTime();
@@ -214,9 +204,9 @@ const Engine = (() => {
     const holidaySet = _balticHolidaySet(startMs, offsets, n, stepMs);
     for (let i = 0; i < n; i++) {
       const ts = new Date(startMs + offsets[i] * stepMs);
-      const dow = ts.getUTCDay(); // 0 = Sun, 6 = Sat
+      const dow = ts.getUTCDay();
       if (dow === 0 || dow === 6) {
-        mask[i] = 1; // weekend
+        mask[i] = 1;
       } else {
         const ds = ts.toISOString().substring(0, 10);
         mask[i] = holidaySet.has(ds) ? 2 : 0;
@@ -225,14 +215,10 @@ const Engine = (() => {
     return mask;
   }
 
-  // Build the union of public-holiday calendar dates (YYYY-MM-DD strings)
-  // across LV / EE / LT for every year in the dataset, using the
-  // date-holidays plugin loaded as a global.
   function _balticHolidaySet(startMs, offsets, n, stepMs) {
     const set = new Set();
     // The UMD bundle of date-holidays v3+ exposes the constructor as either
-    // window.Holidays directly (older style) OR window.Holidays.default
-    // (ES-module-flavoured style — what v3.28's umd.min.js does). Probe both.
+    // window.Holidays (older) OR window.Holidays.default (ES-module wrap).
     const Ctor =
       typeof Holidays === "function"
         ? Holidays
@@ -250,19 +236,13 @@ const Engine = (() => {
     }
     try {
       const firstYear = new Date(startMs + offsets[0] * stepMs).getUTCFullYear();
-      const lastYear = new Date(
-        startMs + offsets[n - 1] * stepMs,
-      ).getUTCFullYear();
+      const lastYear = new Date(startMs + offsets[n - 1] * stepMs).getUTCFullYear();
       for (const cc of ["LV", "EE", "LT"]) {
         const hd = new Ctor(cc);
         for (let y = firstYear; y <= lastYear; y++) {
           const list = hd.getHolidays(y) || [];
           for (const h of list) {
-            // Public bank-holiday calendar only — not 'observance' or 'school'.
             if (h.type !== "public") continue;
-            // h.date is "YYYY-MM-DD HH:MM:SS" in the country's local TZ.
-            // Substring(0, 10) gives the local calendar date, which we use
-            // directly as the UTC-keyed bucket (see fn-level comment).
             if (typeof h.date === "string" && h.date.length >= 10) {
               set.add(h.date.substring(0, 10));
             }
@@ -281,8 +261,6 @@ const Engine = (() => {
     return D;
   }
 
-  // Set the simulation window. Re-clamps to dataset bounds. Invalidates the
-  // winsorization cache because percentiles are derived from the window slice.
   function setWindow(start, end) {
     const s = Math.max(0, Math.min(D.n, start | 0));
     const e = Math.max(s, Math.min(D.n, end | 0));
@@ -302,8 +280,6 @@ const Engine = (() => {
   }
 
   // ---------- winsorization with caching ---------------------------------
-  // Cached bounds are kept across calls so the UI can show the current cap
-  // values (live preview) without forcing a recompute on every render.
   let cachedMfrrKey = null;
   let cachedImbKey = null;
   let cachedAfrrPosKey = null;
@@ -313,27 +289,11 @@ const Engine = (() => {
   let cachedAfrrPosBounds = { lo: 0, hi: 0 };
   let cachedAfrrNegBounds = { lo: 0, hi: 0 };
 
-  // ---------- S3 (Level-3 speculative intraday oversell) rolling stats ----
-  // Computed from raw p_mfrr across the FULL dataset (not the sim window) —
-  // the rolling window looks back K ISPs from each H (excluding the L most
-  // recent), which can cross the sim-window boundary. Independent of
-  // winStart/winEnd, so cached forever. Keyed by (K, L). NaN-aware: a window
-  // with <2 valid (non-NaN) values yields NaN mean/std at that ISP (the S3
-  // evaluator treats that as "skip ISP"). Sample std (ddof=1) per Q6.
-  //
-  // SOURCE: D.p_mfrr_raw (the past settled mFRR clearing price). Earlier
-  // builds used D.p_imb_raw — that was the imbalance price the wind park
-  // would have paid IF it had been short, not the price it would actually
-  // observe to time an intra-day oversell. Switching to p_mfrr reflects the
-  // actual signal a real trader has available. Raw (not winsorized) because
-  // a live trader sees actual settlement, not capped values.
-  //
-  // LAG L: rolling window is [i-K-L, i-L) — i.e. the K samples ending L ISPs
-  // before the target ISP. Models real-world publication latency: at 08:55
-  // the trader bidding for 09:30 has visibility only through ~08:30 (the
-  // last fully-settled ISP). Default L = 4 (one hour of "dark" period
-  // immediately before the target). L = 0 reproduces the no-lag legacy
-  // behaviour.
+  // ---------- S3 rolling stats cache, keyed on (K, L) --------------------
+  // Computed from raw p_mfrr across the FULL dataset. Independent of
+  // winStart/winEnd, so cached forever. Mirrors a real trader: rolling
+  // window is [i − K − L, i − L) — the K samples ending L ISPs before the
+  // target ISP (publication latency).
   const _s3RollingCache = new Map();
   function _getS3Rolling(K, L) {
     if (!D || K < 1) return null;
@@ -355,7 +315,7 @@ const Engine = (() => {
         continue;
       }
       const winLo = i - Ki - Li;
-      const winHi = i - Li; // exclusive
+      const winHi = i - Li;
       let sum = 0;
       let cnt = 0;
       for (let j = winLo; j < winHi; j++) {
@@ -394,17 +354,12 @@ const Engine = (() => {
     return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
   }
 
-  // Compute the percentile bounds over the [winStart, winEnd) slice and
-  // clamp every value in `src` to those bounds, writing into `dst`. NaN
-  // values are excluded from percentile computation and copied through to
-  // dst as NaN (so the Backtester's L2 can detect missing imbalance prices).
   function applyWinsor(src, dst, pLow, pHigh) {
     const wLen = winEnd - winStart;
     if (wLen <= 0) {
       for (let i = 0; i < src.length; i++) dst[i] = src[i];
       return { lo: 0, hi: 0 };
     }
-    // Collect non-NaN window values for percentile estimation
     const buf = [];
     for (let i = winStart; i < winEnd; i++) {
       const v = src[i];
@@ -429,10 +384,6 @@ const Engine = (() => {
     return { lo, hi };
   }
 
-  // maybeWinsorize ALWAYS returns the current cached bounds (mfrr, imb,
-  // afrrPos, afrrNeg) so the UI can read them for live cap previews
-  // without forcing a recompute. New args (afrr*) default to 10/90 to keep
-  // the Graphs page's existing 4-arg call valid.
   function maybeWinsorize(
     pMfrrLow,
     pMfrrHigh,
@@ -478,57 +429,74 @@ const Engine = (() => {
     cachedAfrrNegKey = null;
   }
 
+  // ---------- helpers: resolve sources + enable flags --------------------
+  // Source resolvers honour the user's selectors. Pure index → value.
+  function _qPotArray(actualSource) {
+    if (actualSource === "da") return D.da_forecast;
+    if (actualSource === "id") return D.id_forecast;
+    return D.q_pot;
+  }
+  function _idArray(idSource) {
+    return idSource === "da" ? D.da_forecast : D.id_forecast;
+  }
+  // Effective scalar params given the user's enable flags. Disabling a
+  // strategy collapses its params to a neutral value (same shape the
+  // optimiser already understands).
+  function _resolveParams(params) {
+    const en = params.enabled || {};
+    const daWithhold = en.daWithhold !== false;
+    const split = en.split !== false;
+    const idTrust = en.idTrust !== false;
+    const s3On = en.s3 !== false;
+    const X = +params.X || 0;
+    const Y_raw = +params.Y || 0;
+    const Z_raw = +params.Z || 0;
+    const theta_flat = +params.theta_flat || 0;
+    const sUpRaw = params.s_up == null ? 1 : +params.s_up;
+    const sDnRaw = params.s_dn == null ? 1 : +params.s_dn;
+    return {
+      X,
+      Y: daWithhold ? Y_raw : 0,
+      Z: idTrust ? Z_raw : 0,
+      theta_flat,
+      s_up: split ? (sUpRaw < 0 ? 0 : sUpRaw > 1 ? 1 : sUpRaw) : 1,
+      s_dn: split ? (sDnRaw < 0 ? 0 : sDnRaw > 1 ? 1 : sDnRaw) : 1,
+      actualSource: params.actualSource || "real",
+      idSource: params.idSource || "real",
+      s3Enabled: s3On,
+      s3_K: (params.s3_K | 0) || 0,
+      s3_X_cap: s3On ? (params.s3_X_cap | 0) || 0 : 0,
+      s3_S_min: +params.s3_S_min || 0,
+      s3_sigma_max: +params.s3_sigma_max || 0,
+      s3_M: +params.s3_M || 0,
+      s3_lag: params.s3_lag == null ? 4 : (params.s3_lag | 0),
+      s3_da_skip: params.s3_da_skip == null ? 50 : (params.s3_da_skip | 0),
+    };
+  }
+
   // ---------- detailed simulation (returns per-ISP arrays) ---------------
-  // level: 1 or 2. params: { X, Y, Z?, theta_flat? }
-  // Per-ISP arrays are sized to the simulation window length. The result
-  // also carries windowStart / windowEnd so callers can map perISP[k]
-  // back to a global ISP index via (windowStart + k).
-  function simulate(level, params) {
-    const { X, Y, Z = 0, theta_flat = 0 } = params;
-    // s_up controls the mFRR/aFRR split for UPWARD volume offered; s_dn
-    // for DOWNWARD volume. They're independent because the per-direction
-    // economics differ (mFRR-up clears on upside spikes; mFRR-dn on the
-    // negative side; aFRR earnings come from the AVERAGED 4-s prices).
-    // Default both to 1 so any callers that didn't pass them still get
-    // the all-mFRR behaviour and the frozen regression values hold.
-    const s_up = params.s_up == null ? 1 : params.s_up;
-    const s_dn = params.s_dn == null ? 1 : params.s_dn;
-    const sUpC = s_up < 0 ? 0 : s_up > 1 ? 1 : s_up;
-    const sDnC = s_dn < 0 ? 0 : s_dn > 1 ? 1 : s_dn;
-    // ----- S3 (speculative intraday oversell) params -----
-    // Only active when level === 3 AND X_cap ≥ 1 AND K ≥ 1. Setting X_cap=0
-    // disables S3 entirely (UI convention; saves a toggle). L1/L2 always
-    // skip S3 because isL3 is false.
-    const isL3 = level === 3;
-    const s3K = (params.s3_K | 0) || 0;
-    const s3X_cap = (params.s3_X_cap | 0) || 0;
-    const s3Enabled = isL3 && s3X_cap >= 1 && s3K >= 1;
-    const s3S_min = +params.s3_S_min || 0;
-    const s3Sigma_max = +params.s3_sigma_max || 0;
-    const s3M = +params.s3_M || 0;
-    // L = number of most-recent ISPs the trader cannot yet see (publication
-    // latency). Default 4 (~1 h). Independent of K and not optimised.
-    const s3L = params.s3_lag == null ? 4 : (params.s3_lag | 0);
-    // DA-sold skip threshold: when da_sold >= s3DaSkip we don't even attempt
-    // S3 for that ISP. Prevents oversell-on-top-of-near-max-DA cases where
-    // physical headroom is already exhausted. Default 50 MW (park cap is
-    // 58.8 MW). Setting this to 0 disables S3 entirely. Not optimised.
-    const s3DaSkip = params.s3_da_skip == null ? 50 : (params.s3_da_skip | 0);
-    const s3Roll = s3Enabled ? _getS3Rolling(s3K, s3L) : null;
+  // params shape:
+  //   { X, Y, Z, theta_flat, s_up, s_dn,
+  //     actualSource: 'da'|'id'|'real',
+  //     idSource: 'da'|'real',
+  //     enabled: { daWithhold, split, idTrust, s3 },
+  //     s3_K, s3_lag, s3_da_skip, s3_S_min, s3_sigma_max, s3_X_cap, s3_M }
+  //
+  // Per-ISP arrays are sized to the simulation window length. Index k of
+  // perISP corresponds to global ISP (windowStart + k).
+  function simulate(params) {
+    const p = _resolveParams(params);
+    const s3Active = p.s3Enabled && p.s3_X_cap >= 1 && p.s3_K >= 1;
+    const s3Roll = s3Active ? _getS3Rolling(p.s3_K, p.s3_lag) : null;
+    const Q_pot_src = _qPotArray(p.actualSource);
+    const ID_src = _idArray(p.idSource);
 
     const wLen = Math.max(0, winEnd - winStart);
     const Q_da_sold = new Float32Array(wLen);
-    const Q_up = new Float32Array(wLen); // total upward volume offered (mFRR + aFRR)
+    const Q_up = new Float32Array(wLen);
     const Q_dn = new Float32Array(wLen);
-    // aFRR DISPATCHED MW (time-averaged over ISP) — the volume the system
-    // actually used, after the profitability gate AND the n_pos/n_neg
-    // activation fraction. These feed the time-series chart bars; they're
-    // < Q_*_afrr offered when the gate fails or the activation rate < 1.
     const Q_up_afrr_disp = new Float32Array(wLen);
     const Q_dn_afrr_disp = new Float32Array(wLen);
-    // S3 per-ISP volumes (positive ints in MW). Q_s3_intraday is the oversold
-    // amount; Q_s3_curtail is the same amount when the hedge mFRR-dn bid
-    // clears (else 0). Charts show these as hatched green/red bars.
     const Q_s3_intraday = new Float32Array(wLen);
     const Q_s3_curtail = new Float32Array(wLen);
     const Q_short = new Float32Array(wLen);
@@ -553,43 +521,33 @@ const Engine = (() => {
       nS3HedgeFired = 0;
     let totalShortMWh = 0;
     let nNegRevWarn = 0;
-    // L2 math also applies to L3 (which adds "speculation" on top).
-    const isL2 = level >= 2;
+
     for (let i = winStart; i < winEnd; i++) {
       const k = i - winStart;
       const F = D.da_forecast[i];
-      const ID = D.id_forecast[i];
+      const ID = ID_src[i];
       const P_da = D.p_da[i];
       const P_mfrr = D.p_mfrr[i];
-      const aboveX = P_da >= X;
-      const da_sold_raw = aboveX ? F : F * (1 - Y);
+      const aboveX = P_da >= p.X;
+      const da_sold_raw = aboveX ? F : F * (1 - p.Y);
       const da_sold = Math.floor(da_sold_raw + 1e-9);
       const Q_w_raw = aboveX ? 0 : F - da_sold;
       const Q_w = Math.floor(Q_w_raw + 1e-9);
-      const trustedRevRaw = isL2 ? Z * (ID - F) : 0;
-      if (isL2 && trustedRevRaw < 0) nNegRevWarn++;
+      const trustedRevRaw = p.Z * (ID - F);
+      if (trustedRevRaw < 0) nNegRevWarn++;
       const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
       const Q_up_offer = Q_w + trustedExtra;
       const Q_dn_offer = da_sold;
-      // ----- mFRR ↔ aFRR split (per-direction) -----
-      // Round-and-remainder per direction: Q_up_mfrr + Q_up_afrr = Q_up_offer
-      // exactly (no MW lost), same for downward. s_up = s_dn = 1 → all mFRR.
-      const Q_up_mfrr = Math.round(sUpC * Q_up_offer);
+      // mFRR ↔ aFRR split (per-direction, round-and-remainder).
+      const Q_up_mfrr = Math.round(p.s_up * Q_up_offer);
       const Q_up_afrr = Q_up_offer - Q_up_mfrr;
-      const Q_dn_mfrr = Math.round(sDnC * Q_dn_offer);
+      const Q_dn_mfrr = Math.round(p.s_dn * Q_dn_offer);
       const Q_dn_afrr = Q_dn_offer - Q_dn_mfrr;
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr = isUp ? Q_up_mfrr : 0;
       const dn_mfrr = isDn ? Q_dn_mfrr : 0;
-      // ----- aFRR profitability gate (per direction, per ISP) -----
-      // A wind park bidding sensibly will only OFFER aFRR-up where
-      // avg_p_pos > 0 (positive earnings per MWh), and aFRR-dn where
-      // avg_p_neg < 0 (system pays the park to curtail → −Q × negative =
-      // positive earnings). When the gate fails, the offered volume earns
-      // 0 AND contributes 0 to the L2 position — the park simply didn't
-      // bid that direction this ISP. This is the ISP-level analogue of
-      // the existing |P_mfrr| ≥ 1 mFRR gate.
+      // aFRR profitability gate (per direction, per ISP).
       const avg_pos = D.avg_p_pos[i];
       const avg_neg = D.avg_p_neg[i];
       const upAfrrActive = avg_pos > 0 && Q_up_afrr > 0;
@@ -599,14 +557,8 @@ const Engine = (() => {
       const DA_rev = da_sold * P_da;
       const Up_rev_mfrr = up_mfrr * P_mfrr;
       const Dn_rev_mfrr = -dn_mfrr * P_mfrr;
-      // ----- position accounting -----
-      // mFRR contributes its full Q when activated (binary across the ISP);
-      // aFRR contributes a time-fraction n_*_fav[i]/225 — the FAVOURABLE
-      // 4-s slot count (slots where the wind park would have bid). This
-      // matches the favourable-only revenue averaging in preprocess-
-      // afrr-15min.py: dispatched MW = MW × (favourable slots / 225).
-      // The profitability gate ALSO governs position; if avg_p_pos ≤ 0
-      // (no favourable slots existed) we weren't dispatched at all.
+      // Position: mFRR full Q when activated (binary); aFRR scaled by
+      // favourable-slot fraction n_*_fav/225.
       const aFracPos = D.afrr_n_pos_fav[i] / 225;
       const aFracNeg = D.afrr_n_neg_fav[i] / 225;
       const up_afrr_disp = upAfrrActive ? Q_up_afrr * aFracPos : 0;
@@ -615,50 +567,27 @@ const Engine = (() => {
       Q_dn_afrr_disp[k] = dn_afrr_disp;
       const Q_pos_l2 = da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
 
-      // ----- S3 (Level-3 speculative intraday oversell) ---------------
-      // Evaluate the strategy's 3 gates (spread, sigma, ≥1 MW after floor).
-      // If all pass, add X_prop MW to position (intraday oversell) and submit
-      // a HEDGE mFRR-dn bid at vwap+M. The hedge bid clears iff
-      // p_mfrr ≤ bid_price. When it clears, the curtailment offsets the
-      // oversell exactly (s3_delta_pos = 0). When it doesn't clear, position
-      // increases by X_prop and the extra shortfall is settled at p_imb
-      // (+ theta_flat). Uses WINSORIZED p_mfrr (D.p_mfrr) so the user's
-      // winsor settings affect S3 the same way they affect mFRR revenue.
+      // ----- S3 (speculative intraday oversell) -----
       let s3_X = 0;
       let s3_fires = false;
       let s3_intraday = 0;
       let s3_curtail = 0;
-      // Gate 0: skip S3 if DA is already at/above the user's threshold —
-      // the park has little physical headroom to honour an extra X_cap MW.
-      if (s3Enabled && da_sold < s3DaSkip) {
+      if (s3Active && da_sold < p.s3_da_skip) {
         const P_ID_est = D.vwap_1h[i];
         if (!isNaN(P_ID_est)) {
-          // P_mfrr_est / P_mfrr_sigma: rolling mean and std of past raw
-          // p_mfrr, lagged by s3L (see _getS3Rolling above).
           const P_mfrr_est = s3Roll.mean[i];
           const P_mfrr_sigma = s3Roll.std[i];
           if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
             const spread = P_ID_est - P_mfrr_est;
-            if (spread >= s3S_min && P_mfrr_sigma <= s3Sigma_max) {
-              const sig = (spread - s3S_min) / s3S_min;
-              const X_raw = s3X_cap * (sig < 1 ? sig : 1);
+            if (spread >= p.s3_S_min && P_mfrr_sigma <= p.s3_sigma_max) {
+              const sig = (spread - p.s3_S_min) / p.s3_S_min;
+              const X_raw = p.s3_X_cap * (sig < 1 ? sig : 1);
               const X_prop = Math.floor(X_raw + 1e-9);
               if (X_prop >= 1) {
-                const bid_price = P_ID_est + s3M;
-                // The hedge bid is a "stop-loss" mFRR-dn offer that we
-                // wouldn't normally place — at a price above the typical
-                // mFRR-dn clearing — so it costs us when it clears, but
-                // bounds the loss on the oversold MW vs imbalance.
-                // Wind farm accepts being curtailed at any marginal price
-                // ≤ bid_price. Negative P_mfrr → grid pays the wind farm
-                // (windfall); positive P_mfrr ≤ bid_price → wind farm
-                // pays the grid, but cost is capped at bid_price · X.
+                const bid_price = P_ID_est + p.s3_M;
                 s3_fires = P_mfrr <= bid_price;
                 s3_X = X_prop;
                 s3_intraday = X_prop * P_ID_est;
-                // Curtailment "revenue" is signed: −P_mfrr can be positive
-                // (we're paid) OR negative (we paid). Accumulated as-is in
-                // sumS3Curtail.
                 if (s3_fires) s3_curtail = X_prop * (-P_mfrr);
               }
             }
@@ -667,27 +596,19 @@ const Engine = (() => {
       }
       const s3_delta_pos = s3_fires ? 0 : s3_X;
       const Q_pos = Q_pos_l2 + s3_delta_pos;
-      const Q_pot = isL2 ? D.q_pot[i] : F;
+      const Q_pot = Q_pot_src[i];
       const short_l2 = Q_pos_l2 > Q_pot ? Q_pos_l2 - Q_pot : 0;
       const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
 
-      // ----- NaN p_imb handling -----
-      // The Latvia imbalance-price source ran out at end-of-March 2026, so
-      // ~6.8% of rows (mostly April) have NaN p_imb. We keep those rows in
-      // the simulation (they still earn DA + mFRR + aFRR revenue) but zero
-      // their imbalance & flat-penalty contributions — effectively assuming
-      // "perfect imbalance" for those ISPs. This MILDLY undercounts L2 cost
-      // if you point the sim window at April only.
-      const P_imb_raw = isL2 ? D.p_imb[i] : 0;
-      const P_imb_valid = isL2 ? !isNaN(P_imb_raw) : true;
-      // L2 portion of imb/flat (existing behaviour). For L3 with S3, the
-      // S3-induced extra shortfall settles at the same p_imb+theta but is
-      // attributed to S3 so the decomposition makes sense.
-      const imb = isL2 && P_imb_valid ? short_l2 * P_imb_raw : 0;
-      const flat = isL2 && P_imb_valid ? short_l2 * theta_flat : 0;
-      const s3_extra_short = short - short_l2; // ≥ 0
-      const s3_extra_cost =
-        isL2 && P_imb_valid ? s3_extra_short * (P_imb_raw + theta_flat) : 0;
+      // NaN p_imb (April rows): skip imbalance + flat costs entirely.
+      const P_imb_raw = D.p_imb[i];
+      const P_imb_valid = !isNaN(P_imb_raw);
+      const imb = P_imb_valid ? short_l2 * P_imb_raw : 0;
+      const flat = P_imb_valid ? short_l2 * p.theta_flat : 0;
+      const s3_extra_short = short - short_l2;
+      const s3_extra_cost = P_imb_valid
+        ? s3_extra_short * (P_imb_raw + p.theta_flat)
+        : 0;
       const rev =
         (DA_rev +
           Up_rev_mfrr +
@@ -717,10 +638,6 @@ const Engine = (() => {
       sumS3Intraday += s3_intraday * 0.25;
       sumS3Curtail += s3_curtail * 0.25;
       sumS3ExtraCost += s3_extra_cost * 0.25;
-      // Counts: mFRR up vs dn are mutually exclusive per ISP (P_mfrr is
-      // single-signed) — kept as before. aFRR up / dn are independent and
-      // can BOTH fire in the same ISP (e.g. mFRR-dn + aFRR-up at the same
-      // time when prices allow it).
       if (up_mfrr > 1e-6) nUp++;
       else if (dn_mfrr > 1e-6) nDn++;
       else if (Q_w > 1e-6 && !upAfrrActive && !dnAfrrActive) nWasted++;
@@ -789,42 +706,23 @@ const Engine = (() => {
   }
 
   // ---------- fast total-only simulation (for sweeps) --------------------
-  // s_up / s_dn default to 1 so legacy 5-arg callers keep their
-  // pre-feature behaviour exactly (frozen regression values intact).
-  // s3: null (disabled) or { K, S_min, sigma_max, X_cap, M } — when set
-  // AND level === 3, adds the speculative intraday-oversell contribution.
-  function simulateTotal(level, X, Y, Z, theta_flat, s_up = 1, s_dn = 1, s3 = null) {
-    const isL2 = level >= 2;
-    const isL3 = level === 3;
-    const sUpC = s_up < 0 ? 0 : s_up > 1 ? 1 : s_up;
-    const sDnC = s_dn < 0 ? 0 : s_dn > 1 ? 1 : s_dn;
-    const s3Enabled = isL3 && s3 && (s3.X_cap | 0) >= 1;
-    const s3K = s3Enabled ? (s3.K | 0) || 4 : 0;
-    const s3S_min = s3Enabled ? +s3.S_min : 0;
-    const s3Sigma_max = s3Enabled ? +s3.sigma_max : 0;
-    const s3X_cap = s3Enabled ? (s3.X_cap | 0) : 0;
-    const s3M = s3Enabled ? +s3.M : 0;
-    // Lag (default 4) — see simulate(). Not optimised; passed from caller.
-    const s3L = s3Enabled
-      ? (s3.lag == null ? 4 : (s3.lag | 0))
-      : 0;
-    // DA-sold skip threshold — see simulate(). Default 50, not optimised.
-    const s3DaSkip = s3Enabled
-      ? (s3.da_skip == null ? 50 : (s3.da_skip | 0))
-      : 0;
-    const s3Roll = s3Enabled ? _getS3Rolling(s3K, s3L) : null;
+  // Same math as simulate() but returns only the scalar totalRevenue.
+  // Inlined hot path; no per-ISP arrays allocated.
+  function simulateTotal(params) {
+    const p = _resolveParams(params);
+    const s3Active = p.s3Enabled && p.s3_X_cap >= 1 && p.s3_K >= 1;
+    const s3Roll = s3Active ? _getS3Rolling(p.s3_K, p.s3_lag) : null;
     const s3MeanArr = s3Roll ? s3Roll.mean : null;
     const s3StdArr = s3Roll ? s3Roll.std : null;
+    const Q_pot_src = _qPotArray(p.actualSource);
+    const ID_src = _idArray(p.idSource);
     const vwap_arr = D.vwap_1h;
     const F_arr = D.da_forecast;
-    const ID_arr = D.id_forecast;
     const P_da_arr = D.p_da;
     const P_mfrr_arr = D.p_mfrr;
-    const Q_pot_arr = D.q_pot;
     const P_imb_arr = D.p_imb;
     const aPos_arr = D.avg_p_pos;
     const aNeg_arr = D.avg_p_neg;
-    // Favourable-only counts: see init() docstring + preprocess script.
     const nPos_arr = D.afrr_n_pos_fav;
     const nNeg_arr = D.afrr_n_neg_fav;
     let total = 0;
@@ -832,23 +730,21 @@ const Engine = (() => {
       const F = F_arr[i];
       const P_da = P_da_arr[i];
       const P_mfrr = P_mfrr_arr[i];
-      const aboveX = P_da >= X;
-      const da_sold = (aboveX ? F : F * (1 - Y)) | 0; // floor via |0
+      const aboveX = P_da >= p.X;
+      const da_sold = (aboveX ? F : F * (1 - p.Y)) | 0;
       const Q_w = aboveX ? 0 : ((F - da_sold) | 0);
-      const trustedRevRaw = isL2 ? Z * (ID_arr[i] - F) : 0;
+      const trustedRevRaw = p.Z * (ID_src[i] - F);
       const trustedExtra = trustedRevRaw > 0 ? (trustedRevRaw | 0) : 0;
       const Q_up_offer = Q_w + trustedExtra;
       const Q_dn_offer = da_sold;
-      // Round-and-remainder per-direction split (see simulate()).
-      const Q_up_mfrr = Math.round(sUpC * Q_up_offer);
+      const Q_up_mfrr = Math.round(p.s_up * Q_up_offer);
       const Q_up_afrr = Q_up_offer - Q_up_mfrr;
-      const Q_dn_mfrr = Math.round(sDnC * Q_dn_offer);
+      const Q_dn_mfrr = Math.round(p.s_dn * Q_dn_offer);
       const Q_dn_afrr = Q_dn_offer - Q_dn_mfrr;
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr = isUp ? Q_up_mfrr : 0;
       const dn_mfrr = isDn ? Q_dn_mfrr : 0;
-      // aFRR profitability gate — see simulate() for the rationale.
       const avg_pos = aPos_arr[i];
       const avg_neg = aNeg_arr[i];
       const upAfrrActive = avg_pos > 0 && Q_up_afrr > 0;
@@ -856,235 +752,55 @@ const Engine = (() => {
       let rev = da_sold * P_da + up_mfrr * P_mfrr - dn_mfrr * P_mfrr;
       if (upAfrrActive) rev += Q_up_afrr * avg_pos;
       if (dnAfrrActive) rev -= Q_dn_afrr * avg_neg;
-      if (isL2) {
-        const up_afrr_disp = upAfrrActive ? Q_up_afrr * (nPos_arr[i] / 225) : 0;
-        const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * (nNeg_arr[i] / 225) : 0;
-        let Q_pos =
-          da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
-        // ----- S3 (Level-3 speculative intraday oversell) -----
-        // Same logic as simulate(); inlined for hot-path performance.
-        // Gate 0 (da_sold < s3DaSkip): see simulate() comment.
-        if (s3Enabled && da_sold < s3DaSkip) {
-          const P_ID_est = vwap_arr[i];
-          if (!isNaN(P_ID_est)) {
-            const P_mfrr_est = s3MeanArr[i];
-            const P_mfrr_sigma = s3StdArr[i];
-            if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
-              const spread = P_ID_est - P_mfrr_est;
-              if (spread >= s3S_min && P_mfrr_sigma <= s3Sigma_max) {
-                const sig = (spread - s3S_min) / s3S_min;
-                const X_raw = s3X_cap * (sig < 1 ? sig : 1);
-                const X_prop = (X_raw + 1e-9) | 0; // floor
-                if (X_prop >= 1) {
-                  const bid_price = P_ID_est + s3M;
-                  rev += X_prop * P_ID_est;
-                  // Hedge mFRR-dn bid is a stop-loss: clears whenever
-                  // the marginal price isn't above our ceiling.
-                  // Curtailment revenue −P_mfrr can be positive (paid)
-                  // or negative (we paid up to bid_price per MWh).
-                  if (P_mfrr <= bid_price) {
-                    rev += X_prop * (-P_mfrr);
-                    // hedge clears → curtailment offsets oversell, no position increase
-                  } else {
-                    Q_pos += X_prop; // shortfall increases by X_prop
-                  }
+      const up_afrr_disp = upAfrrActive ? Q_up_afrr * (nPos_arr[i] / 225) : 0;
+      const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * (nNeg_arr[i] / 225) : 0;
+      let Q_pos = da_sold + up_mfrr + up_afrr_disp - dn_mfrr - dn_afrr_disp;
+      if (s3Active && da_sold < p.s3_da_skip) {
+        const P_ID_est = vwap_arr[i];
+        if (!isNaN(P_ID_est)) {
+          const P_mfrr_est = s3MeanArr[i];
+          const P_mfrr_sigma = s3StdArr[i];
+          if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
+            const spread = P_ID_est - P_mfrr_est;
+            if (spread >= p.s3_S_min && P_mfrr_sigma <= p.s3_sigma_max) {
+              const sig = (spread - p.s3_S_min) / p.s3_S_min;
+              const X_raw = p.s3_X_cap * (sig < 1 ? sig : 1);
+              const X_prop = (X_raw + 1e-9) | 0;
+              if (X_prop >= 1) {
+                const bid_price = P_ID_est + p.s3_M;
+                rev += X_prop * P_ID_est;
+                if (P_mfrr <= bid_price) {
+                  rev += X_prop * (-P_mfrr);
+                } else {
+                  Q_pos += X_prop;
                 }
               }
             }
           }
         }
-        const Q_pot = Q_pot_arr[i];
-        const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
-        // NaN p_imb (April rows): skip imbalance + flat costs entirely.
-        // Mirrors simulate(); see the long comment on NaN handling there.
-        const pimb = P_imb_arr[i];
-        if (!isNaN(pimb)) rev -= short * (pimb + theta_flat);
       }
+      const Q_pot = Q_pot_src[i];
+      const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
+      const pimb = P_imb_arr[i];
+      if (!isNaN(pimb)) rev -= short * (pimb + p.theta_flat);
       total += rev;
     }
     return total * 0.25;
   }
 
-  function naiveRevenue(level, theta_flat = 0, s_up = 1, s_dn = 1) {
-    return simulateTotal(level, 0, 0, 0, theta_flat, s_up, s_dn);
-  }
-
-  // ---------- parameter sweeps -------------------------------------------
-  // sweepLevel1 / sweepLevel2 sweep over the per-direction splits ss_up
-  // and ss_dn (was a single `ss`). Independent grids let the optimiser
-  // pick a different mFRR/aFRR ratio for upward vs downward — useful
-  // because the per-direction price economics aren't symmetric. Old
-  // callers passing undefined / [] get a degenerate {1} grid (all mFRR).
-  function sweepLevel1(xs, ys, ss_up, ss_dn) {
-    const upList = ss_up && ss_up.length ? ss_up : [1];
-    const dnList = ss_dn && ss_dn.length ? ss_dn : [1];
-    let bestRev = -Infinity,
-      bestX = 0,
-      bestY = 0,
-      bestSup = 1,
-      bestSdn = 1;
-    for (let xi = 0; xi < xs.length; xi++) {
-      for (let yi = 0; yi < ys.length; yi++) {
-        for (let ui = 0; ui < upList.length; ui++) {
-          for (let di = 0; di < dnList.length; di++) {
-            const r = simulateTotal(
-              1,
-              xs[xi],
-              ys[yi],
-              0,
-              0,
-              upList[ui],
-              dnList[di],
-            );
-            if (r > bestRev) {
-              bestRev = r;
-              bestX = xs[xi];
-              bestY = ys[yi];
-              bestSup = upList[ui];
-              bestSdn = dnList[di];
-            }
-          }
-        }
-      }
-    }
-    return {
-      best: {
-        X: bestX,
-        Y: bestY,
-        s_up: bestSup,
-        s_dn: bestSdn,
-        revenue: bestRev,
-      },
+  // Naïve baseline: same sources / θ / splits the user picked, but
+  // X = Y = Z = 0 (always sell everything to DA, no withhold, no ID trust)
+  // and S3 disabled. Re-uses the user's enables so a strategy switched off
+  // stays off in the baseline too.
+  function naiveRevenue(params) {
+    const naiveP = {
+      ...params,
+      X: 0,
+      Y: 0,
+      Z: 0,
+      enabled: { ...(params.enabled || {}), s3: false },
     };
-  }
-
-  function sweepLevel2(xs, ys, zs, ss_up, ss_dn, theta_flat, progressCb) {
-    const upList = ss_up && ss_up.length ? ss_up : [1];
-    const dnList = ss_dn && ss_dn.length ? ss_dn : [1];
-    let bestRev = -Infinity,
-      bestX = 0,
-      bestY = 0,
-      bestZ = 0,
-      bestSup = 1,
-      bestSdn = 1;
-    const total =
-      xs.length * ys.length * zs.length * upList.length * dnList.length;
-    let done = 0;
-    for (let xi = 0; xi < xs.length; xi++) {
-      for (let yi = 0; yi < ys.length; yi++) {
-        for (let zi = 0; zi < zs.length; zi++) {
-          for (let ui = 0; ui < upList.length; ui++) {
-            for (let di = 0; di < dnList.length; di++) {
-              const r = simulateTotal(
-                2,
-                xs[xi],
-                ys[yi],
-                zs[zi],
-                theta_flat,
-                upList[ui],
-                dnList[di],
-              );
-              if (r > bestRev) {
-                bestRev = r;
-                bestX = xs[xi];
-                bestY = ys[yi];
-                bestZ = zs[zi];
-                bestSup = upList[ui];
-                bestSdn = dnList[di];
-              }
-              done++;
-            }
-          }
-        }
-      }
-      if (progressCb) progressCb(done / total);
-    }
-    return {
-      best: {
-        X: bestX,
-        Y: bestY,
-        Z: bestZ,
-        s_up: bestSup,
-        s_dn: bestSdn,
-        revenue: bestRev,
-      },
-    };
-  }
-
-  // ---------- L3 oversell sweep ------------------------------------------
-  // Separate optimiser for the S3 strategy params (K, S_min, sigma_max,
-  // X_cap, M). Holds the market params (X, Y, Z, s_up, s_dn, theta_flat)
-  // fixed at the values passed in — by design (per Q7), so the user can
-  // independently tune market vs speculation. 5-D grid; coarse defaults
-  // for speed (the caller can pass denser grids if needed).
-  function sweepLevel3Oversell(
-    Ks,
-    S_mins,
-    sigma_maxs,
-    X_caps,
-    Ms,
-    fixedMarket,
-    progressCb,
-  ) {
-    const X = fixedMarket.X;
-    const Y = fixedMarket.Y;
-    const Z = fixedMarket.Z;
-    const theta = fixedMarket.theta_flat;
-    const sUp = fixedMarket.s_up == null ? 1 : fixedMarket.s_up;
-    const sDn = fixedMarket.s_dn == null ? 1 : fixedMarket.s_dn;
-    // Lag is fixed across the sweep — not an optimised dimension. Default
-    // matches simulate() / simulateTotal().
-    const lag = fixedMarket.lag == null ? 4 : (fixedMarket.lag | 0);
-    // DA-sold skip threshold: also fixed across the sweep (not optimised).
-    const da_skip = fixedMarket.da_skip == null ? 50 : (fixedMarket.da_skip | 0);
-    let bestRev = -Infinity,
-      bestK = Ks[0],
-      bestSmin = S_mins[0],
-      bestSigma = sigma_maxs[0],
-      bestXcap = X_caps[0],
-      bestM = Ms[0];
-    const total =
-      Ks.length * S_mins.length * sigma_maxs.length * X_caps.length * Ms.length;
-    let done = 0;
-    for (let ki = 0; ki < Ks.length; ki++) {
-      for (let si = 0; si < S_mins.length; si++) {
-        for (let gi = 0; gi < sigma_maxs.length; gi++) {
-          for (let xi = 0; xi < X_caps.length; xi++) {
-            for (let mi = 0; mi < Ms.length; mi++) {
-              const r = simulateTotal(3, X, Y, Z, theta, sUp, sDn, {
-                K: Ks[ki],
-                S_min: S_mins[si],
-                sigma_max: sigma_maxs[gi],
-                X_cap: X_caps[xi],
-                M: Ms[mi],
-                lag,
-                da_skip,
-              });
-              if (r > bestRev) {
-                bestRev = r;
-                bestK = Ks[ki];
-                bestSmin = S_mins[si];
-                bestSigma = sigma_maxs[gi];
-                bestXcap = X_caps[xi];
-                bestM = Ms[mi];
-              }
-              done++;
-            }
-          }
-        }
-      }
-      if (progressCb) progressCb(done / total);
-    }
-    return {
-      best: {
-        K: bestK,
-        S_min: bestSmin,
-        sigma_max: bestSigma,
-        X_cap: bestXcap,
-        M: bestM,
-        revenue: bestRev,
-      },
-    };
+    return simulateTotal(naiveP);
   }
 
   // ---------- robustness: top-N revenue concentration --------------------
@@ -1101,54 +817,37 @@ const Engine = (() => {
 
   // ---------- monthly aggregation (window-only) --------------------------
   // Mirrors simulate()'s revenue formula exactly so the monthly bars sum
-  // back to the headline totalRevenue. Includes aFRR contributions when
-  // s < 1.
-  function monthlyAggregation(level, params) {
+  // back to the headline totalRevenue.
+  function monthlyAggregation(params) {
+    const p = _resolveParams(params);
+    const s3Active = p.s3Enabled && p.s3_X_cap >= 1 && p.s3_K >= 1;
+    const s3Roll = s3Active ? _getS3Rolling(p.s3_K, p.s3_lag) : null;
+    const Q_pot_src = _qPotArray(p.actualSource);
+    const ID_src = _idArray(p.idSource);
     const start = new Date(D.start_iso);
     const buckets = new Map();
-    const isL2 = level >= 2;
-    const isL3 = level === 3;
-    const Y = params.Y;
-    const X = params.X;
-    const Z = params.Z || 0;
-    const theta = params.theta_flat || 0;
-    const s_up = params.s_up == null ? 1 : params.s_up;
-    const s_dn = params.s_dn == null ? 1 : params.s_dn;
-    const sUpC = s_up < 0 ? 0 : s_up > 1 ? 1 : s_up;
-    const sDnC = s_dn < 0 ? 0 : s_dn > 1 ? 1 : s_dn;
-    // S3 params (active when level === 3 AND X_cap ≥ 1 AND K ≥ 1).
-    const s3K = (params.s3_K | 0) || 0;
-    const s3X_cap = (params.s3_X_cap | 0) || 0;
-    const s3Enabled = isL3 && s3X_cap >= 1 && s3K >= 1;
-    const s3S_min = +params.s3_S_min || 0;
-    const s3Sigma_max = +params.s3_sigma_max || 0;
-    const s3M = +params.s3_M || 0;
-    const s3L = params.s3_lag == null ? 4 : (params.s3_lag | 0);
-    const s3DaSkip = params.s3_da_skip == null ? 50 : (params.s3_da_skip | 0);
-    const s3Roll = s3Enabled ? _getS3Rolling(s3K, s3L) : null;
     for (let i = winStart; i < winEnd; i++) {
       const ts = new Date(start.getTime() + D.offsets[i] * D.step_min * 60000);
       const key = `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`;
       const F = D.da_forecast[i];
-      const ID = D.id_forecast[i];
+      const ID = ID_src[i];
       const P_da = D.p_da[i];
       const P_mfrr = D.p_mfrr[i];
-      const aboveX = P_da >= X;
-      const da_sold = Math.floor((aboveX ? F : F * (1 - Y)) + 1e-9);
+      const aboveX = P_da >= p.X;
+      const da_sold = Math.floor((aboveX ? F : F * (1 - p.Y)) + 1e-9);
       const Q_w = Math.floor((aboveX ? 0 : F - da_sold) + 1e-9);
-      const trustedRevRaw = isL2 ? Z * (ID - F) : 0;
+      const trustedRevRaw = p.Z * (ID - F);
       const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
       const up_offer = Q_w + trustedExtra;
       const dn_offer = da_sold;
-      const Q_up_mfrr = Math.round(sUpC * up_offer);
+      const Q_up_mfrr = Math.round(p.s_up * up_offer);
       const Q_up_afrr = up_offer - Q_up_mfrr;
-      const Q_dn_mfrr = Math.round(sDnC * dn_offer);
+      const Q_dn_mfrr = Math.round(p.s_dn * dn_offer);
       const Q_dn_afrr = dn_offer - Q_dn_mfrr;
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr_q = isUp ? Q_up_mfrr : 0;
       const dn_mfrr_q = isDn ? Q_dn_mfrr : 0;
-      // aFRR profitability gate (see simulate() for the rationale).
       const avg_pos = D.avg_p_pos[i];
       const avg_neg = D.avg_p_neg[i];
       const upAfrrActive = avg_pos > 0 && Q_up_afrr > 0;
@@ -1158,54 +857,46 @@ const Engine = (() => {
       const DnMfrr_rev = -dn_mfrr_q * P_mfrr * 0.25;
       const UpAfrr_rev = upAfrrActive ? Q_up_afrr * avg_pos * 0.25 : 0;
       const DnAfrr_rev = dnAfrrActive ? -Q_dn_afrr * avg_neg * 0.25 : 0;
-      let imb = 0,
-        flat = 0;
+      const up_afrr_disp = upAfrrActive ? Q_up_afrr * (D.afrr_n_pos_fav[i] / 225) : 0;
+      const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * (D.afrr_n_neg_fav[i] / 225) : 0;
+      const Q_pos_l2 = da_sold + up_mfrr_q + up_afrr_disp - dn_mfrr_q - dn_afrr_disp;
       let S3Intraday_rev = 0,
         S3Curtail_rev = 0,
         S3ExtraCost = 0;
-      if (isL2) {
-        // Favourable-only counts (see init()) — matches simulate().
-        const up_afrr_disp = upAfrrActive ? Q_up_afrr * (D.afrr_n_pos_fav[i] / 225) : 0;
-        const dn_afrr_disp = dnAfrrActive ? Q_dn_afrr * (D.afrr_n_neg_fav[i] / 225) : 0;
-        const Q_pos_l2 = da_sold + up_mfrr_q + up_afrr_disp - dn_mfrr_q - dn_afrr_disp;
-
-        // S3 contribution per ISP — mirrors simulate() logic.
-        let s3_X = 0;
-        let s3_fires = false;
-        if (s3Enabled && da_sold < s3DaSkip) {
-          const P_ID_est = D.vwap_1h[i];
-          if (!isNaN(P_ID_est)) {
-            const P_mfrr_est = s3Roll.mean[i];
-            const P_mfrr_sigma = s3Roll.std[i];
-            if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
-              const spread = P_ID_est - P_mfrr_est;
-              if (spread >= s3S_min && P_mfrr_sigma <= s3Sigma_max) {
-                const sig = (spread - s3S_min) / s3S_min;
-                const X_prop = Math.floor(s3X_cap * (sig < 1 ? sig : 1) + 1e-9);
-                if (X_prop >= 1) {
-                  const bid_price = P_ID_est + s3M;
-                  // Hedge mFRR-dn bid clears at P_mfrr ≤ bid_price (see simulate()).
-                  s3_fires = P_mfrr <= bid_price;
-                  s3_X = X_prop;
-                  S3Intraday_rev = X_prop * P_ID_est * 0.25;
-                  if (s3_fires) S3Curtail_rev = X_prop * (-P_mfrr) * 0.25;
-                }
+      let s3_X = 0;
+      let s3_fires = false;
+      if (s3Active && da_sold < p.s3_da_skip) {
+        const P_ID_est = D.vwap_1h[i];
+        if (!isNaN(P_ID_est)) {
+          const P_mfrr_est = s3Roll.mean[i];
+          const P_mfrr_sigma = s3Roll.std[i];
+          if (!isNaN(P_mfrr_est) && !isNaN(P_mfrr_sigma)) {
+            const spread = P_ID_est - P_mfrr_est;
+            if (spread >= p.s3_S_min && P_mfrr_sigma <= p.s3_sigma_max) {
+              const sig = (spread - p.s3_S_min) / p.s3_S_min;
+              const X_prop = Math.floor(p.s3_X_cap * (sig < 1 ? sig : 1) + 1e-9);
+              if (X_prop >= 1) {
+                const bid_price = P_ID_est + p.s3_M;
+                s3_fires = P_mfrr <= bid_price;
+                s3_X = X_prop;
+                S3Intraday_rev = X_prop * P_ID_est * 0.25;
+                if (s3_fires) S3Curtail_rev = X_prop * (-P_mfrr) * 0.25;
               }
             }
           }
         }
-        const Q_pos = Q_pos_l2 + (s3_fires ? 0 : s3_X);
-        const Q_pot = D.q_pot[i];
-        const short_l2 = Q_pos_l2 > Q_pot ? Q_pos_l2 - Q_pot : 0;
-        const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
-        // Guard against NaN p_imb (April rows): treat as 0 cost rather than
-        // letting NaN poison the entire month's bucket.
-        const pimb = D.p_imb[i];
-        if (!isNaN(pimb)) {
-          imb = short_l2 * pimb * 0.25;
-          flat = short_l2 * theta * 0.25;
-          S3ExtraCost = (short - short_l2) * (pimb + theta) * 0.25;
-        }
+      }
+      const Q_pos = Q_pos_l2 + (s3_fires ? 0 : s3_X);
+      const Q_pot = Q_pot_src[i];
+      const short_l2 = Q_pos_l2 > Q_pot ? Q_pos_l2 - Q_pot : 0;
+      const short = Q_pos > Q_pot ? Q_pos - Q_pot : 0;
+      let imb = 0,
+        flat = 0;
+      const pimb = D.p_imb[i];
+      if (!isNaN(pimb)) {
+        imb = short_l2 * pimb * 0.25;
+        flat = short_l2 * p.theta_flat * 0.25;
+        S3ExtraCost = (short - short_l2) * (pimb + p.theta_flat) * 0.25;
       }
       const b =
         buckets.get(key) ||
@@ -1237,9 +928,6 @@ const Engine = (() => {
     const keys = [...buckets.keys()].sort();
     for (const k of keys) {
       const b = buckets.get(k);
-      // Back-compat: keep `up` / `dn` as the SUM of mFRR + aFRR for the
-      // existing stacked-bar chart (charts.js drawMonthly stacks DA / up /
-      // dn / imb / flat). Callers that need the split read the new keys.
       out.push({
         month: k,
         DA: b.DA,
@@ -1270,10 +958,14 @@ const Engine = (() => {
     return out;
   }
 
-  // Sum of MWh of potential generation in the current window.
-  function totalPotMWhInWindow() {
+  // Sum of MWh of Q_pot in the current window. Q_pot depends on the
+  // actualSource selector so the "revenue per MWh of potential" tile is
+  // self-consistent with whatever drives shortfall.
+  function totalPotMWhInWindow(params) {
+    const actualSource = params && params.actualSource ? params.actualSource : "real";
+    const arr = _qPotArray(actualSource);
     let s = 0;
-    for (let i = winStart; i < winEnd; i++) s += D.q_pot[i] * 0.25;
+    for (let i = winStart; i < winEnd; i++) s += arr[i] * 0.25;
     return s;
   }
 
@@ -1293,9 +985,6 @@ const Engine = (() => {
     simulate,
     simulateTotal,
     naiveRevenue,
-    sweepLevel1,
-    sweepLevel2,
-    sweepLevel3Oversell,
     topConcentration,
     monthlyAggregation,
     totalPotMWhInWindow,

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Vanessa Wind Park — Market Strategy Backtester</title>
-    <link rel="stylesheet" href="style.css?v=34" />
+    <link rel="stylesheet" href="style.css?v=36" />
   </head>
   <body>
     <nav class="site-nav">
@@ -17,24 +17,19 @@
       <h1>Vanessa Wind Park — Market Strategy Backtester</h1>
       <p class="subtitle">
         14 × 4.2&nbsp;MW (58.8&nbsp;MW) onshore wind park at Targale, Latvia.
-        15-minute ISP backtester comparing day-ahead vs mFRR-balancing
-        allocations with optional ID-forecast adjustment. Data covers
-        <span id="data-range">…</span>.
+        15-minute ISP backtester. Pick the data sources (what counts as
+        "actual" power, what counts as the intra-day forecast) and the
+        strategies to enable — the optimiser then sweeps every checked
+        strategy jointly. Data covers <span id="data-range">…</span>.
       </p>
     </header>
 
-    <nav class="tabs">
-      <button class="tab active" data-level="1">Level 1 — DA forecast = Actual Power</button>
-      <button class="tab" data-level="2">Level 2 — DA + Actual power + imbalance penalties</button>
-      <button class="tab" data-level="3">Level 3 — DA + Actual power + imbalance penalties + speculation</button>
-    </nav>
-
     <!-- =================================================================
-         SHARED SETUP — sits below the level selector and applies to all
-         three levels. Changing anything here propagates to L1/L2/L3 state
-         (sim window, winsorisation, θ_flat) so switching tabs uses the same
-         experiment scope. These bound the analysis but aren't optimised.
-         Spans full viewport width to anchor the page visually.
+         SETUP — sources, sim window, winsorisation, θ. Everything in
+         this section bounds the experiment; nothing here is optimised.
+         The two source-selector groups at the top determine what the
+         engine reads as "actual generation" (Q_pot) and what it reads
+         as the intra-day forecast (ID input to Z·(ID − F)).
          ================================================================= -->
     <div class="setup-wrapper">
       <section class="setup-box">
@@ -42,11 +37,9 @@
           <div class="group-head">
             <h3>Setup</h3>
             <p class="group-desc">
-              Define the experiment environment — what data is fed into the
-              simulation. Setup applies to all three levels: change anything
-              here and the next tab you open uses the same window /
-              winsorisation / θ. Not varied by the optimiser; not touched by
-              "Reset to naïve".
+              Define the experiment environment — what data is fed into
+              the simulation and how it is bounded. Setup is not varied
+              by the optimiser and not touched by "Reset to naïve".
             </p>
           </div>
           <div class="controls-grid" id="setup-params"></div>
@@ -56,12 +49,22 @@
 
     <main>
       <!-- =================================================================
-           LEVEL 1 PANEL
+           UNIFIED STRATEGY PANEL — four strategy cards, each toggleable
+           via the checkbox in the card head. Unchecking a card greys it
+           out and the engine treats its strategy as neutralised:
+             · DA withhold off → Y = 0 (full forecast always sold to DA)
+             · mFRR↔aFRR split off → s_up = s_dn = 1 (all mFRR)
+             · ID trust off → Z = 0 (no ID revision)
+             · Intra-day oversell off → S3 disabled
            ================================================================= -->
-      <section id="panel-1" class="panel active">
-        <div class="controls-card">
+      <section id="strategy-panel" class="panel active">
+        <div class="controls-card" data-strategy="da-withhold">
           <div class="param-group market">
             <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-da-withhold" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
               <h3>DA withhold on low prices <span class="badge">optimised</span></h3>
               <p class="group-desc">
                 When DA clears at or below price threshold X, hold back fraction
@@ -69,13 +72,17 @@
                 Above X, sell the full forecast to DA as usual.
               </p>
             </div>
-            <div class="controls-grid" id="l1-da-withhold-params"></div>
+            <div class="controls-grid" id="da-withhold-params"></div>
           </div>
         </div>
 
-        <div class="controls-card">
+        <div class="controls-card" data-strategy="split">
           <div class="param-group market">
             <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-split" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
               <h3>mFRR ↔ aFRR universal offer split <span class="badge">optimised</span></h3>
               <p class="group-desc">
                 Per-direction routing of balancing volume between mFRR and aFRR.
@@ -83,342 +90,37 @@
                 the two markets price each direction differently.
               </p>
             </div>
-            <div class="controls-grid" id="l1-split-params"></div>
+            <div class="controls-grid" id="split-params"></div>
           </div>
         </div>
 
-        <div class="controls-card actions-card">
-          <div class="actions">
-            <button id="l1-optimise" class="btn primary">⚡ Optimise</button>
-            <button id="l1-reset" class="btn">⇄ Reset to naïve</button>
-            <span id="l1-progress" class="progress"></span>
-          </div>
-        </div>
-
-        <div class="stats-card" id="l1-stats">
-          <div class="stat-grid">
-            <div class="big-stat">
-              <div class="label" title="Sum of per-ISP P&L over the entire backtest window.">Total revenue</div>
-              <div class="value" id="l1-total">–</div>
-            </div>
-            <div class="big-stat">
-              <div class="label" title="Difference vs. selling everything to DA at every ISP (Y=0, Z=0). Computed at the current θ_flat and winsorization.">Vs. naïve baseline</div>
-              <div class="value" id="l1-vs-naive">–</div>
-            </div>
-            <div class="big-stat">
-              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated). Useful as an asset-yield comparison.">Revenue per MWh of potential</div>
-              <div class="value" id="l1-per-mwh">–</div>
-            </div>
-          </div>
-          <table class="decomposition" id="l1-decomp-table"></table>
-          <table class="decomposition" id="l1-counts-table"></table>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h2>Time series</h2>
-            <div class="ts-controls">
-              <label>From:
-                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
-                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
-                       id="l1-date-from" class="date-eu" />
+        <div class="controls-card" data-strategy="id-trust">
+          <div class="param-group market">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-id-trust" checked />
+                <span class="strategy-toggle-box"></span>
               </label>
-              <label>To:
-                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
-                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
-                       id="l1-date-to" class="date-eu" />
-              </label>
-              <button id="l1-prev-range" class="btn small" title="Shift backward by current span">◀</button>
-              <button id="l1-next-range" class="btn small" title="Shift forward by current span">▶</button>
-              <span class="preset-group">
-                <button class="btn small preset" data-level="1" data-preset="1d">1d</button>
-                <button class="btn small preset" data-level="1" data-preset="1w">1w</button>
-                <button class="btn small preset" data-level="1" data-preset="1mo">1mo</button>
-                <button class="btn small preset" data-level="1" data-preset="3mo">3mo</button>
-                <button class="btn small preset" data-level="1" data-preset="all">all</button>
-              </span>
-              <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
-            </div>
-          </div>
-          <p class="card-desc">
-            DA-sold (line) and mFRR up/down volumes (bars) over the chosen window.
-            Hover any ISP for the full P&L breakdown. Bar mode for ranges ≤ 6 days;
-            filled-area scatter for longer ranges (the "all" preset plots all 40 k ISPs).
-          </p>
-          <div id="l1-ts-chart" class="chart"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h2>Robustness</h2>
-          </div>
-          <p class="card-desc">
-            How concentrated is the revenue? If a few rare periods dominate, the
-            "optimum" may be a coincidence. Read the numbers below as a stress test.
-          </p>
-          <div class="robust-grid">
-            <div class="robust-item">
-              <div class="label">Top 1% concentration</div>
-              <div class="big-num" id="l1-top1pct">–</div>
-              <div class="robust-help">
-                Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
-                <br><b>&lt; 10%:</b> well-distributed.
-                <br><b>&gt; 30%:</b> strategy depends on rare events.
-              </div>
-            </div>
-            <div class="robust-item">
-              <div class="label">Top 5% concentration</div>
-              <div class="big-num" id="l1-top5pct">–</div>
-              <div class="robust-help">
-                Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
-              </div>
-            </div>
-            <div class="robust-item">
-              <div class="label">Top 10% concentration</div>
-              <div class="big-num" id="l1-top10pct">–</div>
-              <div class="robust-help">
-                Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
-              </div>
-            </div>
-          </div>
-          <div class="two-col">
-            <div>
-              <h3>Monthly revenue (decomposition)</h3>
-              <p class="chart-desc">
-                Stacked bar per calendar month showing how each leg contributes.
-                Big swings between months suggest seasonality.
-              </p>
-              <div id="l1-monthly-chart" class="chart small"></div>
-            </div>
-            <div>
-              <h3>Per-ISP revenue distribution</h3>
-              <p class="chart-desc">
-                Histogram (log-scale Y) of every ISP's revenue. A long right tail
-                means a few periods dominate.
-              </p>
-              <div id="l1-hist-chart" class="chart small"></div>
-            </div>
-          </div>
-        </div>
-
-      </section>
-
-      <!-- =================================================================
-           LEVEL 2 PANEL
-           ================================================================= -->
-      <section id="panel-2" class="panel">
-        <div class="controls-card">
-          <div class="param-group market">
-            <div class="group-head">
-              <h3>DA withhold on low prices <span class="badge">optimised</span></h3>
-              <p class="group-desc">
-                When DA clears at or below price threshold X, hold back fraction
-                Y of the forecast from DA and offer it to balancing instead.
-                Above X, sell the full forecast to DA as usual.
-              </p>
-            </div>
-            <div class="controls-grid" id="l2-da-withhold-params"></div>
-          </div>
-        </div>
-
-        <div class="controls-card">
-          <div class="param-group market">
-            <div class="group-head">
-              <h3>mFRR ↔ aFRR universal offer split <span class="badge">optimised</span></h3>
-              <p class="group-desc">
-                Per-direction routing of balancing volume between mFRR and aFRR.
-                Independent ratios for upward (s_up) and downward (s_dn) because
-                the two markets price each direction differently.
-              </p>
-            </div>
-            <div class="controls-grid" id="l2-split-params"></div>
-          </div>
-        </div>
-
-        <div class="controls-card">
-          <div class="param-group market">
-            <div class="group-head">
               <h3>ID trust coefficient <span class="badge">optimised</span></h3>
               <p class="group-desc">
                 How much of the intra-day forecast revision (ID − DA) to act on
                 as additional mFRR-up volume. Negative revisions are not acted on
-                (no buy-back modelled).
+                (no buy-back modelled). Only meaningful when the ID forecast
+                source in Setup is set to "Real intra-day forecast" — otherwise
+                ID − DA = 0 and the term collapses.
               </p>
             </div>
-            <div class="controls-grid" id="l2-id-trust-params"></div>
+            <div class="controls-grid" id="id-trust-params"></div>
           </div>
         </div>
 
-        <div class="controls-card actions-card">
-          <div class="actions">
-            <button id="l2-optimise" class="btn primary">⚡ Optimise</button>
-            <button id="l2-reset" class="btn">⇄ Reset to naïve</button>
-            <span id="l2-progress" class="progress"></span>
-          </div>
-        </div>
-
-        <div class="stats-card" id="l2-stats">
-          <div class="stat-grid">
-            <div class="big-stat">
-              <div class="label" title="Sum of per-ISP P&L over the entire backtest window.">Total revenue</div>
-              <div class="value" id="l2-total">–</div>
-            </div>
-            <div class="big-stat">
-              <div class="label" title="Difference vs. selling everything to DA at every ISP (Y=0, Z=0). Computed at the current θ_flat and winsorization.">Vs. naïve baseline</div>
-              <div class="value" id="l2-vs-naive">–</div>
-            </div>
-            <div class="big-stat">
-              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated). Useful as an asset-yield comparison.">Revenue per MWh of potential</div>
-              <div class="value" id="l2-per-mwh">–</div>
-            </div>
-          </div>
-          <table class="decomposition" id="l2-decomp-table"></table>
-          <table class="decomposition" id="l2-counts-table"></table>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h2>Time series</h2>
-            <div class="ts-controls">
-              <label>From:
-                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
-                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
-                       id="l2-date-from" class="date-eu" />
-              </label>
-              <label>To:
-                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
-                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
-                       id="l2-date-to" class="date-eu" />
-              </label>
-              <button id="l2-prev-range" class="btn small" title="Shift backward by current span">◀</button>
-              <button id="l2-next-range" class="btn small" title="Shift forward by current span">▶</button>
-              <span class="preset-group">
-                <button class="btn small preset" data-level="2" data-preset="1d">1d</button>
-                <button class="btn small preset" data-level="2" data-preset="1w">1w</button>
-                <button class="btn small preset" data-level="2" data-preset="1mo">1mo</button>
-                <button class="btn small preset" data-level="2" data-preset="3mo">3mo</button>
-                <button class="btn small preset" data-level="2" data-preset="all">all</button>
-              </span>
-              <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
-            </div>
-          </div>
-          <p class="card-desc">
-            DA-sold (line) and mFRR up/down volumes (bars) over the chosen window.
-            Hover any ISP for the full P&L breakdown. Bar mode for ranges ≤ 6 days;
-            filled-area scatter for longer ranges (the "all" preset plots all 40 k ISPs).
-          </p>
-          <div id="l2-ts-chart" class="chart"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h2>Robustness</h2>
-          </div>
-          <p class="card-desc">
-            How concentrated is the revenue? If a few rare periods dominate, the
-            "optimum" may be a coincidence. Read the numbers below as a stress test.
-          </p>
-          <div class="robust-grid">
-            <div class="robust-item">
-              <div class="label">Top 1% concentration</div>
-              <div class="big-num" id="l2-top1pct">–</div>
-              <div class="robust-help">
-                Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
-                <br><b>&lt; 10%:</b> well-distributed.
-                <br><b>&gt; 30%:</b> strategy depends on rare events.
-              </div>
-            </div>
-            <div class="robust-item">
-              <div class="label">Top 5% concentration</div>
-              <div class="big-num" id="l2-top5pct">–</div>
-              <div class="robust-help">
-                Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
-              </div>
-            </div>
-            <div class="robust-item">
-              <div class="label">Top 10% concentration</div>
-              <div class="big-num" id="l2-top10pct">–</div>
-              <div class="robust-help">
-                Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
-              </div>
-            </div>
-          </div>
-          <div class="two-col">
-            <div>
-              <h3>Monthly revenue (decomposition)</h3>
-              <p class="chart-desc">
-                Stacked bar per calendar month showing how each leg contributes.
-                Big swings between months suggest seasonality.
-              </p>
-              <div id="l2-monthly-chart" class="chart small"></div>
-            </div>
-            <div>
-              <h3>Per-ISP revenue distribution</h3>
-              <p class="chart-desc">
-                Histogram (log-scale Y) of every ISP's revenue. A long right tail
-                means a few periods dominate.
-              </p>
-              <div id="l2-hist-chart" class="chart small"></div>
-            </div>
-          </div>
-        </div>
-
-      </section>
-
-      <!-- =================================================================
-           LEVEL 3 PANEL
-           L2 + S3 (speculative intraday oversell). Three control groups:
-           Setup, Market parameters, Intra-day oversell. Per Q7, market
-           and oversell each have their own ⚡ Optimise button — they're
-           tuned independently. Setting s3_X_cap = 0 disables S3 entirely
-           and L3 reverts to L2 behaviour.
-           ================================================================= -->
-      <section id="panel-3" class="panel">
-        <div class="controls-card">
-          <div class="param-group market">
-            <div class="group-head">
-              <h3>DA withhold on low prices <span class="badge">optimised</span></h3>
-              <p class="group-desc">
-                When DA clears at or below price threshold X, hold back fraction
-                Y of the forecast from DA and offer it to balancing instead.
-                Above X, sell the full forecast to DA as usual.
-              </p>
-            </div>
-            <div class="controls-grid" id="l3-da-withhold-params"></div>
-          </div>
-        </div>
-
-        <div class="controls-card">
-          <div class="param-group market">
-            <div class="group-head">
-              <h3>mFRR ↔ aFRR universal offer split <span class="badge">optimised</span></h3>
-              <p class="group-desc">
-                Per-direction routing of balancing volume between mFRR and aFRR.
-                Independent ratios for upward (s_up) and downward (s_dn) because
-                the two markets price each direction differently.
-              </p>
-            </div>
-            <div class="controls-grid" id="l3-split-params"></div>
-          </div>
-        </div>
-
-        <div class="controls-card">
-          <div class="param-group market">
-            <div class="group-head">
-              <h3>ID trust coefficient <span class="badge">optimised</span></h3>
-              <p class="group-desc">
-                How much of the intra-day forecast revision (ID − DA) to act on
-                as additional mFRR-up volume. Negative revisions are not acted on
-                (no buy-back modelled).
-              </p>
-            </div>
-            <div class="controls-grid" id="l3-id-trust-params"></div>
-          </div>
-        </div>
-
-        <div class="controls-card">
+        <div class="controls-card" data-strategy="s3">
           <div class="param-group oversell">
             <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-s3" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
               <h3>Intra-day oversell <span class="badge">optimised</span></h3>
               <p class="group-desc">
                 S3: for each ISP, if da_sold &lt; "Skip if DA sold ≥" AND
@@ -427,46 +129,45 @@
                 bid at VWAP1H + M — a stop-loss mFRR-dn offer the park
                 wouldn't normally place (pitched above the typical
                 clearing). The hedge clears whenever p_mfrr ≤ VWAP1H + M,
-                bounding the loss on the oversold MW.
-                Rolling stats are over [target − K − L, target − L) — the
-                publication lag L (default 4 ISPs ≈ 1 h) models the fact
-                that an intra-day trader cannot see settlement prices of
-                the ISPs immediately preceding the target. Set X_cap = 0
-                to disable S3 and revert L3 to L2 behaviour. The single
-                Optimise button at the bottom sweeps K, S_min, σ_max and
-                M jointly with the market params — X_cap, L and DA-skip
-                stay at their user-set values.
+                bounding the loss on the oversold MW. Rolling stats span
+                [target − K − L, target − L) — the publication lag L
+                (default 4 ISPs ≈ 1 h) models the fact that an intra-day
+                trader cannot see settlement prices of the ISPs
+                immediately preceding the target. The Optimise button
+                sweeps K, S_min, σ_max and M jointly with the other
+                checked strategies' params — X_cap, L and DA-skip stay at
+                their user-set values.
               </p>
             </div>
-            <div class="controls-grid" id="l3-oversell-params"></div>
+            <div class="controls-grid" id="s3-params"></div>
           </div>
         </div>
 
         <div class="controls-card actions-card">
           <div class="actions">
-            <button id="l3-optimise" class="btn primary">⚡ Optimise</button>
-            <button id="l3-reset" class="btn">⇄ Reset to naïve</button>
-            <span id="l3-progress" class="progress"></span>
+            <button id="optimise" class="btn primary">⚡ Optimise</button>
+            <button id="reset" class="btn">⇄ Reset to defaults</button>
+            <span id="progress" class="progress"></span>
           </div>
         </div>
 
-        <div class="stats-card" id="l3-stats">
+        <div class="stats-card" id="stats">
           <div class="stat-grid">
             <div class="big-stat">
               <div class="label" title="Sum of per-ISP P&L over the entire backtest window.">Total revenue</div>
-              <div class="value" id="l3-total">–</div>
+              <div class="value" id="total">–</div>
             </div>
             <div class="big-stat">
-              <div class="label" title="Difference vs. selling everything to DA at every ISP (Y=0, Z=0). Computed at the current θ_flat and winsorization.">Vs. naïve baseline</div>
-              <div class="value" id="l3-vs-naive">–</div>
+              <div class="label" title="Difference vs. selling everything to DA at every ISP (X=Y=Z=0, S3 off). Computed at the current θ_flat, sources and splits.">Vs. naïve baseline</div>
+              <div class="value" id="vs-naive">–</div>
             </div>
             <div class="big-stat">
-              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated). Useful as an asset-yield comparison.">Revenue per MWh of potential</div>
-              <div class="value" id="l3-per-mwh">–</div>
+              <div class="label" title="Total revenue divided by total MWh of potential generation (Q_pot integrated, using the chosen actual-power source).">Revenue per MWh of potential</div>
+              <div class="value" id="per-mwh">–</div>
             </div>
           </div>
-          <table class="decomposition" id="l3-decomp-table"></table>
-          <table class="decomposition" id="l3-counts-table"></table>
+          <table class="decomposition" id="decomp-table"></table>
+          <table class="decomposition" id="counts-table"></table>
         </div>
 
         <div class="card">
@@ -476,31 +177,32 @@
               <label>From:
                 <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
                        pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
-                       id="l3-date-from" class="date-eu" />
+                       id="date-from" class="date-eu" />
               </label>
               <label>To:
                 <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
                        pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
-                       id="l3-date-to" class="date-eu" />
+                       id="date-to" class="date-eu" />
               </label>
-              <button id="l3-prev-range" class="btn small" title="Shift backward by current span">◀</button>
-              <button id="l3-next-range" class="btn small" title="Shift forward by current span">▶</button>
+              <button id="prev-range" class="btn small" title="Shift backward by current span">◀</button>
+              <button id="next-range" class="btn small" title="Shift forward by current span">▶</button>
               <span class="preset-group">
-                <button class="btn small preset" data-level="3" data-preset="1d">1d</button>
-                <button class="btn small preset" data-level="3" data-preset="1w">1w</button>
-                <button class="btn small preset" data-level="3" data-preset="1mo">1mo</button>
-                <button class="btn small preset" data-level="3" data-preset="3mo">3mo</button>
-                <button class="btn small preset" data-level="3" data-preset="all">all</button>
+                <button class="btn small preset" data-preset="1d">1d</button>
+                <button class="btn small preset" data-preset="1w">1w</button>
+                <button class="btn small preset" data-preset="1mo">1mo</button>
+                <button class="btn small preset" data-preset="3mo">3mo</button>
+                <button class="btn small preset" data-preset="all">all</button>
               </span>
               <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
             </div>
           </div>
           <p class="card-desc">
-            DA-sold (line) and mFRR up/down volumes (bars) over the chosen window.
-            Hover any ISP for the full P&L breakdown. Bar mode for ranges ≤ 6 days;
-            filled-area scatter for longer ranges (the "all" preset plots all 40 k ISPs).
+            DA-sold (line) and mFRR/aFRR up/down volumes (bars) over the
+            chosen window. Hover any ISP for the full P&L breakdown. Bar
+            mode for ranges ≤ 6 days; filled-area scatter for longer
+            ranges (the "all" preset plots all 40 k ISPs).
           </p>
-          <div id="l3-ts-chart" class="chart"></div>
+          <div id="ts-chart" class="chart"></div>
         </div>
 
         <div class="card">
@@ -508,13 +210,14 @@
             <h2>Robustness</h2>
           </div>
           <p class="card-desc">
-            How concentrated is the revenue? If a few rare periods dominate, the
-            "optimum" may be a coincidence. Read the numbers below as a stress test.
+            How concentrated is the revenue? If a few rare periods dominate,
+            the "optimum" may be a coincidence. Read the numbers below as a
+            stress test.
           </p>
           <div class="robust-grid">
             <div class="robust-item">
               <div class="label">Top 1% concentration</div>
-              <div class="big-num" id="l3-top1pct">–</div>
+              <div class="big-num" id="top1pct">–</div>
               <div class="robust-help">
                 Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
                 <br><b>&lt; 10%:</b> well-distributed.
@@ -523,14 +226,14 @@
             </div>
             <div class="robust-item">
               <div class="label">Top 5% concentration</div>
-              <div class="big-num" id="l3-top5pct">–</div>
+              <div class="big-num" id="top5pct">–</div>
               <div class="robust-help">
                 Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
               </div>
             </div>
             <div class="robust-item">
               <div class="label">Top 10% concentration</div>
-              <div class="big-num" id="l3-top10pct">–</div>
+              <div class="big-num" id="top10pct">–</div>
               <div class="robust-help">
                 Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
               </div>
@@ -543,7 +246,7 @@
                 Stacked bar per calendar month showing how each leg contributes.
                 Big swings between months suggest seasonality.
               </p>
-              <div id="l3-monthly-chart" class="chart small"></div>
+              <div id="monthly-chart" class="chart small"></div>
             </div>
             <div>
               <h3>Per-ISP revenue distribution</h3>
@@ -551,7 +254,7 @@
                 Histogram (log-scale Y) of every ISP's revenue. A long right tail
                 means a few periods dominate.
               </p>
-              <div id="l3-hist-chart" class="chart small"></div>
+              <div id="hist-chart" class="chart small"></div>
             </div>
           </div>
         </div>
@@ -561,7 +264,6 @@
 
     <footer class="site-footer">
       <p>
-        Click any point on the heatmap to set parameters to that value.
         Hover the time-series chart for per-ISP detail. All math runs
         client-side — no server required.
       </p>
@@ -572,7 +274,7 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="data.js?v=34"></script>
+    <script src="data.js?v=36"></script>
     <!--
       data-afrr.js: per-ISP aFRR activation counts (n_pos, n_neg, n_total).
       Engine reads n_pos / n_neg to scale aFRR position contribution
@@ -582,10 +284,10 @@
       mFRR↔aFRR split parameter s < 1. Both files are gracefully optional
       — engine.js falls back to zero arrays if either is missing.
     -->
-    <script src="data-afrr.js?v=34"></script>
-    <script src="data-afrr-15min.js?v=34"></script>
-    <script src="engine.js?v=34"></script>
-    <script src="charts.js?v=34"></script>
-    <script src="app.js?v=34"></script>
+    <script src="data-afrr.js?v=36"></script>
+    <script src="data-afrr-15min.js?v=36"></script>
+    <script src="engine.js?v=36"></script>
+    <script src="charts.js?v=36"></script>
+    <script src="app.js?v=36"></script>
   </body>
 </html>
