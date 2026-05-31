@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1200, initial-scale=1" />
+    <title>Baltic Imbalance Forecast — Vanessa Wind Park</title>
+    <link rel="stylesheet" href="style.css?v=37" />
+  </head>
+  <body>
+    <nav class="site-nav">
+      <a href="index.html" class="brand">Vanessa Wind Park</a>
+      <a href="index.html" class="navlink">Backtester</a>
+      <a href="graphs.html" class="navlink">Graphs</a>
+      <a href="forecast.html" class="navlink active">Forecast</a>
+    </nav>
+
+    <header class="site-header">
+      <h1>Baltic Imbalance Regime Forecast</h1>
+      <p class="subtitle">
+        Six-hour ahead (24 × 15-minute) probability forecast of Baltic
+        imbalance regimes — NEG (grid deficit), ZRO (balanced), POS
+        (grid surplus) — and expected imbalance prices. The model
+        (<code>regime_v6_light_top100</code>) lives in a separate private
+        repository and runs on demand via GitHub Actions. Last
+        forecast: <span id="last-updated">—</span>.
+      </p>
+    </header>
+
+    <main>
+      <!-- =================================================================
+           CONTROL CARD — repo + activation toggle.
+           The page is in a public repo; the model lives in a private
+           one. We talk to the private repo through a hardcoded GitHub
+           PAT (Actions:write + Contents:read). Workflow runs are
+           additionally password-gated server-side: the typed password is
+           verified inside the workflow against a GitHub Actions secret,
+           so leaking the PAT alone doesn't let anyone burn compute.
+           ================================================================= -->
+      <section class="panel active">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Forecast control</h3>
+              <p class="group-desc">
+                The latest forecast (read-only) loads automatically when
+                you open the page. To request a fresh run, enter the
+                shared password and activate — that triggers a workflow
+                dispatch immediately and then again every 15 minutes
+                until you deactivate. Each cycle: dispatch → poll for
+                completion → refetch forecast.json → redraw the charts.
+              </p>
+            </div>
+            <div class="controls-grid" id="forecast-controls">
+              <div class="control">
+                <label>Repository</label>
+                <div class="slider-row">
+                  <span id="repo-display" class="winsor-cap">—</span>
+                </div>
+                <div class="param-desc">
+                  <p>
+                    Private GitHub repository hosting the model and
+                    <code>forecast.json</code>. Edit the constants at the
+                    top of <code>forecast-app.js</code> to point at your
+                    repo.
+                  </p>
+                </div>
+              </div>
+              <div class="control">
+                <label for="pwd-input">Run password</label>
+                <div class="slider-row">
+                  <input
+                    type="password"
+                    id="pwd-input"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="(empty)"
+                  />
+                  <button id="activate-btn" class="btn primary">Activate</button>
+                </div>
+                <div class="param-desc">
+                  <p>
+                    The password gates workflow dispatches server-side.
+                    It is never persisted to disk, browser storage or
+                    URL — only held in memory while the page is active.
+                    Deactivate or reload to clear it.
+                  </p>
+                </div>
+              </div>
+              <div class="control">
+                <label>Status</label>
+                <div class="slider-row">
+                  <span id="status-text" class="winsor-cap">idle</span>
+                </div>
+                <div class="param-desc">
+                  <p>
+                    Activation state and last-dispatch result. Wrong
+                    password → the workflow exits in ~5 s and shows
+                    "auth failed"; the displayed forecast stays at the
+                    last successful read.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Probability per horizon</h2>
+          </div>
+          <p class="card-desc">
+            Stacked bar per horizon (15-minute step). NEG = grid deficit
+            (system needs upward energy), ZRO = balanced, POS = grid
+            surplus (system needs downward energy). Heights sum to 1.
+          </p>
+          <div id="prob-chart" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Expected imbalance price</h2>
+          </div>
+          <p class="card-desc">
+            Per-horizon model-weighted expected price (solid line) plus
+            the calendar-only baseline (dashed) for reference. The gap
+            between them is the value the model adds beyond what a
+            no-model expectation gives.
+          </p>
+          <div id="price-chart" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Per-horizon detail</h2>
+          </div>
+          <p class="card-desc">
+            Full numeric forecast for every horizon. Sortable by clicking
+            a header (delivery time / argmax / expected price).
+          </p>
+          <table class="decomposition" id="horizon-table"></table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Forecast model and runner code live in a separate private
+        repository; this page only reads <code>forecast.json</code> and
+        triggers workflow runs.
+      </p>
+    </footer>
+
+    <script
+      src="https://cdn.plot.ly/plotly-2.35.2.min.js"
+      charset="utf-8"
+    ></script>
+    <script src="forecast-charts.js?v=37"></script>
+    <script src="forecast-app.js?v=37"></script>
+  </body>
+</html>
