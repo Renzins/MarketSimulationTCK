@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Baltic Imbalance Forecast — Vanessa Wind Park</title>
-    <link rel="stylesheet" href="style.css?v=37" />
+    <link rel="stylesheet" href="style.css?v=38" />
   </head>
   <body>
     <nav class="site-nav">
@@ -28,7 +28,7 @@
 
     <main>
       <!-- =================================================================
-           CONTROL CARD — repo + activation toggle.
+           CONTROL CARD — repo + run button.
            The page is in a public repo; the model lives in a private
            one. We talk to the private repo through a hardcoded GitHub
            PAT (Actions:write + Contents:read). Workflow runs are
@@ -42,12 +42,14 @@
             <div class="group-head">
               <h3>Forecast control</h3>
               <p class="group-desc">
-                The latest forecast (read-only) loads automatically when
-                you open the page. To request a fresh run, enter the
-                shared password and activate — that triggers a workflow
-                dispatch immediately and then again every 15 minutes
-                until you deactivate. Each cycle: dispatch → poll for
-                completion → refetch forecast.json → redraw the charts.
+                Enter the shared password and click <em>Run forecast</em>
+                to dispatch a single workflow run. The page polls for
+                completion (up to 15 minutes), refetches
+                <code>forecast.json</code> and redraws the charts. It runs
+                exactly once per click — there is no automatic refresh.
+                Click <em>Run forecast</em> again whenever you want a
+                fresh forecast. While a run is in flight the button
+                becomes <em>Cancel</em>.
               </p>
             </div>
             <div class="controls-grid" id="forecast-controls">
@@ -75,14 +77,14 @@
                     spellcheck="false"
                     placeholder="(empty)"
                   />
-                  <button id="activate-btn" class="btn primary">Activate</button>
+                  <button id="activate-btn" class="btn primary">Run forecast</button>
                 </div>
                 <div class="param-desc">
                   <p>
                     The password gates workflow dispatches server-side.
                     It is never persisted to disk, browser storage or
-                    URL — only held in memory while the page is active.
-                    Deactivate or reload to clear it.
+                    URL — it stays only in the masked field above and in
+                    memory during a run. Reload to clear it.
                   </p>
                 </div>
               </div>
@@ -93,7 +95,7 @@
                 </div>
                 <div class="param-desc">
                   <p>
-                    Activation state and last-dispatch result. Wrong
+                    Current run state and last-dispatch result. Wrong
                     password → the workflow exits in ~5 s and shows
                     "auth failed"; the displayed forecast stays at the
                     last successful read.
@@ -154,7 +156,7 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="forecast-charts.js?v=37"></script>
-    <script src="forecast-app.js?v=37"></script>
+    <script src="forecast-charts.js?v=38"></script>
+    <script src="forecast-app.js?v=38"></script>
   </body>
 </html>

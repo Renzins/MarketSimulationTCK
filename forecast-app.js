@@ -14,20 +14,23 @@
 //   On page load: do NOT fetch anything. Charts stay blank. Status
 //     reads "idle — enter password to begin". The PAT is not yet
 //     unlocked, so even the Contents API is unreachable.
-//   Activate:
+//   Run forecast (one shot per click — NO automatic repeat):
 //     1. Read typed password from #pwd-input.
 //     2. unlockPAT(password) — PBKDF2-derive key + AES-GCM decrypt the
 //        ENCRYPTED_PAT blob.
 //        - Wrong password → AES-GCM auth-tag mismatch → caught here,
 //          surface as "wrong password", clear field, stay blank.
-//        - Right password → plaintext PAT in memory (closure var only).
-//     3. dispatchWorkflow(password) — fires off a workflow run.
-//     4. waitForRunCompletion — polls every 5 s until completed.
+//        - Right password → plaintext PAT in memory for this run only.
+//     3. dispatchWorkflow(password) — fires off a SINGLE workflow run.
+//     4. waitForRunCompletion — polls every 5 s until completed, giving
+//        up after the 15-minute timeout.
 //     5. fetchAndRender — read forecast.json + draw charts.
-//     6. setInterval(runOneCycle, 15 min) — repeat until Deactivate.
-//   Deactivate: clear interval, abort poll, wipe in-memory PAT, clear
-//   password input, re-enable controls. The last-rendered charts stay
-//   on screen until the user reloads.
+//     6. Wipe the in-memory PAT, return the button to "Run forecast".
+//        The run happens exactly once. To get a fresh forecast the user
+//        clicks the button again — there is no interval / cron loop.
+//   Cancel (while a run is in flight): abort the poll, wipe the
+//   in-memory PAT, re-enable controls. The last-rendered charts stay on
+//   screen.
 //
 // SECURITY
 // ========
@@ -40,10 +43,12 @@
 // What's NEVER in the source repo:
 //   - The PAT in plaintext.
 //   - The password in any form (plaintext, hash, hint, autocomplete).
-// What's in memory while active:
-//   - The decrypted PAT (closure variable, dropped on Deactivate).
-//   - The typed password (input value, cleared the moment Activate
-//     succeeds).
+// What's in memory during a run:
+//   - The decrypted PAT (local to a single run, dropped the moment the
+//     run finishes or is cancelled).
+//   - The typed password (input value). It stays in the masked field
+//     between runs so a re-run is a single click; it is never persisted
+//     to disk, browser storage or URL, and reload clears it.
 // The server-side password gate inside the workflow is independent —
 // even if someone breaks the client-side encryption, the workflow's
 // first step still checks the typed password against RUN_PASSWORD and
@@ -78,12 +83,9 @@
   ciphertext: "KMVQCivBgrhhg3ouq4S+NHQ6VH/6IktOf5yBFiWQOkm+Ipe6uKNFBggM4gBvNsA1h3LQsOS02WNB976gkZt6M6OBcugnJM+DKVq5tlvHma7R5JPP1XYFQI9tESxI0teN86qMcNdIjn0CVN791Q=="
 };
 
-  // How often to auto-redispatch a fresh run once activated.
-  const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-
   // Poll-for-completion cadence after a dispatch.
   const POLL_INTERVAL_MS = 5 * 1000; // 5 s
-  const POLL_MAX_MS = 8 * 60 * 1000; // give up after 8 min
+  const POLL_MAX_MS = 15 * 60 * 1000; // give up after 15 min
 
   // =====================================================================
   //  DOM HANDLES
@@ -99,16 +101,14 @@
   // =====================================================================
   //  STATE
   // =====================================================================
-  // active: 15-min auto-dispatch loop running?
-  // currentPAT: decrypted plaintext PAT, in memory only while active.
-  // intervalId: 15-min setInterval handle.
-  // pollAbort: AbortController for the in-flight poll so Deactivate
+  // running: a single forecast run currently in flight?
+  // currentPAT: decrypted plaintext PAT, in memory only during a run.
+  // pollAbort: AbortController for the in-flight poll so Cancel
   //   short-circuits cleanly.
   // lastForecastTimestamp: ISO string from forecast.json, for the header.
   const state = {
-    active: false,
+    running: false,
     currentPAT: null,
-    intervalId: null,
     pollAbort: null,
     lastForecastTimestamp: null,
   };
@@ -327,72 +327,30 @@
   }
 
   // =====================================================================
-  //  ACTIVATION CYCLE
+  //  RUN — one forecast run per click, no automatic repeat
   // =====================================================================
-  async function runOneCycle() {
-    if (!state.active || !state.currentPAT) return;
-    const sinceMs = Date.now();
-    try {
-      setStatus("dispatching…", "warn");
-      // Re-derive the password to send to the workflow. We DON'T keep
-      // the password in memory — only the decrypted PAT. So we rely on
-      // the in-memory PAT having been unlocked by the same password
-      // the workflow's RUN_PASSWORD secret expects. The first dispatch
-      // proves they match (failure → workflow auth-fails fast).
-      // Password is stored separately in a closure variable that survives
-      // the activate() function — see ACTIVATION SECRETS below.
-      const pwd = activationSecrets.password;
-      if (!pwd) throw new Error("activation password missing");
-      await dispatchWorkflow(pwd);
-      state.pollAbort = new AbortController();
-      const run = await waitForRunCompletion(sinceMs, state.pollAbort.signal);
-      if (run.conclusion === "success") {
-        await fetchAndRender();
-        setStatus(`refreshed at ${new Date().toLocaleTimeString()}`, "ok");
-      } else {
-        const conclusion = run.conclusion || "failed";
-        // First step of the workflow is the password check (~5 s). If
-        // the run fails fast it's almost certainly that — the
-        // workflow's server-side gate caught a password mismatch even
-        // though decryption succeeded locally (e.g. the team rotated
-        // RUN_PASSWORD without re-encrypting the PAT).
-        const likelyAuth = Date.now() - sinceMs < 30000;
-        setStatus(
-          likelyAuth
-            ? `workflow ${conclusion} — server-side password rejected. Deactivating.`
-            : `workflow ${conclusion} (see Actions tab for logs)`,
-          "err",
-        );
-        if (likelyAuth) deactivate();
-      }
-    } catch (err) {
-      if (err && err.message === "aborted") return;
-      console.error("forecast cycle failed:", err);
-      setStatus(`error: ${err.message}`, "err");
-    }
-  }
-
-  // -----------------------------------------------------------------
-  //  ACTIVATION SECRETS
-  //  Closure object holding the in-memory password (for re-dispatch
-  //  every 15 min) and decrypted PAT (for GitHub API calls). Kept off
-  //  the `state` object so it doesn't show up in casual JSON.stringify
-  //  debugging. Both fields are nulled on Deactivate.
-  // -----------------------------------------------------------------
-  const activationSecrets = { password: null };
-
-  async function activate() {
-    const typed = $pwd.value;
-    if (!typed) {
-      setStatus("enter a password before activating", "warn");
+  // A single click dispatches the workflow once, waits for it, redraws
+  // the charts, then returns to idle. There is no interval / cron loop:
+  // a fresh forecast only happens when the user clicks again.
+  async function runForecast() {
+    const pwd = $pwd.value;
+    if (!pwd) {
+      setStatus("enter a password before running", "warn");
       $pwd.focus();
       return;
     }
+
+    // Enter "running" mode. The password field is disabled but keeps its
+    // value so the next run is a single click. The button is briefly
+    // disabled while the PAT unlocks (~1 s of PBKDF2), then becomes
+    // Cancel for the long poll.
+    state.running = true;
     $btn.disabled = true;
+    $pwd.disabled = true;
     setStatus("unlocking PAT…", "warn");
-    let pat;
+
     try {
-      pat = await unlockPAT(typed);
+      state.currentPAT = await unlockPAT(pwd);
     } catch (err) {
       // OperationError = wrong password. Anything else = misconfig.
       const isWrongPwd = err && err.name === "OperationError";
@@ -401,56 +359,87 @@
         "err",
       );
       $pwd.value = "";
+      finishRun();
       $pwd.focus();
-      $btn.disabled = false;
       return;
     }
-    state.active = true;
-    state.currentPAT = pat;
-    activationSecrets.password = typed;
-    $pwd.value = "";
-    $pwd.disabled = true;
-    $btn.textContent = "Deactivate";
+
+    // PAT unlocked — let the user abort the (potentially 15-minute) poll.
+    $btn.textContent = "Cancel";
     $btn.classList.remove("primary");
     $btn.disabled = false;
-    setStatus("activated — dispatching first run…", "warn");
-    runOneCycle();
-    state.intervalId = setInterval(runOneCycle, REFRESH_INTERVAL_MS);
+
+    const sinceMs = Date.now();
+    try {
+      setStatus("dispatching…", "warn");
+      // The same password unlocked the PAT locally and gates the run
+      // server-side. The dispatch proves they match: a mismatch makes
+      // the workflow's first step auth-fail fast.
+      await dispatchWorkflow(pwd);
+      state.pollAbort = new AbortController();
+      const run = await waitForRunCompletion(sinceMs, state.pollAbort.signal);
+      if (run.conclusion === "success") {
+        await fetchAndRender();
+        setStatus(`refreshed at ${new Date().toLocaleTimeString()}`, "ok");
+      } else {
+        const conclusion = run.conclusion || "failed";
+        // First step of the workflow is the password check (~5 s). A
+        // fast failure is almost certainly the server-side gate
+        // rejecting the password even though decryption succeeded
+        // locally (e.g. RUN_PASSWORD rotated without re-encrypting the
+        // PAT).
+        const likelyAuth = Date.now() - sinceMs < 30000;
+        setStatus(
+          likelyAuth
+            ? `workflow ${conclusion} — server-side password rejected`
+            : `workflow ${conclusion} (see Actions tab for logs)`,
+          "err",
+        );
+      }
+    } catch (err) {
+      if (err && err.message === "aborted") {
+        setStatus("run cancelled", null);
+      } else {
+        console.error("forecast run failed:", err);
+        setStatus(`error: ${err.message}`, "err");
+      }
+    } finally {
+      finishRun();
+    }
   }
 
-  function deactivate() {
-    state.active = false;
-    // Wipe secrets aggressively. JS strings are immutable so we can't
-    // overwrite the bytes in place — just drop references and let GC
-    // reclaim. Best-effort, same as any browser secret.
+  // Cancel an in-flight run: abort the poll. The runForecast finally
+  // block (via finishRun) does the actual teardown.
+  function cancelRun() {
+    if (state.pollAbort) state.pollAbort.abort();
+  }
+
+  // Tear down after a run ends for any reason (success, failure, wrong
+  // password, cancel). Wipes the in-memory PAT and returns the UI to its
+  // idle, ready-to-run-again state. The password is left in the field so
+  // the next run is one click. JS strings are immutable so we can't
+  // scrub the bytes — just drop references and let GC reclaim them.
+  function finishRun() {
+    state.running = false;
     state.currentPAT = null;
-    activationSecrets.password = null;
-    if (state.intervalId != null) {
-      clearInterval(state.intervalId);
-      state.intervalId = null;
-    }
-    if (state.pollAbort) {
-      state.pollAbort.abort();
-      state.pollAbort = null;
-    }
+    state.pollAbort = null;
     $pwd.disabled = false;
-    $pwd.value = "";
-    $btn.textContent = "Activate";
+    $btn.textContent = "Run forecast";
     $btn.classList.add("primary");
-    setStatus("idle — enter password to begin", null);
+    $btn.disabled = false;
   }
 
   $btn.addEventListener("click", () => {
-    if (state.active) deactivate();
-    else activate();
+    if (state.running) cancelRun();
+    else runForecast();
   });
 
-  // Enter in the password field activates (only when not already
-  // active — pressing Enter while disabled is a no-op anyway).
+  // Enter in the password field starts a run (a no-op while one is
+  // already in flight, since the field is disabled then anyway).
   $pwd.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !state.active) {
+    if (e.key === "Enter" && !state.running) {
       e.preventDefault();
-      activate();
+      runForecast();
     }
   });
 
@@ -459,13 +448,12 @@
   // exposure to "left the tab open on a shared computer" scenarios.
   window.addEventListener("pagehide", () => {
     state.currentPAT = null;
-    activationSecrets.password = null;
   });
 
   // =====================================================================
   //  INIT
   // =====================================================================
   // No initial fetch — the PAT isn't unlocked yet. Page stays blank;
-  // charts and table render only after a successful Activate.
+  // charts and table render only after a successful run.
   setStatus("idle — enter password to begin", null);
 })();
