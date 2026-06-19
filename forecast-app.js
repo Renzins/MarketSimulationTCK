@@ -87,6 +87,12 @@
   const POLL_INTERVAL_MS = 5 * 1000; // 5 s
   const POLL_MAX_MS = 15 * 60 * 1000; // give up after 15 min
 
+  // sessionStorage key for the last completed forecast (per-tab cache).
+  // Bump the version suffix if forecast.json's shape ever changes so a
+  // stale-shaped cache can't be rendered. Holds only the forecast OUTPUT —
+  // never the PAT or password (see SECURITY note at the top of this file).
+  const FORECAST_CACHE_KEY = "tck.forecast.v1";
+
   // =====================================================================
   //  DOM HANDLES
   // =====================================================================
@@ -311,18 +317,32 @@
   // =====================================================================
   //  RENDER
   // =====================================================================
-  async function fetchAndRender() {
-    const forecast = await fetchForecastJson();
-    if (forecast.error) {
-      setStatus(`forecast.json has error: ${forecast.error}`, "err");
-      return forecast;
-    }
+  // Draw a forecast object. Shared by a fresh fetch and the session-cache
+  // restore path, so a restored run looks identical to a just-fetched one.
+  function renderForecastObject(forecast) {
     state.lastForecastTimestamp = forecast.generated_at || null;
     updateLastUpdated();
     const horizons = forecast.horizons || [];
     ForecastCharts.drawProbabilityBars("prob-chart", horizons);
     ForecastCharts.drawExpectedPriceLine("price-chart", horizons);
     ForecastCharts.renderHorizonTable("horizon-table", horizons);
+  }
+
+  async function fetchAndRender() {
+    const forecast = await fetchForecastJson();
+    if (forecast.error) {
+      setStatus(`forecast.json has error: ${forecast.error}`, "err");
+      return forecast;
+    }
+    renderForecastObject(forecast);
+    // Cache the completed forecast for this tab so navigating to the
+    // Backtester / Graphs and back keeps it on screen (sessionStorage
+    // survives same-tab navigation/reload, clears on tab close). Best-effort.
+    try {
+      sessionStorage.setItem(FORECAST_CACHE_KEY, JSON.stringify(forecast));
+    } catch (_) {
+      /* storage disabled or full — caching is non-critical */
+    }
     return forecast;
   }
 
@@ -450,10 +470,36 @@
     state.currentPAT = null;
   });
 
+  // Restore the last completed forecast for this tab, if any. Pure redraw
+  // from sessionStorage — never touches the network or the PAT, so it works
+  // before any password is entered. Returns true if something was drawn.
+  function restoreCachedForecast() {
+    let raw;
+    try {
+      raw = sessionStorage.getItem(FORECAST_CACHE_KEY);
+    } catch (_) {
+      return false;
+    }
+    if (!raw) return false;
+    try {
+      const forecast = JSON.parse(raw);
+      if (!forecast || !Array.isArray(forecast.horizons)) return false;
+      renderForecastObject(forecast);
+      return true;
+    } catch (_) {
+      return false; // corrupt / stale-shaped cache — ignore
+    }
+  }
+
   // =====================================================================
   //  INIT
   // =====================================================================
-  // No initial fetch — the PAT isn't unlocked yet. Page stays blank;
-  // charts and table render only after a successful run.
-  setStatus("idle — enter password to begin", null);
+  // No initial network fetch — the PAT isn't unlocked yet. But if this tab
+  // already produced a forecast earlier this session, restore it from the
+  // per-tab cache so navigating away and back doesn't lose a completed run.
+  if (restoreCachedForecast()) {
+    setStatus("restored last forecast (this tab) — Run forecast to refresh", null);
+  } else {
+    setStatus("idle — enter password to begin", null);
+  }
 })();

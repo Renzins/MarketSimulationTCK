@@ -3,19 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
-    <title>Vanessa Wind Park — Market Strategy Backtester</title>
-    <link rel="stylesheet" href="style.css?v=36" />
+    <title>TCK Market Dashboard — Backtester - Wind Park</title>
+    <link rel="stylesheet" href="style.css?v=39" />
   </head>
   <body>
     <nav class="site-nav">
-      <a href="index.html" class="brand">Vanessa Wind Park</a>
-      <a href="index.html" class="navlink active">Backtester</a>
+      <a href="index.html" class="brand">TCK Market Dashboard</a>
+      <a href="index.html" class="navlink active">Backtester - Wind Park</a>
       <a href="graphs.html" class="navlink">Graphs</a>
       <a href="forecast.html" class="navlink">Forecast</a>
     </nav>
 
     <header class="site-header">
-      <h1>Vanessa Wind Park — Market Strategy Backtester</h1>
+      <h1>Backtester — Wind Park</h1>
       <p class="subtitle">
         14 × 4.2&nbsp;MW (58.8&nbsp;MW) onshore wind park at Targale, Latvia.
         15-minute ISP backtester. Pick the data sources (what counts as
@@ -260,6 +260,33 @@
           </div>
         </div>
 
+        <!-- =================================================================
+             OPTIMISED RUNS (#4) — a running log of every Optimise click.
+             Each row summarises the setup (sim window, day-type filter,
+             sources, winsor/θ), which strategies were enabled, and the
+             optimal parameters the sweep found, so different configurations
+             (e.g. summer vs winter, workdays vs weekends) can be compared
+             side by side. Populated by app.js renderOptimRuns(); in-memory
+             only, cleared on reload or via the Clear button.
+             ================================================================= -->
+        <div class="card" id="optim-runs-card">
+          <div class="card-head">
+            <h2>Optimised runs</h2>
+            <button id="clear-optim-runs" class="btn small" title="Remove all recorded runs">Clear</button>
+          </div>
+          <p class="card-desc">
+            Every time you press <b>⚡ Optimise</b>, this table gains a row:
+            the experiment setup, which strategies were on/off, and the
+            optimal parameters found — plus the resulting revenue and how it
+            compares to the naïve baseline. Use it to compare, for example,
+            whether summer and winter (or workdays vs weekends) prefer
+            different parameters. The list is in-memory and clears on reload.
+          </p>
+          <div class="optim-runs-wrap">
+            <table class="optim-runs" id="optim-runs-table"></table>
+          </div>
+        </div>
+
       </section>
     </main>
 
@@ -275,6 +302,15 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
+    <!--
+      date-holidays plugin (UMD bundle, exposes window.Holidays). Drives the
+      Backtester's day-type filter (workdays / weekends+holidays) by detecting
+      public holidays in LV / EE / LT. Loaded BEFORE engine.js so Engine.init
+      can build the dayTypeMask up front. If this CDN fails the holiday set
+      stays empty and the filter degrades to weekend-only (engine.js logs a
+      console.info in that case but keeps working).
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/date-holidays@3.28.0/dist/umd.min.js"></script>
     <script src="data.js?v=36"></script>
     <!--
       data-afrr.js: per-ISP aFRR activation counts (n_pos, n_neg, n_total).
@@ -287,8 +323,8 @@
     -->
     <script src="data-afrr.js?v=36"></script>
     <script src="data-afrr-15min.js?v=36"></script>
-    <script src="engine.js?v=36"></script>
-    <script src="charts.js?v=36"></script>
-    <script src="app.js?v=36"></script>
+    <script src="engine.js?v=39"></script>
+    <script src="charts.js?v=39"></script>
+    <script src="app.js?v=40"></script>
   </body>
 </html>

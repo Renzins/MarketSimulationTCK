@@ -257,6 +257,23 @@ const Engine = (() => {
     return set;
   }
 
+  // ---------- day-type filter (post-hoc accumulation gate) ---------------
+  // The engine ALWAYS simulates every ISP in the window continuously, so the
+  // S3 rolling-stats window [i−K−L, i−L) keeps spanning real calendar time
+  // (a Monday trade still "sees" the preceding weekend's settled prices).
+  // The day-type filter is applied ONLY when accumulating totals — a
+  // non-matching ISP is dropped from the sums/counts but NEVER alters any
+  // other ISP's P&L (each ISP's revenue is a pure function of i + the cached
+  // rolling stats; there is no cross-ISP carry state in the loop). This is
+  // what lets "workdays only" / "weekends+holidays" stay correct without
+  // breaking intra-day oversell continuity. Reads D.dayTypeMask
+  // (0 = workday, 1 = weekend, 2 = public holiday). "all" is a strict no-op.
+  function _dayAccepts(filter, maskVal) {
+    if (filter === "workday") return maskVal === 0;
+    if (filter === "weekend-holiday") return maskVal !== 0;
+    return true; // "all" / unknown → no filtering
+  }
+
   function getData() {
     return D;
   }
@@ -463,6 +480,7 @@ const Engine = (() => {
       s_dn: split ? (sDnRaw < 0 ? 0 : sDnRaw > 1 ? 1 : sDnRaw) : 1,
       actualSource: params.actualSource || "real",
       idSource: params.idSource || "real",
+      dayTypeFilter: params.dayTypeFilter || "all",
       s3Enabled: s3On,
       s3_K: (params.s3_K | 0) || 0,
       s3_X_cap: s3On ? (params.s3_X_cap | 0) || 0 : 0,
@@ -522,8 +540,19 @@ const Engine = (() => {
     let totalShortMWh = 0;
     let nNegRevWarn = 0;
 
+    // Day-type filter (post-hoc accumulation gate — see _dayAccepts). Per-ISP
+    // arrays are filled for EVERY ISP so the time-series chart keeps a
+    // continuous window; only the totals/counts below are gated by `accept`.
+    const dtf = p.dayTypeFilter;
+    const filtering = dtf !== "all";
+    const mask = D.dayTypeMask;
+    const dayType = new Uint8Array(wLen);
+    const filteredRev = [];
+    let matchedCount = 0;
+
     for (let i = winStart; i < winEnd; i++) {
       const k = i - winStart;
+      const accept = !filtering || _dayAccepts(dtf, mask[i]);
       const F = D.da_forecast[i];
       const ID = ID_src[i];
       const P_da = D.p_da[i];
@@ -621,6 +650,7 @@ const Engine = (() => {
           flat -
           s3_extra_cost) *
         0.25;
+      // Per-ISP arrays are always written (full continuous window).
       Q_da_sold[k] = da_sold;
       Q_up[k] = up_mfrr + Q_up_afrr;
       Q_dn[k] = dn_mfrr + Q_dn_afrr;
@@ -628,6 +658,11 @@ const Engine = (() => {
       Q_s3_curtail[k] = s3_fires ? s3_X : 0;
       Q_short[k] = short;
       revenue[k] = rev;
+      dayType[k] = mask[i];
+      // Totals / counts only accumulate matching-day ISPs.
+      if (!accept) continue;
+      matchedCount++;
+      filteredRev.push(rev);
       sumDA += DA_rev * 0.25;
       sumUpMfrr += Up_rev_mfrr * 0.25;
       sumDnMfrr += Dn_rev_mfrr * 0.25;
@@ -676,7 +711,12 @@ const Engine = (() => {
         Q_s3_curtail,
         Q_short,
         revenue,
+        dayType,
       },
+      // Revenues of matching-day ISPs only (== perISP.revenue when filter is
+      // "all"). Histogram + robustness read this so they reflect the filter.
+      filteredRevenue: Float64Array.from(filteredRev),
+      matchedCount,
       totalRevenue: total,
       breakdown: {
         DA: sumDA,
@@ -725,8 +765,15 @@ const Engine = (() => {
     const aNeg_arr = D.avg_p_neg;
     const nPos_arr = D.afrr_n_pos_fav;
     const nNeg_arr = D.afrr_n_neg_fav;
+    // Day-type filter: skip non-matching ISPs (their P&L is independent of
+    // every other ISP, so dropping them from the sum is exact). Rolling stats
+    // are still full-data, so S3 continuity is preserved. See _dayAccepts.
+    const dtf = p.dayTypeFilter;
+    const filtering = dtf !== "all";
+    const mask = D.dayTypeMask;
     let total = 0;
     for (let i = winStart; i < winEnd; i++) {
+      if (filtering && !_dayAccepts(dtf, mask[i])) continue;
       const F = F_arr[i];
       const P_da = P_da_arr[i];
       const P_mfrr = P_mfrr_arr[i];
@@ -825,8 +872,12 @@ const Engine = (() => {
     const Q_pot_src = _qPotArray(p.actualSource);
     const ID_src = _idArray(p.idSource);
     const start = new Date(D.start_iso);
+    const dtf = p.dayTypeFilter;
+    const filtering = dtf !== "all";
+    const mask = D.dayTypeMask;
     const buckets = new Map();
     for (let i = winStart; i < winEnd; i++) {
+      if (filtering && !_dayAccepts(dtf, mask[i])) continue;
       const ts = new Date(start.getTime() + D.offsets[i] * D.step_min * 60000);
       const key = `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`;
       const F = D.da_forecast[i];
@@ -964,8 +1015,14 @@ const Engine = (() => {
   function totalPotMWhInWindow(params) {
     const actualSource = params && params.actualSource ? params.actualSource : "real";
     const arr = _qPotArray(actualSource);
+    const dtf = (params && params.dayTypeFilter) || "all";
+    const filtering = dtf !== "all";
+    const mask = D.dayTypeMask;
     let s = 0;
-    for (let i = winStart; i < winEnd; i++) s += arr[i] * 0.25;
+    for (let i = winStart; i < winEnd; i++) {
+      if (filtering && !_dayAccepts(dtf, mask[i])) continue;
+      s += arr[i] * 0.25;
+    }
     return s;
   }
 

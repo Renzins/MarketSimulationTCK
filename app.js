@@ -46,6 +46,13 @@
         ["Sub-period", "stress-test: does the strategy still win when the window excludes a known easy month?"],
       ],
     },
+    dayType: {
+      group: "setup",
+      isDayType: true,
+      label: "Day type filter",
+      description:
+        "Restricts every result — totals, decomposition, monthly bars, robustness and the optimiser — to ISPs of the chosen day type. The simulation still runs over the FULL continuous window first, so intra-day oversell's rolling stats keep seeing the hidden days (a Monday trade still uses the preceding weekend's settled prices); the filter is applied only when summing the results, so continuity is never broken. Public holidays are detected for Latvia / Estonia / Lithuania via the date-holidays plugin (a date counts as a holiday if any of the three observes it).",
+    },
     actualSource: {
       group: "setup",
       isSourceSelect: true,
@@ -387,6 +394,7 @@
     "actualSource",
     "idSource",
     "sim_range",
+    "dayType",
     "w_mfrr",
     "w_imb",
     "w_afrr_pos",
@@ -464,10 +472,15 @@
     enabled: { ...DEFAULTS.enabled },
     params: { ...DEFAULTS.params },
     simRange: { from: dataMinDate, to: dataMaxDate },
+    // Day-type filter — like simRange, it scopes the experiment and is NOT
+    // touched by "Reset to defaults". "all" | "weekend-holiday" | "workday".
+    dayType: "all",
     tsRange: { from: null, to: null },
     lastSim: null,
     lastNaive: null,
     lastSweep: null,
+    // Optimised-runs log (#4) — one entry per completed Optimise. In-memory.
+    optimRuns: [],
   };
 
   // Build the params object the engine expects: numeric params + sources
@@ -478,6 +491,7 @@
       ...(extras || {}),
       actualSource: state.actualSource,
       idSource: state.idSource,
+      dayTypeFilter: state.dayType,
       enabled: { ...state.enabled },
     };
   }
@@ -511,6 +525,25 @@
             <ul class="extremes">
               ${def.extremes.map(([v, m]) => `<li><b>${v}:</b> ${m}</li>`).join("")}
             </ul>
+          </div>
+        </div>`;
+    }
+
+    // ---- day-type toggle (all / weekends+holidays / workdays) ----
+    if (def.isDayType) {
+      const cur = state.dayType;
+      const btn = (val, lbl) =>
+        `<button type="button" class="btn small preset${cur === val ? " active" : ""}" data-day-type="${val}">${lbl}</button>`;
+      return `
+        <div class="control">
+          <label>${def.label}</label>
+          <div class="day-type-toggle bt-day-type-toggle">
+            ${btn("all", "All days")}
+            ${btn("weekend-holiday", "Weekends + holidays")}
+            ${btn("workday", "Workdays only")}
+          </div>
+          <div class="param-desc">
+            <p>${def.description}</p>
           </div>
         </div>`;
     }
@@ -766,10 +799,13 @@
     setCnt("s3Oversold", fmtInt(sim.counts.s3Oversold || 0));
     setCnt("s3HedgeFired", fmtInt(sim.counts.s3HedgeFired || 0));
 
-    // 5. Robustness
-    const conc1 = Engine.topConcentration(sim.perISP.revenue, 0.01);
-    const conc5 = Engine.topConcentration(sim.perISP.revenue, 0.05);
-    const conc10 = Engine.topConcentration(sim.perISP.revenue, 0.1);
+    // 5. Robustness — use filteredRevenue so concentration reflects only the
+    // days the headline total is computed over (== perISP.revenue when the
+    // filter is "all").
+    const robustRev = sim.filteredRevenue || sim.perISP.revenue;
+    const conc1 = Engine.topConcentration(robustRev, 0.01);
+    const conc5 = Engine.topConcentration(robustRev, 0.05);
+    const conc10 = Engine.topConcentration(robustRev, 0.1);
     document.getElementById("top1pct").textContent =
       fmtPct(conc1.share) + " (" + conc1.topN + " ISPs)";
     document.getElementById("top5pct").textContent = fmtPct(conc5.share);
@@ -792,7 +828,7 @@
     const lvl = effectiveLevel();
     Charts.drawTimeSeries("ts-chart", lvl, sim, callParams, chartIdx.start, chartIdx.end);
     Charts.drawMonthly("monthly-chart", lvl, Engine.monthlyAggregation(callParams));
-    Charts.drawHistogram("hist-chart", sim.perISP.revenue);
+    Charts.drawHistogram("hist-chart", sim.filteredRevenue || sim.perISP.revenue);
   }
 
   let updateTimer = null;
@@ -868,6 +904,24 @@
           toEl.value = isoToEU(dataMaxDate);
           onChange();
         });
+        continue;
+      }
+
+      if (def.isDayType) {
+        document
+          .querySelectorAll(".bt-day-type-toggle .preset[data-day-type]")
+          .forEach((b) => {
+            b.addEventListener("click", () => {
+              const nt = b.dataset.dayType;
+              if (state.dayType === nt) return;
+              state.dayType = nt;
+              document
+                .querySelectorAll(".bt-day-type-toggle .preset[data-day-type]")
+                .forEach((x) => x.classList.remove("active"));
+              b.classList.add("active");
+              scheduleUpdate();
+            });
+          });
         continue;
       }
 
@@ -1235,6 +1289,7 @@
     applyOptimisedSample(best.sample);
     state.lastSweep = { best: { ...best.sample, revenue: best.revenue } };
     update();
+    recordOptimRun(best, ms);
     renderProgressBar(
       progEl,
       1,
@@ -1242,6 +1297,154 @@
     );
     optimiseBtn.disabled = false;
     resetBtn.disabled = false;
+  }
+
+  // =====================================================================
+  //  OPTIMISED RUNS LOG (#4)
+  //  Each completed Optimise appends a row capturing the setup, which
+  //  strategies were enabled, and the optimal parameters found — so runs
+  //  (e.g. summer vs winter, workdays vs weekends) line up for comparison.
+  //  In-memory only; cleared on reload or via the Clear button.
+  // =====================================================================
+  const DAYTYPE_LABEL = {
+    all: "All",
+    "weekend-holiday": "Wknd+Hol",
+    workday: "Workday",
+  };
+
+  function nowClock() {
+    const d = new Date();
+    const p2 = (x) => String(x).padStart(2, "0");
+    return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+  }
+
+  function recordOptimRun(best, ms) {
+    const p = state.params;
+    state.optimRuns.push({
+      n: state.optimRuns.length + 1,
+      when: nowClock(),
+      ms,
+      from: state.simRange.from,
+      to: state.simRange.to,
+      dayType: state.dayType,
+      actualSource: state.actualSource,
+      idSource: state.idSource,
+      enabled: { ...state.enabled },
+      theta: p.theta_flat,
+      winsor: {
+        mfrr: [p.w_mfrr_lo, p.w_mfrr_hi],
+        imb: [p.w_imb_lo, p.w_imb_hi],
+        afrrPos: [p.w_afrr_pos_lo, p.w_afrr_pos_hi],
+        afrrNeg: [p.w_afrr_neg_lo, p.w_afrr_neg_hi],
+      },
+      // Effective values after the optimise. Swept dims hold the optimum;
+      // the fixed S3 knobs (cap/lag/skip) hold whatever the user set.
+      params: {
+        X: p.X,
+        Y: p.Y,
+        s_up: p.s_up,
+        s_dn: p.s_dn,
+        Z: p.Z,
+        s3_K: p.s3_K,
+        s3_S_min: p.s3_S_min,
+        s3_sigma_max: p.s3_sigma_max,
+        s3_M: p.s3_M,
+        s3_X_cap: p.s3_X_cap,
+        s3_lag: p.s3_lag,
+        s3_da_skip: p.s3_da_skip,
+      },
+      revenue: best.revenue,
+      naive: state.lastNaive,
+    });
+    saveOptimRuns();
+    renderOptimRuns();
+  }
+
+  const OPTIM_HEADER = [
+    "#", "Time", "Range", "Days", "Strategies",
+    "X", "Y", "s_up", "s_dn", "Z",
+    "S3 K", "S3 S_min", "S3 σ_max", "S3 M", "S3 cap/lag/skip",
+    "θ", "Sources", "Winsor m/i/+/−", "Revenue", "Δ vs naïve",
+  ];
+
+  // Per-tab persistence (sessionStorage): survives navigating to Graphs /
+  // Forecast and back, clears on tab close. Bump the version suffix if the
+  // run-row shape changes so a stale cache can't render wrong.
+  const OPTIM_RUNS_KEY = "tck.optimRuns.v1";
+  function saveOptimRuns() {
+    try {
+      sessionStorage.setItem(OPTIM_RUNS_KEY, JSON.stringify(state.optimRuns));
+    } catch (_) {
+      /* storage disabled or full — non-critical */
+    }
+  }
+  function loadOptimRuns() {
+    let raw;
+    try {
+      raw = sessionStorage.getItem(OPTIM_RUNS_KEY);
+    } catch (_) {
+      return;
+    }
+    if (!raw) return;
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) state.optimRuns = arr;
+    } catch (_) {
+      /* corrupt cache — ignore */
+    }
+  }
+
+  function renderOptimRuns() {
+    const table = document.getElementById("optim-runs-table");
+    if (!table) return;
+    const runs = state.optimRuns;
+    if (!runs.length) {
+      table.innerHTML =
+        '<tbody><tr><td class="optim-empty">No runs yet — click ⚡ Optimise to capture the setup and optimal parameters here.</td></tr></tbody>';
+      return;
+    }
+    const num = (v, d = 0) => (v == null || isNaN(v) ? "—" : (+v).toFixed(d));
+    const dash = '<span class="optim-off">—</span>';
+    const win = (pair) => `${pair[0]}–${pair[1]}`;
+    const chip = (on, lbl) =>
+      `<span class="optim-chip ${on ? "on" : "off"}">${lbl}</span>`;
+    const rows = runs
+      .map((r) => {
+        const en = r.enabled;
+        const p = r.params;
+        const strategies =
+          chip(en.daWithhold, "DA") + chip(en.split, "SP") +
+          chip(en.idTrust, "ID") + chip(en.s3, "S3");
+        const diff = r.revenue - (r.naive || 0);
+        const diffPct = r.naive ? (diff / Math.abs(r.naive)) * 100 : 0;
+        const cells = [
+          r.n,
+          r.when,
+          `${isoToEU(r.from)}<br>${isoToEU(r.to)}`,
+          DAYTYPE_LABEL[r.dayType] || r.dayType,
+          strategies,
+          en.daWithhold ? num(p.X) : dash,
+          en.daWithhold ? num(p.Y, 2) : dash,
+          en.split ? num(p.s_up, 2) : dash,
+          en.split ? num(p.s_dn, 2) : dash,
+          en.idTrust ? num(p.Z, 2) : dash,
+          en.s3 ? num(p.s3_K) : dash,
+          en.s3 ? num(p.s3_S_min) : dash,
+          en.s3 ? num(p.s3_sigma_max) : dash,
+          en.s3 ? num(p.s3_M) : dash,
+          en.s3 ? `${num(p.s3_X_cap)}/${num(p.s3_lag)}/${num(p.s3_da_skip)}` : dash,
+          num(r.theta),
+          `${r.actualSource}/${r.idSource}`,
+          `${win(r.winsor.mfrr)} · ${win(r.winsor.imb)} · ${win(r.winsor.afrrPos)} · ${win(r.winsor.afrrNeg)}`,
+          `<b>${fmtEUR(r.revenue)}</b>`,
+          `<span class="${diff >= 0 ? "optim-up" : "optim-down"}">${diff >= 0 ? "+" : ""}${fmtEUR(diff)}<br>(${diff >= 0 ? "+" : ""}${diffPct.toFixed(1)}%)</span>`,
+        ];
+        return `<tr>${cells.map((c) => `<td>${c}</td>`).join("")}</tr>`;
+      })
+      .reverse(); // newest first
+    table.innerHTML =
+      `<thead><tr>${OPTIM_HEADER.map((h) => `<th>${h}</th>`).join("")}</tr></thead>` +
+      `<tbody>${rows.join("")}</tbody>`;
   }
 
   document.getElementById("optimise").addEventListener("click", () => {
@@ -1395,6 +1598,17 @@
   bindEnableToggles();
   bindDateNav();
   applyEnableUI();
+
+  const clearOptimBtn = document.getElementById("clear-optim-runs");
+  if (clearOptimBtn) {
+    clearOptimBtn.addEventListener("click", () => {
+      state.optimRuns = [];
+      saveOptimRuns();
+      renderOptimRuns();
+    });
+  }
+  loadOptimRuns();
+  renderOptimRuns();
 
   update();
 })();

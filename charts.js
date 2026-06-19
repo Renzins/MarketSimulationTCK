@@ -207,9 +207,21 @@ const Charts = (() => {
     // ID-trust strategy can't fire if ID = F.
     const idSource = (params && params.idSource) || "real";
     const idArr = idSource === "da" ? D.da_forecast : D.id_forecast;
+    // Day-type filter: the simulation ran over every ISP (so S3 rolling stats
+    // saw the hidden days), but the detail chart should only DRAW the days the
+    // totals are computed over. `kept[k]` marks ISPs of the chosen day type;
+    // non-kept ISPs are nulled out of every trace below so they render as
+    // gaps. simResult.perISP.dayType carries the per-ISP mask (0/1/2).
+    const dayFilter = (params && params.dayTypeFilter) || "all";
+    const filtering =
+      dayFilter !== "all" && !!(simResult.perISP && simResult.perISP.dayType);
+    const dtArr = filtering ? simResult.perISP.dayType : null;
+    const keepFn = (mv) => (dayFilter === "workday" ? mv === 0 : mv !== 0);
+    const kept = new Array(N);
     for (let k = 0; k < N; k++) {
       const i = clampedStart + k; // global ISP index
       const k_p = i - winStart; // perISP-array index
+      kept[k] = filtering ? keepFn(dtArr[k_p]) : true;
       ts[k] = Engine.tsAt(i);
       da[k] = simResult.perISP.Q_da_sold[k_p];
       // Reconstruct the OFFERED split via the same round-and-remainder
@@ -259,6 +271,22 @@ const Charts = (() => {
       short[k] = simResult.perISP.Q_short[k_p];
     }
 
+    // Gap-out filtered days across every drawn series (in-place null).
+    if (filtering) {
+      for (let k = 0; k < N; k++) {
+        if (kept[k]) continue;
+        da[k] = null;
+        upMfrrActive[k] = null;
+        dnMfrrActive[k] = null;
+        upAfrrDisp[k] = null;
+        dnAfrrDisp[k] = null;
+        s3Intraday[k] = null;
+        s3Curtail[k] = null;
+        id_arr[k] = null;
+        pot[k] = null;
+      }
+    }
+
     // ---- Build sectioned tooltip ----
     // Sections: Header / Forecast / DA market / Balancing / Imbalance / Total
     // Each section is shown only when relevant.
@@ -271,6 +299,7 @@ const Charts = (() => {
       );
     }
     const hover = ts.map((t, k) => {
+      if (filtering && !kept[k]) return null; // gapped day — no tooltip
       // European-style timestamp DD/MM/YYYY HH:MM
       const dd = String(t.getUTCDate()).padStart(2, "0");
       const mm = String(t.getUTCMonth() + 1).padStart(2, "0");
@@ -749,6 +778,7 @@ const Charts = (() => {
     // for ISP 18/09 15:15 where the mFRR-dn bar at y=0 was beating the
     // marker-line in y-distance proximity).
     const hoverY = new Array(N).fill(yMax * 1.05 || 1);
+    if (filtering) for (let k = 0; k < N; k++) if (!kept[k]) hoverY[k] = null;
     traces.push({
       x: ts,
       y: hoverY,

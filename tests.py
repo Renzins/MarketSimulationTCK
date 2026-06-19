@@ -1,7 +1,7 @@
 """
 tests.py — comprehensive audit / regression suite for the wind-park backtester.
 
-65 tests over 9 categories; aFRR / split tests are gated on the optional
+69 tests over 9 categories; aFRR / split tests are gated on the optional
 data files being present so the suite still passes on a stripped repo.
 
   A. DATA INTEGRITY (data.js vs CSV)
@@ -377,6 +377,8 @@ def simulate_total(
     avg_p_neg_w=None,
     n_pos_fav=None,
     n_neg_fav=None,
+    day_mask=None,
+    day_filter="all",
 ):
     """Vectorised total-only mirror of engine.simulateTotal (with current
     winsorized prices). n_pos_fav / n_neg_fav are FAVOURABLE 4-s slot
@@ -438,6 +440,12 @@ def simulate_total(
         imb = np.where(valid_imb, Q_short * P_imb_w, 0)
         flat = np.where(valid_imb, Q_short * theta, 0)
         rev -= imb + flat
+    # Day-type filter (post-hoc accumulation gate) — mirror engine.js: per-ISP
+    # P&L is computed for every ISP, then non-matching days are dropped from
+    # the sum. day_mask: 0=workday, 1=weekend, 2=holiday.
+    if day_mask is not None and day_filter != "all":
+        keep = (day_mask == 0) if day_filter == "workday" else (day_mask != 0)
+        rev = np.where(keep, rev, 0.0)
     return rev.sum() * 0.25
 
 
@@ -472,6 +480,7 @@ def simulate_total_l3(
     avg_p_pos_w=None, avg_p_neg_w=None, n_pos_fav=None, n_neg_fav=None,
     s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
     s3_da_skip=50,
+    day_mask=None, day_filter="all",
 ):
     """L3 vectorised total. Adds S3 on top of L2 math (same shape as engine
     simulateTotal level=3). Rolling stats are from p_mfrr_raw (NOT p_imb_raw)
@@ -548,6 +557,12 @@ def simulate_total_l3(
     flat = np.where(valid_imb, short_l2 * theta, 0)
     s3_extra_cost = np.where(valid_imb, s3_extra_short * (P_imb_w + theta), 0)
     rev -= imb + flat + s3_extra_cost
+    # Day-type filter (post-hoc accumulation gate) — see simulate_total. The
+    # S3 rolling stats above were computed over the FULL series, so dropping
+    # non-matching days here never disturbs intra-day-oversell continuity.
+    if day_mask is not None and day_filter != "all":
+        keep = (day_mask == 0) if day_filter == "workday" else (day_mask != 0)
+        rev = np.where(keep, rev, 0.0)
     return {
         "total": rev.sum() * 0.25,
         "short_l2": short_l2,
@@ -580,6 +595,41 @@ CSV_BY_TS = CSV.set_index("datetime_utc")
 print(f"  data.js timestamps: {DATA_TS[0]} → {DATA_TS[-1]}")
 
 R = TestRunner()
+
+
+# =============================================================================
+#  Day-type mask mirror (engine.js _computeDayTypeMask)
+#  0 = workday, 1 = weekend, 2 = public holiday. Weekend takes precedence
+#  over holiday (engine checks day-of-week first). Holidays for LV / EE / LT
+#  via the `holidays` package; if it's missing we degrade to weekend-only,
+#  exactly like engine.js falls back when the date-holidays CDN fails.
+# =============================================================================
+_DAY_TYPE_MASK_CACHE = None
+
+
+def _day_type_mask():
+    global _DAY_TYPE_MASK_CACHE
+    if _DAY_TYPE_MASK_CACHE is not None:
+        return _DAY_TYPE_MASK_CACHE
+    # pandas day-of-week: Mon=0 .. Sun=6, so weekend = {5, 6} (Sat, Sun) —
+    # the same Sat/Sun set engine.js gets from getUTCDay() ∈ {0, 6}.
+    dow = np.asarray(DATA_TS.dayofweek)
+    is_weekend = (dow == 5) | (dow == 6)
+    hol = set()
+    try:
+        import holidays as _holidays
+
+        years = list(range(DATA_TS[0].year, DATA_TS[-1].year + 1))
+        for cc in ("LV", "EE", "LT"):
+            for d in _holidays.country_holidays(cc, years=years).keys():
+                hol.add(pd.Timestamp(d).date())
+    except Exception:
+        hol = set()  # weekend-only fallback (mirrors engine.js CDN failure)
+    dates = DATA_TS.date
+    is_hol = np.array([d in hol for d in dates], dtype=bool)
+    mask = np.where(is_weekend, 1, np.where(is_hol, 2, 0)).astype(np.int64)
+    _DAY_TYPE_MASK_CACHE = mask
+    return mask
 
 
 # =============================================================================
@@ -1886,6 +1936,114 @@ def test_l1_s0_produces_meaningful_afrr_revenue():
 #  Register & run
 # =============================================================================
 # A. Data integrity
+# ============================================================================
+#  DAY-TYPE FILTER (Backtester) — the filter is a post-hoc accumulation gate:
+#  the engine simulates every ISP continuously (so S3 rolling stats keep
+#  spanning weekends), then drops non-matching days from the totals. These
+#  tests lock the partition invariant and prove S3 continuity is preserved.
+# ============================================================================
+def test_day_type_mask_values_and_weekends():
+    """Mask holds only {0,1,2}; mask==1 ⇔ Sat/Sun; holidays (if the package
+    is present) surface as mask==2."""
+    m = _day_type_mask()
+    assert set(np.unique(m).tolist()).issubset({0, 1, 2}), (
+        f"mask has unexpected values: {np.unique(m)}"
+    )
+    dow = np.asarray(DATA_TS.dayofweek)
+    is_weekend = (dow == 5) | (dow == 6)
+    assert np.all(m[is_weekend] == 1), "every Sat/Sun ISP must be mask==1"
+    assert np.all(is_weekend[m == 1]), "every mask==1 ISP must be a Sat/Sun"
+    try:
+        import holidays  # noqa: F401
+
+        have_hol = True
+    except Exception:
+        have_hol = False
+    n_hol = int((m == 2).sum())
+    print(f"\n        mask: {(m==0).sum():,} workday · {(m==1).sum():,} weekend · {n_hol:,} holiday")
+    if have_hol:
+        assert n_hol > 0, "expected some LV/EE/LT public holidays flagged as mask==2"
+
+
+def test_day_filter_all_is_noop():
+    """day_filter='all' must not change the L3 default — frozen value
+    preserved. Filtering is a strict no-op when 'all'."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    m = _day_type_mask()
+    common = dict(
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )
+    base = simulate_total_l3(F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, **common)["total"]
+    allf = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        day_mask=m, day_filter="all", **common,
+    )["total"]
+    assert abs(base - allf) < 1.0, f"'all' filter changed the total: {base:,.2f} vs {allf:,.2f}"
+    assert abs(allf - FROZEN_L3_DEFAULT_EUR) < 200, (
+        f"L3 default with 'all' filter = {allf:,.0f} but FROZEN is {FROZEN_L3_DEFAULT_EUR:,}"
+    )
+
+
+def test_day_filter_partition():
+    """LOAD-BEARING: total(all) == total(workday) + total(weekend+holiday).
+    This is the proof the filter is a clean post-hoc partition (and therefore
+    that each ISP's P&L is computed identically regardless of filter). Also
+    confirms the filter is live: workday-only differs from all, and the
+    weekend+holiday slice is non-trivial."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    m = _day_type_mask()
+    common = dict(
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )
+    def run(flt):
+        return simulate_total_l3(
+            F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+            day_mask=m, day_filter=flt, **common,
+        )["total"]
+    allt = run("all")
+    wd = run("workday")
+    we = run("weekend-holiday")
+    print(f"\n        all={allt:,.0f} €  =  workday={wd:,.0f} €  +  weekend/hol={we:,.0f} €  (Σ={wd+we:,.0f})")
+    assert abs(allt - (wd + we)) < 2.0, (
+        f"partition broken: all={allt:,.2f} but workday+weekend={wd+we:,.2f}"
+    )
+    assert abs(allt - wd) > 1000, "workday-only should differ materially from all-days"
+    assert we > 1000, "weekend+holiday slice should carry non-trivial revenue"
+
+
+def test_day_filter_preserves_s3_continuity():
+    """The whole point of 'run fully, filter last': workdays-only revenue must
+    use S3 rolling stats computed over the FULL continuous series (incl. the
+    weekends), NOT over a weekend-stripped series. We prove it by showing the
+    correct total differs from a naïve 'drop weekends first, then simulate'."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    m = _day_type_mask()
+    common = dict(
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+    )
+    # Correct: full-data rolling stats, day filter applied at the end.
+    correct = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        day_mask=m, day_filter="workday", **common,
+    )["total"]
+    # Wrong: strip weekends from EVERY input first, so the rolling window only
+    # ever sees workdays — continuity broken at each Monday boundary.
+    wd = m == 0
+    sub = lambda a: a[wd]
+    wrong = simulate_total_l3(
+        sub(F), sub(ID), sub(P_da), sub(p_mfrr), sub(Q_pot),
+        sub(p_imb), sub(vwap_1h), sub(p_mfrr_raw), **common,
+    )["total"]
+    print(f"\n        workday S3: continuity-correct={correct:,.0f} €  vs  weekend-stripped={wrong:,.0f} €")
+    assert abs(correct - wrong) > 100, (
+        "workday S3 total should depend on whether the weekend was in the "
+        "rolling window — if these match, continuity isn't actually preserved"
+    )
+
+
 R.add("baltic_wind_da is sum of LV+EE+LT", test_baltic_wind_aggregation)
 R.add("baltic_solar_da is sum of LV+EE+LT", test_baltic_solar_aggregation)
 R.add("baltic_imb_vol is sum of LV+EE+LT", test_baltic_imb_vol_aggregation)
@@ -1911,6 +2069,10 @@ R.add("S3 rolling source must be p_mfrr (not p_imb)", test_s3_rolling_source_is_
 R.add("S3 lag L: [i-K-L, i-L) window respected", test_s3_lag_window_shifts_results)
 R.add("S3 decomp: imb+flat+s3_extra == short·(p_imb+θ)", test_s3_imbalance_decomposition_equals_naive_short_cost)
 R.add("S3 with NaN p_imb → imb/flat/s3_extra all 0", test_s3_nan_pimb_zeroes_all_imbalance_terms)
+R.add("Day-type mask: values {0,1,2}; mask==1 ⇔ Sat/Sun", test_day_type_mask_values_and_weekends)
+R.add("Day filter 'all' is a no-op (frozen L3 default preserved)", test_day_filter_all_is_noop)
+R.add("Day filter partition: all == workday + weekend/holiday", test_day_filter_partition)
+R.add("Day filter preserves S3 continuity (full-series rolling stats)", test_day_filter_preserves_s3_continuity)
 R.add("Window-vectorised total == per-ISP sum", test_window_consistency)
 R.add("April ISPs: NaN p_imb → 0 imb cost in L2", test_april_in_l1_not_in_l2_imbalance)
 

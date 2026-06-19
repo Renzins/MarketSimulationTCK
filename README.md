@@ -93,10 +93,10 @@ publish hashes):
 
 - **Plotly** (cdn.plot.ly, versioned URL) — all three pages.
 - **date-holidays** v3.28 (jsdelivr, UMD bundle exposing `Holidays.default`)
-  — only on the Graphs page; drives the day-type filter for LV / EE / LT
-  public-holiday detection. If the CDN is unreachable, `engine.js` logs
-  a console warning and the day-type filter degrades to weekend-only
-  classification (every Mon–Fri counts as a workday).
+  — on the Graphs **and** Backtester pages; drives the day-type filter for
+  LV / EE / LT public-holiday detection. If the CDN is unreachable,
+  `engine.js` logs a console warning and the day-type filter degrades to
+  weekend-only classification (every Mon–Fri counts as a workday).
 
 The Forecast page additionally calls the **GitHub REST API**
 (`api.github.com`) at runtime — to dispatch the model workflow and read
@@ -412,6 +412,26 @@ refine**:
    pass yielded no improvement).
 3. Return the highest-revenue refined sample.
 
+The objective is the **filtered** total (it honours the active day-type
+filter), so "Workdays only" and "Weekends + holidays" produce distinct
+optima you can compare.
+
+### Optimised runs log
+
+Below the charts, an **Optimised runs** table logs one row per completed
+Optimise: the setup (sim window, day-type filter, sources, winsor pairs,
+θ), which strategies were enabled, the optimal parameters found, and the
+resulting revenue vs the naïve baseline. It's purpose-built for comparing
+configurations side by side — e.g. whether summer and winter, or workdays
+and weekends, prefer different parameters. Newest run on top; **Clear**
+empties it.
+
+The log is **persisted per-tab** in `sessionStorage`
+(`tck.optimRuns.v1`): it survives navigating to Graphs / Forecast and
+back (and same-tab reloads), and is wiped only when the tab is closed.
+Writes are best-effort (wrapped in try/catch, so a disabled/full store
+just degrades to in-memory). See [Per-tab caching](#per-tab-caching).
+
 **Why multi-start?** A variance test (3 RNG seeds × 3 levels) found
 near-zero spread (<0.07 % on L1 / L2, 0 € on L3) — the landscape
 on the current dataset has one dominant basin and refine converges
@@ -703,6 +723,24 @@ bin-edge derivation, and winsorisation percentiles. If the
 date-holidays CDN fails the mask degrades to weekend-only (every
 Mon–Fri counts as workday) and the engines log a console.info.
 
+**Backtester day-type filter (run-fully-then-filter).** The same
+control lives in the Backtester's Setup card, but the mechanics differ
+because the P&L simulation is *sequential* (S3 intra-day oversell reads
+a rolling window of preceding settled prices). Naïvely dropping
+weekends *before* simulating would corrupt that rolling window at every
+Monday boundary. So the Backtester always simulates **every** ISP in the
+window continuously (the S3 rolling-stats cache is full-dataset, so a
+Monday trade still "sees" the weekend's settled prices) and applies the
+filter only as a **post-hoc accumulation gate**: `simulate` /
+`simulateTotal` / `monthlyAggregation` / `totalPotMWhInWindow` sum only
+ISPs whose `dayTypeMask` matches (`_dayAccepts`), and the optimiser
+objective is that filtered total. Per-ISP arrays stay full so the
+time-series chart simply gaps the hidden days. This is exact: each ISP's
+P&L is independent of every other ISP, so the totals partition cleanly
+(`total(all) == total(workday) + total(weekend+holiday)`, locked by
+tests). "All days" is a strict no-op (frozen regression values
+unchanged).
+
 ## Forecast — Baltic imbalance regime forecast
 
 `forecast.html` + `forecast-app.js` + `forecast-charts.js`. Unlike the
@@ -761,6 +799,28 @@ in-flight poll). The typed password stays in the masked field between
 runs so a re-run is a single click; it is never written to disk, browser
 storage, or the URL, and a reload clears it. The decrypted PAT is dropped
 from memory the moment a run ends — success, failure, or cancel.
+
+On a successful `fetchAndRender`, the completed forecast **output** (and
+only the output — never the PAT or password) is cached to
+`sessionStorage` (`tck.forecast.v1`). On page load the charts + table are
+restored from that cache with **no network call and no PAT**, so leaving
+the page mid-session and coming back doesn't lose a finished 15-minute
+run. A run takes ~15 min, so this matters. The header's "Last forecast: N
+min ago" reflects the cached `generated_at`, and the status reads
+"restored last forecast". See [Per-tab caching](#per-tab-caching).
+
+### Per-tab caching
+
+Both the Backtester's **Optimised runs** log and the Forecast page's last
+result are persisted in **`sessionStorage`** — deliberately *not*
+`localStorage`. `sessionStorage` survives same-tab navigation and reload
+but is cleared when the tab closes, which matches the intent: "keep my
+work while I bounce between pages, but don't resurrect a stale run
+tomorrow." Keys are version-suffixed (`…​.v1`) so a future shape change
+can invalidate old caches, and every read/write is wrapped in try/catch
+so a disabled or full store degrades gracefully to in-memory behaviour.
+Nothing sensitive is stored: the forecast cache holds only model output,
+and the PAT / run password are never persisted anywhere.
 
 ### `forecast.json` schema
 
@@ -853,7 +913,7 @@ Internally the canonical form is still `YYYY-MM-DD` (ISO).
 
 ## Tests
 
-`tests.py` runs 57 audit / regression tests:
+`tests.py` runs 69 audit / regression tests:
 
 ```
 python tests.py
@@ -863,9 +923,11 @@ Categories:
 
 - **A — Data integrity** (9 tests): Baltic aggregations, spread
   formula, NaN handling, time monotonicity, mFRR up == down.
-- **B — Engine invariants** (8 tests): whole-MW rounding, mFRR-dn cap,
+- **B — Engine invariants** (12 tests): whole-MW rounding, mFRR-dn cap,
   mFRR up/dn mutual exclusion, naive value, L1 / L2 known regression
-  values, window vs per-ISP consistency, NaN p_imb behaviour.
+  values, window vs per-ISP consistency, NaN p_imb behaviour, and the
+  day-type filter (mask values, "all" is a no-op, the partition
+  `all == workday + weekend/holiday`, and S3 continuity preserved).
 - **C — Spec examples** (2 tests): the original brief's two worked
   Level 2 examples (−322.5 € / +375.0 €).
 - **D — Graphs engine** (6 tests): regime classification at the ±30

@@ -776,6 +776,78 @@ table.decomposition td {
   font-weight: 500;
 }
 
+/* ---------- Optimised runs log (#4) ---------------------------------- */
+/* Wide comparison table — scrolls horizontally inside its card so the page
+   body never overflows. One row per Optimise click. */
+.optim-runs-wrap {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+table.optim-runs {
+  border-collapse: collapse;
+  font-size: 12px;
+  white-space: nowrap;
+  min-width: 100%;
+}
+table.optim-runs th {
+  text-align: center;
+  font-weight: 500;
+  color: var(--text-dim);
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  position: sticky;
+  top: 0;
+  background: var(--bg2);
+}
+table.optim-runs td {
+  text-align: center;
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+  vertical-align: middle;
+}
+table.optim-runs tbody tr:hover {
+  background: var(--bg3);
+}
+.optim-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 18px 10px !important;
+  text-align: center !important;
+}
+.optim-chip {
+  display: inline-block;
+  min-width: 22px;
+  margin: 0 1px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.optim-chip.on {
+  background: var(--accent);
+  color: #0d1117;
+}
+.optim-chip.off {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  text-decoration: line-through;
+}
+.optim-off {
+  color: var(--text-dim);
+}
+.optim-up {
+  color: var(--good, #3fb950);
+}
+.optim-down {
+  color: var(--bad, #f85149);
+}
+
 /* ---------- Charts ---------------------------------------------------- */
 .chart {
   background: var(--plot-bg);
