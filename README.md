@@ -1,8 +1,10 @@
-# Vanessa Wind Park — Backtester + Spread Graphs + Forecast
+# TCK Market Dashboard — Backtester + Spread Graphs + Forecast
 
-A static, three-page web tool for the Vanessa / Targale wind park (14 ×
-4.2 MW = 58.8 MW, Latvia). No server, no build step, no install — every
-page is plain HTML + JS served as-is.
+A static, three-page web tool (UI brand **"TCK Market Dashboard"**) for
+the Vanessa / Targale wind park (14 × 4.2 MW = 58.8 MW, Latvia). No
+server, no build step, no install — every page is plain HTML + JS served
+as-is. (The Backtester page is titled **"Backtester - Wind Park"** in the
+navbar.)
 
 The **Backtester** and **Graphs** pages run **entirely client-side and
 offline**: embedded datasets (~3 MB main + ~1.2 MB aFRR + ~85 MB
@@ -15,16 +17,19 @@ The tool is split into three pages, navigable from a top navbar:
 
 | Page              | What it does                                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------------- |
-| **Backtester**    | Strategy P&L over a configurable simulation window. **Levels 1 / 2 / 3.** Trades against DA + mFRR + aFRR (configurable per-direction split). L3 adds an intra-day oversell + hedge-mFRR-dn speculative leg (S3). |
-| **Graphs**        | Box plots and heatmaps of mFRR / aFRR spread (mFRR + aFRR sub-tabs), plus a **mFRR vs aFRR** sub-tab for joint analysis (per-4-s slot-level direction matrix, sign-agreement bars, spread scatter, stats scoreboard). |
-| **Forecast**      | Six-hour-ahead (24 × 15-min) probability forecast of Baltic imbalance regimes — NEG (deficit) / ZRO (balanced) / POS (surplus) — plus expected imbalance prices. The model lives in a private repo; the page reads its `forecast.json`, and a single button dispatches a fresh run via GitHub Actions, then redraws when it lands. |
+| **Backtester - Wind Park** | Strategy P&L over a configurable simulation window, with a **day-type filter** (all / weekends+holidays / workdays). A unified engine runs **five toggleable, jointly-optimised strategies**: **reserve-market** capacity (down), **DA-withhold on low prices**, **adaptive mFRR↔aFRR split**, **ID-trust**, and **intra-day oversell + hedge-mFRR-dn (S3)**. Each ⚡ Optimise is logged to an **Optimised-runs** comparison table (persists per browser tab). |
+| **Graphs**        | Box plots and heatmaps over four sub-tabs: **mFRR** spread, **aFRR** spread/activation, **mFRR vs aFRR** (joint slot-level analysis), and **mFRR vs aFRR reserves** (daily reserve-capacity-price dynamics + imbalance-risk link). |
+| **Forecast**      | Six-hour-ahead (24 × 15-min) probability forecast of Baltic imbalance regimes — NEG (deficit) / ZRO (balanced) / POS (surplus) — plus expected imbalance prices. The model lives in a private repo; the page reads its `forecast.json`, and a single button dispatches a fresh run via GitHub Actions, then redraws when it lands. A completed run is cached per browser tab so navigating away and back keeps it on screen. |
 
 ## Repository layout
 
 ```
 .
-├── index.html                  Backtester page (tabs: Level 1 / Level 2 / Level 3)
-├── graphs.html                 Graphs page (tabs: mFRR / aFRR / mFRR vs aFRR)
+├── index.html                  Backtester page (Setup + day-type filter +
+│                               Reserve / DA-withhold / adaptive-Split / ID-trust /
+│                               S3 strategy cards + Optimised-runs log)
+├── graphs.html                 Graphs page (tabs: mFRR / aFRR / mFRR vs aFRR /
+│                               mFRR vs aFRR reserves)
 ├── forecast.html               Forecast page (Baltic imbalance regime forecast;
 │                               reads forecast.json from a private model repo)
 ├── style.css                   Dark-theme stylesheet (shared)
@@ -35,23 +40,32 @@ The tool is split into three pages, navigable from a top navbar:
 ├── data-afrr-15min.js          ~650 KB per-ISP averaged AST_POS / AST_NEG +
 │                               favourable-slot counts (n_pos_fav / n_neg_fav)
 │                               from preprocess-afrr-15min.py
+├── data-reserve.js             ~0.8 MB per-ISP LV mFRR / aFRR up+down reserve
+│                               (capacity) prices, from preprocess-reserve.py.
+│                               Drives the reserve strategy + Graphs reserves tab.
 ├── data-afrr-prices-meta.js    Tiny meta for the chunked per-4 s spread file
 ├── data-afrr-prices-001.js …   Chunked per-4 s spread payload (lazy-loaded by Graphs aFRR tab)
 │
-├── engine.js                   Backtester simulation engine (window, winsor, simulate,
-│                               aFRR averaging + per-direction split, sweeps)
+├── engine.js                   Backtester simulation engine (window, winsor incl.
+│                               reserve prices, day-type-filter accumulation gate,
+│                               reserve-market down capacity, adaptive split blocks,
+│                               S3 rolling cache, simulate / simulateTotal / monthly)
 ├── charts.js                   Backtester Plotly renderers (timeseries, monthly,
-│                               histogram). Tooltip shows DA + mFRR-up/dn +
-│                               aFRR-up/dn rows; bars stack mFRR + aFRR per direction.
+│                               histogram). Tooltip shows DA + mFRR/aFRR up/dn +
+│                               reserve income; monthly adds a reserve stack; bars use
+│                               the per-ISP adaptive split; gaps filtered days.
 ├── app.js                      Backtester UI controller (config-driven param cards;
-│                               handles s_up / s_dn split + aFRR winsor + live cap previews)
+│                               day-type toggle, reserve + adaptive-split + reserve-winsor
+│                               controls, optimiser over enabled strategies, Optimised-runs
+│                               log with per-tab sessionStorage persistence)
 │
 ├── graphs-engine.js            Graphs data layer (regime split, quantile bins,
 │                               day-type filter, box-plot stats)
 ├── graphs-charts.js            Graphs Plotly renderers (1-D box, 2-D heatmap, matched panels)
-├── graphs-app.js               Graphs UI controller (mFRR + aFRR + mFRR-vs-aFRR sub-tabs,
-│                               day-type toggle, compare-tab winsor controls,
-│                               aFRR-bar resize-on-tab-switch fix, lazy-load hook)
+├── graphs-app.js               Graphs UI controller (mFRR + aFRR + mFRR-vs-aFRR +
+│                               mFRR-vs-aFRR-reserves sub-tabs, day-type toggles,
+│                               winsor controls, daily reserve-price aggregation +
+│                               charts, aFRR-bar resize-on-tab-switch fix, lazy-load hook)
 ├── afrr-engine.js              aFRR activation-count data layer (Graphs page)
 ├── afrr-spread-engine.js       aFRR per-4 s spread data layer (Graphs page)
 ├── afrr-charts.js              aFRR activation-bar Plotly renderer
@@ -70,8 +84,13 @@ The tool is split into three pages, navigable from a top navbar:
 ├── preprocess-afrr.py          Build data-afrr.js + chunked spread files from ast_afrr_data.csv
 ├── preprocess-afrr-15min.py    Build data-afrr-15min.js (averaged 15-min aFRR prices,
 │                               favourable-only filter, n_*_fav counts)
-├── tests.py                    57-test audit suite (data integrity, engine invariants,
-│                               aFRR averaging, mFRR↔aFRR split, frozen regressions)
+├── preprocess-reserve.py       Build data-reserve.js (LV mFRR/aFRR up+down reserve
+│                               prices), aligned to data.js ISP indices by timestamp
+├── tests.py                    79-test audit suite (data integrity, engine invariants,
+│                               day-type filter, reserve market, adaptive split,
+│                               reserve↔split interaction, aFRR, frozen regressions)
+├── scratch/patch_reserves.py   One-off backfill of the Oct–Dec 2025 reserve-price gap
+│                               in the source CSV from the official procured-reserves export
 ├── validate.py                 (legacy) Python ground-truth replay
 ├── sensitivity.py              (legacy) sensitivity sweep
 │
@@ -191,6 +210,37 @@ sign-flipping doesn't cancel out earnings — see "aFRR market"
 section. ISPs before `afrr_start_iso` (May 2025) have all four arrays
 at 0, so the engine's aFRR contribution is naturally 0 for them.
 
+### `data-reserve.js` — reserve (capacity) down-prices
+
+```js
+const RESERVE_DATA = {
+  n: 43070,
+  reserve_mfrr_dn: [...],   // LV mFRR-down hourly capacity price, EUR/MW·h (null where missing)
+  reserve_afrr_dn: [...],   // LV aFRR-down hourly capacity price, EUR/MW·h (null where missing)
+};
+```
+
+Generated by `preprocess-reserve.py`, which aligns the CSV reserve prices
+to `data.js`'s ISP indices **by timestamp** (so it can't drift even if
+`preprocess.py`'s NaN-row filtering changes). Hourly prices are broadcast
+to each 15-min ISP. `null` → NaN in engine.js → "no reserve that ISP".
+
+> **Backfill note (2026-06-21).** The source CSV originally had **no
+> reserve prices for Oct–Dec 2025** (the upstream feed went dark for the
+> whole quarter, all products/areas). That gap was backfilled into
+> `main_data_with_imbalance.csv` from the official *procured-reserves*
+> export (`scratch/patch_reserves.py`, fill-empty-only, non-reserve
+> columns byte-preserved), lifting coverage to **100% mFRR-dn / 91.8%
+> aFRR-dn** (the residual aFRR nulls are Feb–Apr 2025, before that feed
+> started). That export is **ragged**: FCR rows carry one value
+> (`Symetric`); aFRR/mFRR rows carry two, left-packed (`Upward`,
+> `Downward`) — naïve `sep=';'` parsing mislabels them. If you ever
+> regenerate the main CSV from upstream, re-apply the backfill or the
+> quarter goes blank again.
+Optional: if the file is absent the engine falls back to all-NaN and the
+Reserve-market strategy simply never fires. Drives the Reserve-market
+card — see [Reserve market](#reserve-market--down-capacity-sits-before-day-ahead).
+
 ## Backtester — strategy & sign conventions
 
 Per ISP (15-min period). Energy = MW × 0.25 h. Positive = money to the park.
@@ -225,24 +275,41 @@ hold by construction once `data-afrr-15min.js` is built with the
 favourable-only filter (see "aFRR market"): `avg_p_pos ≥ 0` and
 `avg_p_neg ≤ 0` dataset-wide.
 
-### mFRR ↔ aFRR split — per-direction parameters s_up, s_dn
+### mFRR ↔ aFRR adaptive offer split
 
 For each direction we route part of the offered MW to mFRR and the
-remainder to aFRR. Whole-MW market constraint preserved via
-round-and-remainder so no MW is lost:
+remainder to aFRR (whole-MW round-and-remainder, no MW lost):
 
 ```
-Q_up_mfrr = round(s_up * Q_up_offer)     Q_up_afrr = Q_up_offer − Q_up_mfrr
-Q_dn_mfrr = round(s_dn * Q_dn_offer)     Q_dn_afrr = Q_dn_offer − Q_dn_mfrr
+Q_up_mfrr = round(s_up · Q_up_offer)     Q_up_afrr = Q_up_offer − Q_up_mfrr
+Q_dn_mfrr = round(s_dn · Q_dn_offer)     Q_dn_afrr = Q_dn_offer − Q_dn_mfrr
 ```
 
-`s_up = s_dn = 1` (default) routes everything to mFRR — the engine
-collapses to its pre-feature behaviour and the frozen regression
-values hold exactly. `s_up = s_dn = 0` routes everything to aFRR. The
-two parameters are independent because the per-direction price
-economics aren't symmetric (mFRR-up clears only on upside spikes;
-aFRR-up earns continuously on positive avg; same asymmetry for
-downward).
+But `s_up` / `s_dn` are no longer constants — they **adapt over time,
+per direction**, with three params each: **start `x`**, **rebalance
+window `y`** (ISPs), **step `z`**. The split begins at `x`; every `y`
+ISPs it compares the average per-MW revenue *rate* of the two markets
+over the previous block and steps toward the winner by `z`:
+
+```
+up rate:  mFRR = p_mfrr when it clears up (≥1) else 0 ;  aFRR = avg_p_pos
+dn rate:  mFRR = −p_mfrr when it clears dn (≤−1) else 0;  aFRR = −avg_p_neg
+mFRR wins → s += z   ·   aFRR wins → s −= z   ·   tie → no move   ·   clamp [0,1]
+```
+
+The adaptation is **causal** (block `k` uses block `k−1`'s prices) and
+runs continuously from the dataset start (like the S3 rolling stats),
+so a sub-window inherits the right split state; a winsor-keyed
+prefix-sum cache (`_splitEffPrefix`) keeps the optimiser fast. All six
+params (`x₁ y₁ z₁` up, `x₂ y₂ z₂` down) are swept by the optimiser.
+
+**`z = 0` ⇒ the split never moves ⇒ static split at `x`** — the engine
+collapses to the pre-feature behaviour, so `x = 1, z = 0` (the default)
+reproduces the old all-mFRR default and the frozen regression values
+hold exactly (`test_split_adaptive_step0_equals_static`). The static
+scalar `s_up`/`s_dn` call path is retained in the engine + Python mirror
+for those anchors. Up and down are independent because the per-direction
+price economics aren't symmetric.
 
 ### Position accounting
 
@@ -258,6 +325,50 @@ mFRR contributes its full Q when activated (binary across the ISP).
 aFRR contributes a time-fraction `n_*_fav / 225` — the count of 4-s
 slots where the price was favourable for that direction — same factor
 that makes the revenue formula correct.
+
+### Reserve market — down capacity (sits before day-ahead)
+
+A toggleable **Reserve market** card (above DA-withhold, default **OFF**)
+models winning balancing-capacity in the auction that clears *before*
+day-ahead. We model **down capacity only**. Data: hourly LV
+`reserves_mfrr_downward_lv` / `reserves_afrr_downward_lv` prices
+(EUR/MW·h), shipped in `data-reserve.js` (see Data layout). Parameters:
+
+- **DA offer coefficient** `r_coef` — awarded MW = `floor(r_coef × F)`.
+- **mFRR ↔ aFRR reserve split** `r_split` — routes the award between the
+  two reserve products (each paid its own capacity price).
+- **Min reserve price** `r_min_price` — per-product reservation floor; a
+  product priced below it is treated as not awarded that ISP. **NOT
+  swept** by the optimiser (the others are).
+
+Per ISP, with award `R = R_mfrr + R_afrr` (whole-MW, each product kept
+only if its winsorized price is finite and ≥ min):
+
+```
+capacity income      = (R_mfrr·p_res_mfrr + R_afrr·p_res_afrr) × 0.25   (EUR, confirmed settlement)
+da_sold              = max(withhold-level, R)        # reserve MW are MANDATORY DA sales
+Q_w (up offer)       = floor(F) − da_sold
+down offer (mFRR/aFRR): reserve MW use r_split; the non-reserve da_sold−R uses s_dn
+                        ⇒ total down offer == da_sold (unchanged)
+```
+
+The elegance — and the reason it can't break the audited engine — is
+that **with the box off (R = 0) every line collapses to the pre-reserve
+math**, so the frozen L1/L2/L3 values are byte-identical (locked by
+`test_reserve_off_equals_l3_default`). Reserve only (a) adds the capacity
+income leg, (b) raises the DA floor so the awarded MW bypass the withhold
+rule (hence the card rename to *"DA withhold on low prices (non-reserve
+volume)"*), and (c) re-routes a slice of the down offer to the reserve
+split. Down activation still uses our own price gates. Income shows in
+the time-series tooltip (no extra bar) and as a distinct gold stack in
+the monthly decomposition.
+
+⚠ **Backtest caveat (same shape as S3 `X_cap`):** the optimiser sweeps
+`r_coef`, which **saturates to 1.0** — with no price-impact / auction-
+clearing model, offering more capacity is always net-positive. Treat
+`r_coef` like `X_cap` (a liquidity lever) and use `r_min_price` to gate
+participation; the `r_split` optimum leans toward aFRR because the
+aFRR-down capacity price has a fat right tail (high winsorized mean).
 
 ### Physical constraints (audit-applied)
 
@@ -279,47 +390,49 @@ that makes the revenue formula correct.
 
 ### Default parameters
 
-Setup lives in one **shared box above the level selector** — anything you
-change there (sim window, the four winsor pairs, θ_flat) applies to all
-three levels at once. The reset / optimise buttons in each panel only
-touch market params; setup is preserved across resets and across tab
-switches.
+There are no more "Level 1 / 2 / 3" tabs — a single unified engine always
+runs the full codepath, and behaviour is expressed via two source
+selectors (actual-power, ID-forecast) plus **five toggleable strategy
+cards**. Setup lives in one **shared box at the top**: anything there
+(sim window, day-type filter, winsor pairs, θ_flat) bounds the experiment
+and is **not** swept by the optimiser nor touched by "Reset to defaults".
+Below it sit the strategy cards (Reserve → DA-withhold → adaptive Split →
+ID-trust → S3), and at the very bottom the **Optimised-runs** log.
 
-Setup (experiment environment — NOT reset by "Reset to naïve" / "Reset
-market params"):
+Setup (experiment environment — NOT reset by "Reset to defaults"):
 
-| Param                     | Default            | Notes                                                      |
-| ------------------------- | ------------------ | ---------------------------------------------------------- |
-| Sim window                | full dataset       | configurable from/to text inputs                           |
-| mFRR winsor               | 5 / 95 percentile  | clips the −10 000 / +10 000 EUR/MWh outliers               |
-| Imbalance winsor          | 5 / 95 percentile  | same idea, on Latvia imbalance price (L2 / L3 only)        |
-| aFRR upward avg winsor    | 5 / 95 percentile  | clips the per-ISP averaged AST_POS extremes                |
-| aFRR downward avg winsor  | 5 / 95 percentile  | same on AST_NEG (after favourable-only filter, ≤ 0)        |
-| θ_flat                    | 30 EUR/MWh         | flat penalty per MWh of shortfall (L2 / L3). **Moved to Setup**: it's NOT swept by the optimiser and NOT touched by Reset — it bounds the cost model rather than being a strategy lever. |
+| Param                       | Default            | Notes                                                      |
+| --------------------------- | ------------------ | ---------------------------------------------------------- |
+| Sim window                  | full dataset       | from / to text inputs (DD/MM/YYYY)                         |
+| Day-type filter             | All days           | All / Weekends+holidays / Workdays only — post-hoc accumulation gate (see [Day-type filter](#day-type-filter-backtester-and-graphs)) |
+| mFRR winsor                 | 5 / 95 percentile  | clips the −10 000 / +10 000 EUR/MWh outliers               |
+| Imbalance winsor            | 5 / 95 percentile  | Latvia imbalance price                                     |
+| aFRR up / down avg winsor   | 5 / 95 percentile  | per-ISP averaged AST_POS / AST_NEG                         |
+| mFRR / aFRR reserve winsor  | 5 / 95 percentile  | LV reserve (capacity) prices — clips the 4000 €/MW·h spikes (only bites when Reserve is on) |
+| θ_flat                      | 30 EUR/MWh         | flat penalty per MWh of shortfall; not swept, not reset    |
 
 Every winsor input shows a live cap preview alongside the percentile
-(e.g. `(≤ −66.5 €/MWh) / (≥ 258 €/MWh)`) so the user can see what
-they're clipping without running a separate computation.
+(e.g. `(≤ −66.5 €/MWh) / (≥ 258 €/MWh)`).
 
-Market parameters (the optimiser searches over these; "Reset to naïve"
-rolls these back):
+Strategy parameters (the optimiser sweeps these for the **enabled**
+strategies; "Reset to defaults" rolls them back; disabled strategies
+collapse to a neutral value):
 
-| Param             | Default       | Notes                                                                   |
-| ----------------- | ------------- | ----------------------------------------------------------------------- |
-| X                 | 30 EUR/MWh    | DA price below which we withhold from DA                                |
-| Y                 | 1.0           | fraction of forecast to withhold below X                                |
-| Z                 | 1.0           | trust placed on positive ID − DA revisions (L2 / L3 only)               |
-| s_up              | 1.0           | mFRR↔aFRR split for upward MW (1 = all mFRR-up, 0 = all aFRR-up)        |
-| s_dn              | 1.0           | mFRR↔aFRR split for downward MW (1 = all mFRR-dn, 0 = all aFRR-dn)      |
+| Strategy (default enable) | Optimised params (default)                                  | Fixed / user-set         |
+| ------------------------- | ----------------------------------------------------------- | ------------------------ |
+| **Reserve** (OFF)         | DA-offer coef (0.5), mFRR/aFRR reserve split (1.0)          | min reserve price (0)    |
+| **DA-withhold** (ON)      | X (30 €/MWh), Y (1.0)                                       | —                        |
+| **Adaptive split** (ON)   | up x₁/y₁/z₁ + down x₂/y₂/z₂ = start 1.0 / window 96 ISPs / step 0.0 | —                |
+| **ID-trust** (ON)         | Z (1.0)                                                     | —                        |
+| **S3 oversell** (ON)      | K, S_min, σ_max, M                                          | X_cap, lag, DA-skip      |
 
-L3 adds five more **optimised** params (`K`, `S_min`, `σ_max`, `X_cap`,
-`M`) under a dedicated "Intra-day oversell" section with its own ⚡
-Optimise button — see the [Level 3](#level-3--speculative-intra-day-oversell-s3)
-section below.
-
-The `s_up = s_dn = 1` defaults preserve pre-aFRR behaviour exactly —
-both `Q_*_afrr` terms are 0 in that mode, so the engine reduces to
-the legacy mFRR-only math and the frozen regression values still hold.
+The defaults are deliberately **neutral / legacy-preserving**: Reserve
+OFF, and the split at start = 1 / step = 0 (constant all-mFRR). In that
+state both `Q_*_afrr` terms and reserve income are 0, the engine reduces
+to the legacy mFRR-only math, and the frozen L1/L2/L3 regression values
+hold exactly. See [adaptive split](#mfrr--afrr-adaptive-offer-split),
+[reserve market](#reserve-market--down-capacity-sits-before-day-ahead)
+and [S3](#level-3--speculative-intra-day-oversell-s3) for the mechanics.
 
 ## Level 3 — speculative intra-day oversell (S3)
 
@@ -394,18 +507,22 @@ stop-loss framing:
 
 ### Unified optimiser
 
-Each level has **one ⚡ Optimise button** that sweeps every optimised
-parameter in that level at once: on L3 that's `(X, Y, Z, s_up, s_dn,
-K, S_min, σ_max, M)` — 9 dimensions. `X_cap`, lag `L` and `DA_skip`
-are held at the user's slider values because they're physical /
-liquidity constraints, not strategy levers (see "Known quirks" #18).
+**One ⚡ Optimise button** sweeps every optimised parameter of the
+**enabled** strategies jointly. With all five on that's up to **15
+dimensions**: reserve `(coef, split)`, DA-withhold `(X, Y)`, adaptive
+split `(x₁, y₁, z₁, x₂, y₂, z₂)`, ID-trust `(Z)`, and S3 `(K, S_min,
+σ_max, M)`. Disabling a strategy drops its dimensions; min-reserve-price,
+S3 `X_cap` / lag `L` / `DA_skip` are held at the user's values because
+they're physical / liquidity constraints, not strategy levers (see
+"Known quirks" #18). More enabled strategies ⇒ a heavier sweep, so
+disable the ones you're not studying to keep Optimise snappy.
 
 The algorithm is **seeded random search + multi-start coord-descent
 refine**:
 
-1. Draw N uniform random samples over the optimised parameter space.
-   Track the top-K samples by revenue (sorted insertion into a
-   small array — K = 3 on L1 / L2, K = 5 on L3).
+1. Draw N = 4000 uniform random samples over the optimised parameter
+   space. Track the top-K samples by revenue (sorted insertion into a
+   small array — K = 5).
 2. For each of the top-K samples, run coordinate-descent refine:
    sweep each axis over its grid holding others at the current best,
    update the best, repeat for up to 3 passes (stop early if a full
@@ -581,7 +698,9 @@ the right mix.
 
 ## Graphs — what they show
 
-The Graphs page has two sub-tabs:
+The Graphs page has four sub-tabs: **mFRR**, **aFRR**, **mFRR vs aFRR**
+(balancing-energy comparison), and **mFRR vs aFRR reserves**
+(capacity-price analysis, documented at the end of this section).
 
 ### mFRR sub-tab (default)
 
@@ -707,12 +826,52 @@ in the Setup card.
   different signals at different timescales. They agree directionally
   most of the time but their pricing detail differs slot-by-slot.
 
-### Day-type filter (all sub-tabs)
+### mFRR vs aFRR reserves sub-tab
 
-Each sub-tab has an independent **day type filter** (All / Weekends +
-holidays / Workdays only). Public-holiday detection runs through the
-`date-holidays` plugin for **Latvia, Estonia and Lithuania** — a date
-counts as a holiday if any of the three considers it a public holiday.
+Daily-aggregated **reserve (capacity) price** analysis from `data-reserve.js`
+(LV mFRR/aFRR up+down hourly prices). Each market's daily value is the mean
+over the window's matching-day ISPs of its winsorized up/down average — so
+mFRR and aFRR each get **one value per day** (the user-requested
+simplification from 96 ISPs/day). Setup: sim range, day-type filter, two
+winsor pairs (mFRR / aFRR reserve price). It answers two questions:
+
+1. **Do high reserve prices flag extreme-imbalance days?** Box plots of the
+   day's mean |Baltic imbalance| binned by reserve-price quartile, one panel
+   per market, plus `r(price, |imb|)`. Finding on the current data:
+   **mFRR yes, aFRR no** — `r(mFRR price, |imb|) ≈ +0.30` (quartile medians
+   climb 27→33 MW) while `r(aFRR price, |imb|) ≈ −0.10` (flat). mFRR capacity
+   pricing anticipates system stress; aFRR pricing is driven by its own
+   tail-heavy scarcity dynamics. (Combining the two markets washes the signal
+   out — hence the per-market panels.)
+2. **Do the two markets move together or play cat-and-mouse?** A dual time
+   series, an aFRR-vs-mFRR scatter coloured by date, and the spread
+   (aFRR − mFRR) over time. Finding: **not in unison** — level correlation
+   ≈ −0.17 (mild substitution), day-over-day change correlation ≈ 0. The
+   spread has **lag-1 autocorrelation ≈ 0.85**, i.e. it's **persistent
+   regimes** (one product stays the better deal for stretches), not a fast
+   daily oscillation. aFRR is the pricier product on ~46 % of days but its
+   mean spread is +33 €/MW·h, pulled up by a fat upper tail (daily spikes to
+   +287). The high persistence is exploitable: the recently-cheaper market
+   tends to stay cheaper.
+
+**Defaults:** the subtab opens on **01/01/2026 – 01/05/2026** with
+winsorisation **off (0/100)** — the matured-market, fully-reserve-covered
+window. The figures quoted above are the *full-dataset* view; widen the date
+range to reproduce them. They're regime-dependent, which is the real lesson:
+in the Jan–May 2026 default window the two reserve prices actually **co-move**
+(level r ≈ +0.56, change r ≈ +0.52, near-equal levels) and **neither** predicts
+imbalance (both r ≈ −0.09) — so the full-range mFRR-imbalance signal and the
+aFRR "stability" pattern both lean heavily on 2025 (the latter on the Feb–Apr
+aFRR-market startup specifically). Use the date filter to test robustness.
+
+### Day-type filter (Backtester and Graphs)
+
+The Backtester's Setup box and each Graphs sub-tab have an independent
+**day type filter** (All / Weekends + holidays / Workdays only).
+Public-holiday detection runs through the `date-holidays` plugin for
+**Latvia, Estonia and Lithuania** — a date counts as a holiday if any of
+the three considers it a public holiday. (The Graphs mechanics are below;
+the Backtester's run-fully-then-filter variant is described after them.)
 
 Mechanics: `Engine.init()` builds a `dayTypeMask: Uint8Array`
 (0 = workday, 1 = weekend, 2 = holiday) once at load time, classified
@@ -913,7 +1072,8 @@ Internally the canonical form is still `YYYY-MM-DD` (ISO).
 
 ## Tests
 
-`tests.py` runs 69 audit / regression tests:
+`tests.py` runs 79 audit / regression tests (a few are gated on the
+optional aFRR / reserve data files, so a stripped repo still passes):
 
 ```
 python tests.py
@@ -923,11 +1083,20 @@ Categories:
 
 - **A — Data integrity** (9 tests): Baltic aggregations, spread
   formula, NaN handling, time monotonicity, mFRR up == down.
-- **B — Engine invariants** (12 tests): whole-MW rounding, mFRR-dn cap,
-  mFRR up/dn mutual exclusion, naive value, L1 / L2 known regression
-  values, window vs per-ISP consistency, NaN p_imb behaviour, and the
-  day-type filter (mask values, "all" is a no-op, the partition
-  `all == workday + weekend/holiday`, and S3 continuity preserved).
+- **B — Engine invariants** (~23 tests): whole-MW rounding, mFRR-dn cap,
+  mFRR up/dn mutual exclusion, naive value, L1 / L2 / L3 known regression
+  values, window vs per-ISP consistency, NaN p_imb behaviour, the full
+  S3 family (X_cap=0 ≡ L2, lag window, rolling source, decomposition);
+  the **day-type filter** (mask values, "all" is a no-op, the partition
+  `all == workday + weekend/holiday`, S3 continuity preserved); the
+  **reserve market** (income settlement `price×MW×0.25`, DA-floor
+  override, min-price gate, reserve-OFF ≡ frozen L3, total down offer
+  unchanged, data-reserve.js alignment); the **adaptive split** (synthetic
+  block-step logic, step=0 ≡ static scalar, step>0 adapts); and the
+  **reserve↔split interaction** (reserve is a per-direction floor, the
+  adaptive split routes only the free remainder, income is split-invariant).
+  The Python mirror uses half-up rounding (`_rnd`) to match the engine's
+  `Math.round`, so JS↔Python cross-checks agree to float precision.
 - **C — Spec examples** (2 tests): the original brief's two worked
   Level 2 examples (−322.5 € / +375.0 €).
 - **D — Graphs engine** (6 tests): regime classification at the ±30
@@ -1021,6 +1190,23 @@ of favourable 4-s slots per ISP) for the L2 position-contribution
 math. Built-in synthetic checks include the user's −10 / +50 mixed-sign
 example to lock the filter behaviour in.
 
+### `preprocess-reserve.py` → `data-reserve.js`
+
+```
+python preprocess-reserve.py
+```
+
+Builds the per-ISP LV reserve (capacity) prices —
+`reserve_mfrr_up/dn`, `reserve_afrr_up/dn` — used by the Backtester's
+reserve strategy and the Graphs "mFRR vs aFRR reserves" sub-tab. Reads
+`data.js` for the ISP timeline and **aligns the CSV reserve prices to ISP
+indices by timestamp** (so it can't drift even if `preprocess.py`'s
+NaN-row filtering changes); hourly prices are broadcast to each 15-min
+ISP, `null` where missing. The Oct–Dec 2025 gap in the source feed was
+backfilled into the CSV via `scratch/patch_reserves.py` from the official
+procured-reserves export — see the
+[`data-reserve.js`](#data-reservejs--reserve-capacity-down-prices) section.
+
 ## Data refresh workflow
 
 Replace any of the source CSVs and re-run the matching preprocessor(s):
@@ -1029,6 +1215,7 @@ Replace any of the source CSVs and re-run the matching preprocessor(s):
 python preprocess.py                # if main_data_with_imbalance.csv changed
 python preprocess-afrr.py           # if ast_afrr_data.csv changed (counts + chunked spread)
 python preprocess-afrr-15min.py     # if ast_afrr_data.csv changed (averaged 15-min prices)
+python preprocess-reserve.py        # rebuild data-reserve.js (reserve prices)
 python tests.py                     # see "frozen regression values" caveat below
 ```
 
@@ -1039,7 +1226,11 @@ What re-derives **automatically** from the new datasets:
 - Quantile bin boundaries on every Graphs render
 - Winsorisation bounds + cap previews (computed within the sim window)
 - All chart axes / tooltips / aggregations
-- Naïve baseline (recomputed every parameter change at current θ + s_up + s_dn)
+- Naïve baseline — the true do-nothing floor: X=Y=Z=0 and **every strategy
+  neutralised** (DA-withhold, ID-trust, S3, reserve, and the split → all-mFRR),
+  at the current θ + sources. So "vs naïve" shows the combined lift of every
+  enabled strategy, including the adaptive split (it no longer absorbs the
+  split's gains into the baseline).
 - Backtester decompositions, robustness stats, monthly bars
 - ISP counts (mFRR + aFRR per direction, regime / dead-band)
 - Day-type mask + holiday set (recomputed once at `Engine.init`)
@@ -1049,11 +1240,17 @@ What needs **manual attention** when the data changes substantially:
 - **`tests.py` regression values** are frozen on the current dataset:
   - L1 default = 13,257,221 €
   - L2 default = 13,367,642 €
+  - L3 default = 15,185,134 € (S3 on, reserve off, split all-mFRR)
   - April-row count = 2,880
   - ~2,911 NaN p_imb entries
 
   After a data refresh these need updating — `python tests.py` will
   tell you which assertions need new values, then re-freeze them.
+- **Reserve-price backfill.** The source CSV's reserve columns had no
+  data for Oct–Dec 2025; that gap was patched in from the official
+  procured-reserves export. If you regenerate `main_data_with_imbalance.csv`
+  from upstream, **re-apply `scratch/patch_reserves.py`** (or the quarter
+  goes blank again) before `preprocess-reserve.py`.
 - **Cache-busting `?v=N`** in `index.html` and `graphs.html`. Bump N
   when deploying so users re-fetch updated data / JS / CSS.
   Conventionally `index.html` and `graphs.html` use independent
@@ -1256,14 +1453,18 @@ These are non-obvious behaviours by design — read before "fixing".
      refuse to sell at negative prices, add a gate `bid_price > 0` or
      `VWAP1H > 0` outside the engine.
 
-18. **Optimiser doesn't sweep `X_cap`, lag `L`, or `DA_skip`.** When
-    `Optimise` is clicked on L3, the sweep covers `(X, Y, Z, s_up,
-    s_dn, K, S_min, σ_max, M)` only — the three held-fixed dims are
-    physical / liquidity constraints, not strategy levers. `X_cap`
-    in particular is excluded because the backtest has **no
-    price-impact term** — selling more is always net-positive on this
-    dataset's frozen liquidity assumption, so sweeping `X_cap` would
-    just pick the grid max every time. Interior dims (`K ≈ 2-4`,
+18. **Some dims are held fixed (physical / liquidity constraints).** The
+    optimiser sweeps the enabled strategies' levers (reserve `coef`/`split`,
+    `X`, `Y`, the six adaptive-split params, `Z`, S3 `K`/`S_min`/`σ_max`/`M`)
+    but holds **min reserve price** and S3 **`X_cap` / lag `L` / `DA_skip`**
+    at the user's values — they're physical / liquidity constraints, not
+    strategy levers. `X_cap` in particular is excluded because the backtest
+    has **no price-impact term** — selling more is always net-positive on
+    this dataset's frozen liquidity assumption, so sweeping `X_cap` would
+    just pick the grid max every time. The reserve **`coef`** dimension IS
+    swept but **saturates to 1.0** for the same reason (no price-impact /
+    auction-clearing model) — treat it like `X_cap` and lean on the min
+    reserve price to gate participation. Interior dims (`K ≈ 2-4`,
     `M ≈ 0-5`) are genuine optima; `S_min` and `σ_max` may still
     settle on grid edges where the gates never trip (`σ_max ≈ 900-950`
     on the current data — the rolling-std rarely gets that high so

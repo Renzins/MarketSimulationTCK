@@ -242,6 +242,14 @@ def _floor(x: float) -> int:
     return math.floor(x + 1e-9)
 
 
+def _rnd(x):
+    """Round half UP (toward +∞) to match the engine's Math.round on the
+    non-negative whole-MW split/reserve quantities. NumPy's np.round is
+    half-to-EVEN, which diverges from the engine at exact half-MW points
+    (e.g. 0.7 × 15 = 10.5 → engine 11, np.round 10)."""
+    return np.floor(np.asarray(x, dtype=np.float64) + 0.5)
+
+
 def isp_revenue(
     level: int,
     F,
@@ -399,9 +407,9 @@ def simulate_total(
     s_up_c = max(0.0, min(1.0, float(s_up)))
     s_dn_c = max(0.0, min(1.0, float(s_dn)))
     # round() instead of floor for the split (matches engine.js)
-    Q_up_mfrr = np.round(s_up_c * Q_up_offer)
+    Q_up_mfrr = _rnd(s_up_c * Q_up_offer)
     Q_up_afrr = Q_up_offer - Q_up_mfrr
-    Q_dn_mfrr = np.round(s_dn_c * Q_dn_offer)
+    Q_dn_mfrr = _rnd(s_dn_c * Q_dn_offer)
     Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
     is_up = P_mfrr_w >= 1
     is_dn = P_mfrr_w <= -1
@@ -473,32 +481,103 @@ def s3_rolling_stats(src: np.ndarray, K: int, L: int):
     return mean, std
 
 
+def _adaptive_split(start, win, step, pm_w, second_w, direction):
+    """Per-ISP follow-the-winner split — mirror of engine.js _splitBlocks.
+    Block 0 = start; each later block steps the split toward whichever market
+    had the higher average per-MW rate in the PREVIOUS block (causal). Rates:
+      up:  mFRR = p_mfrr when ≥1 else 0 ;  aFRR = avg_p_pos
+      dn:  mFRR = −p_mfrr when ≤−1 else 0;  aFRR = −avg_p_neg
+    """
+    pm = np.asarray(pm_w, float)
+    sec = np.asarray(second_w, float)
+    if direction == "up":
+        effM = np.where(pm >= 1, pm, 0.0)
+        effA = np.where(sec > 0, sec, 0.0)
+    else:
+        effM = np.where(pm <= -1, -pm, 0.0)
+        effA = np.where(sec < 0, -sec, 0.0)
+    n = len(pm)
+    w = max(1, int(win))
+    step = float(step)
+    out = np.empty(n)
+    cur = min(1.0, max(0.0, float(start)))
+    nB = (n - 1) // w + 1
+    for k in range(nB):
+        if k > 0 and step > 0:
+            plo, phi = (k - 1) * w, min(k * w, n)
+            if phi > plo:
+                am, aa = effM[plo:phi].mean(), effA[plo:phi].mean()
+                if am > aa:
+                    cur = min(1.0, cur + step)
+                elif aa > am:
+                    cur = max(0.0, cur - step)
+        out[k * w : min((k + 1) * w, n)] = cur
+    return out
+
+
 def simulate_total_l3(
     F, ID, P_da, P_mfrr_w, Q_pot, P_imb_w, vwap_1h, P_mfrr_raw,
     X, Y, Z, theta,
     s_up=1.0, s_dn=1.0,
+    split_adaptive=False, s_up_start=None, s_dn_start=None,
+    s_up_win=96, s_dn_win=96, s_up_step=0.0, s_dn_step=0.0,
     avg_p_pos_w=None, avg_p_neg_w=None, n_pos_fav=None, n_neg_fav=None,
     s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
     s3_da_skip=50,
     day_mask=None, day_filter="all",
+    reserve_enabled=False, r_coef=0.0, r_split=1.0, r_min_price=0.0,
+    reserve_mfrr_dn=None, reserve_afrr_dn=None,
 ):
     """L3 vectorised total. Adds S3 on top of L2 math (same shape as engine
     simulateTotal level=3). Rolling stats are from p_mfrr_raw (NOT p_imb_raw)
     over window [i-K-L, i-L), matching post-migration engine.js."""
     # Start from L2 components (re-use the L2 logic locally for clarity).
     above_X = P_da >= X
-    da_sold = np.floor(np.where(above_X, F, F * (1 - Y)) + 1e-9).astype(np.float64)
-    Q_w = np.floor(np.where(above_X, 0, F - da_sold) + 1e-9)
+    # Split: adaptive (per-ISP arrays) or static scalar. Scalar path keeps the
+    # frozen L1/L2/L3 anchors valid; np.round broadcasts over either shape.
+    if split_adaptive:
+        su = s_up if s_up_start is None else s_up_start
+        sd = s_dn if s_dn_start is None else s_dn_start
+        ap = avg_p_pos_w if avg_p_pos_w is not None else np.zeros_like(F)
+        an = avg_p_neg_w if avg_p_neg_w is not None else np.zeros_like(F)
+        s_up_c = _adaptive_split(su, s_up_win, s_up_step, P_mfrr_w, ap, "up")
+        s_dn_c = _adaptive_split(sd, s_dn_win, s_dn_step, P_mfrr_w, an, "dn")
+    else:
+        s_up_c = max(0.0, min(1.0, float(s_up)))
+        s_dn_c = max(0.0, min(1.0, float(s_dn)))
+    # ----- Reserve market down capacity (mirror engine.js; inert when off) -----
+    if reserve_enabled and reserve_mfrr_dn is not None:
+        prm = np.asarray(reserve_mfrr_dn, dtype=np.float64)
+        pra = (
+            np.asarray(reserve_afrr_dn, dtype=np.float64)
+            if reserve_afrr_dn is not None
+            else np.full_like(F, np.nan)
+        )
+        R_total = np.floor(float(r_coef) * F + 1e-9)
+        Rm0 = _rnd(float(r_split) * R_total)
+        take_m = np.isfinite(prm) & (prm >= r_min_price)
+        take_a = np.isfinite(pra) & (pra >= r_min_price)
+        R_mfrr = np.where(take_m, Rm0, 0.0)
+        R_afrr = np.where(take_a, R_total - Rm0, 0.0)
+        reserve_rate = R_mfrr * np.where(take_m, prm, 0.0) + R_afrr * np.where(take_a, pra, 0.0)
+    else:
+        R_mfrr = np.zeros_like(F)
+        R_afrr = np.zeros_like(F)
+        reserve_rate = np.zeros_like(F)
+    R_dn = R_mfrr + R_afrr
+    F_int = np.floor(F + 1e-9)
+    da_sold_wh = np.floor(np.where(above_X, F, F * (1 - Y)) + 1e-9).astype(np.float64)
+    da_sold = np.maximum(da_sold_wh, R_dn)
+    Q_w = F_int - da_sold
     trusted_raw = Z * (ID - F)
     trusted_extra = np.where(trusted_raw > 0, np.floor(trusted_raw + 1e-9), 0)
     Q_up_offer = Q_w + trusted_extra
-    Q_dn_offer = da_sold
-    s_up_c = max(0.0, min(1.0, float(s_up)))
-    s_dn_c = max(0.0, min(1.0, float(s_dn)))
-    Q_up_mfrr = np.round(s_up_c * Q_up_offer)
+    da_nonreserve = da_sold - R_dn
+    Q_up_mfrr = _rnd(s_up_c * Q_up_offer)
     Q_up_afrr = Q_up_offer - Q_up_mfrr
-    Q_dn_mfrr = np.round(s_dn_c * Q_dn_offer)
-    Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
+    rest_dn_mfrr = _rnd(s_dn_c * da_nonreserve)
+    Q_dn_mfrr = R_mfrr + rest_dn_mfrr
+    Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr)
     is_up = P_mfrr_w >= 1
     is_dn = P_mfrr_w <= -1
     up_mfrr_active = np.where(is_up, Q_up_mfrr, 0)
@@ -513,6 +592,7 @@ def simulate_total_l3(
         da_sold * P_da
         + up_mfrr_active * P_mfrr_w
         - dn_mfrr_active * P_mfrr_w
+        + reserve_rate
         + np.where(up_afrr_active, Q_up_afrr * avg_p_pos_w, 0)
         - np.where(dn_afrr_active, Q_dn_afrr * avg_p_neg_w, 0)
     )
@@ -573,6 +653,17 @@ def simulate_total_l3(
         "imb": imb,
         "flat": flat,
         "s3_extra_cost": s3_extra_cost,
+        # Reserve diagnostics (for the reserve-market tests).
+        "reserve": float((reserve_rate).sum() * 0.25),
+        "da_sold": da_sold,
+        "R_dn": R_dn,
+        "R_mfrr": R_mfrr,
+        "R_afrr": R_afrr,
+        "Q_dn_mfrr": Q_dn_mfrr,
+        "Q_dn_afrr": Q_dn_afrr,
+        "Q_dn_total": Q_dn_mfrr + Q_dn_afrr,
+        "s_up_arr": s_up_c,
+        "s_dn_arr": s_dn_c,
     }
 
 
@@ -2044,6 +2135,233 @@ def test_day_filter_preserves_s3_continuity():
     )
 
 
+# ============================================================================
+#  RESERVE MARKET (Backtester) — capacity income from mandatory down offers.
+#  Reserve OFF must reproduce L3 exactly; ON adds capacity income, raises the
+#  DA floor, and re-routes the down split — but the TOTAL down offer is
+#  unchanged (= da_sold). Synthetic ISPs check the settlement + gates; the
+#  real data-reserve.js is checked for alignment.  Settlement (confirmed):
+#  income = price[EUR/MW·h] × awarded_MW × 0.25h.
+# ============================================================================
+RESERVE_JS_PATH = os.path.join(BASE, "data-reserve.js")
+HAVE_RESERVE_JS = os.path.exists(RESERVE_JS_PATH)
+
+
+def _load_reserve_js():
+    with open(RESERVE_JS_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    return json.loads(text[text.index("{") : text.rindex("}") + 1])
+
+
+def _reserve_inputs():
+    """L3 inputs + winsorized (5/95) reserve down-price arrays from data-reserve.js."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    rd = _load_reserve_js()
+    rm = np.array([np.nan if v is None else v for v in rd["reserve_mfrr_dn"]], dtype=np.float64)
+    ra = np.array([np.nan if v is None else v for v in rd["reserve_afrr_dn"]], dtype=np.float64)
+    return F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, winsorize(rm, 5, 95), winsorize(ra, 5, 95)
+
+
+def test_reserve_income_hand_example():
+    """User's worked example: 10 MW down @ 10 EUR/MW·h → 25 € for the 15-min
+    ISP (price × MW × 0.25). Isolated: no activation, no shortfall."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    r = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0),
+        X=0, Y=0, Z=0, theta=0, s3_X_cap=0,
+        reserve_enabled=True, r_coef=0.5, r_split=1.0, r_min_price=0.0,
+        reserve_mfrr_dn=one(10.0), reserve_afrr_dn=one(np.nan),
+    )
+    print(f"\n        reserve income (10 MW @ 10) = {r['reserve']:.2f} € (expect 25)")
+    assert abs(r["reserve"] - 25.0) < 1e-9, f"reserve income {r['reserve']} != 25"
+    assert abs(r["total"] - 275.0) < 1e-9, f"total {r['total']} != 275 (DA 250 + reserve 25)"
+    assert r["R_dn"][0] == 10 and r["da_sold"][0] == 20
+
+
+def test_reserve_da_floor_overrides_withhold():
+    """Below X with full withhold (Y=1) DA-sold would be 0; a 10 MW reserve
+    award forces da_sold up to 10 (mandatory DA sale, bypasses withhold)."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    common = dict(X=50, Y=1.0, Z=0, theta=0, s3_X_cap=0)
+    r = simulate_total_l3(
+        one(20.0), one(20.0), one(1.0), one(0.0), one(100.0), one(np.nan), one(np.nan), one(0.0),
+        reserve_enabled=True, r_coef=0.5, r_split=1.0, r_min_price=0.0,
+        reserve_mfrr_dn=one(10.0), reserve_afrr_dn=one(np.nan), **common,
+    )
+    r0 = simulate_total_l3(
+        one(20.0), one(20.0), one(1.0), one(0.0), one(100.0), one(np.nan), one(np.nan), one(0.0), **common,
+    )
+    assert r["da_sold"][0] == 10, f"reserve floor: da_sold {r['da_sold'][0]} != 10"
+    assert r0["da_sold"][0] == 0, "without reserve da_sold should be 0 (full withhold)"
+
+
+def test_reserve_min_price_filter():
+    """Reserve price below the min-price gate → no reserve taken (no income,
+    no DA floor)."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    r = simulate_total_l3(
+        one(20.0), one(20.0), one(1.0), one(0.0), one(100.0), one(np.nan), one(np.nan), one(0.0),
+        X=50, Y=1.0, Z=0, theta=0, s3_X_cap=0,
+        reserve_enabled=True, r_coef=0.5, r_split=1.0, r_min_price=10.0,
+        reserve_mfrr_dn=one(5.0), reserve_afrr_dn=one(np.nan),
+    )
+    assert r["reserve"] == 0.0 and r["R_dn"][0] == 0 and r["da_sold"][0] == 0
+
+
+def test_reserve_off_equals_l3_default():
+    """LOAD-BEARING: reserve disabled reproduces the frozen L3 default even
+    with reserve price arrays attached."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, rm, ra = _reserve_inputs()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+        reserve_enabled=False, reserve_mfrr_dn=rm, reserve_afrr_dn=ra,
+    )
+    assert abs(r["total"] - FROZEN_L3_DEFAULT_EUR) < 200, (
+        f"reserve-off L3 = {r['total']:,.0f} but FROZEN is {FROZEN_L3_DEFAULT_EUR:,}"
+    )
+
+
+def test_reserve_total_down_offer_unchanged():
+    """Reserve only RE-ROUTES the down offer (reserve split vs s_dn); the TOTAL
+    down volume stays == da_sold, so position/shortfall math is undisturbed.
+    Checked elementwise across the whole dataset with reserve ON."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, rm, ra = _reserve_inputs()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30, s3_X_cap=5,
+        reserve_enabled=True, r_coef=0.5, r_split=0.6, r_min_price=5.0,
+        reserve_mfrr_dn=rm, reserve_afrr_dn=ra,
+    )
+    assert np.allclose(r["Q_dn_total"], r["da_sold"]), "total down offer must equal da_sold"
+    assert np.all(r["da_sold"] >= r["R_dn"] - 1e-9), "da_sold must be >= reserve floor"
+    print(f"\n        reserve ON (coef .5 / split .6) total = {r['total']:,.0f} € "
+          f"(capacity income {r['reserve']:,.0f} €)")
+
+
+def test_reserve_data_js_alignment():
+    """data-reserve.js length matches data.js n, and sampled ISPs match the CSV
+    reserve price at the same timestamp (proves the index alignment)."""
+    rd = _load_reserve_js()
+    assert rd["n"] == DATA["n"], f"reserve n {rd['n']} != data.js n {DATA['n']}"
+    assert len(rd["reserve_mfrr_dn"]) == DATA["n"] and len(rd["reserve_afrr_dn"]) == DATA["n"]
+    rcsv = pd.read_csv(CSV_PATH, usecols=["datetime_utc", "reserves_mfrr_downward_lv"])
+    rcsv["datetime_utc"] = pd.to_datetime(rcsv["datetime_utc"])
+    s = rcsv.set_index("datetime_utc")["reserves_mfrr_downward_lv"]
+    s = s[~s.index.duplicated(keep="first")]
+    rng = np.random.default_rng(7)
+    for i in rng.choice(DATA["n"], size=30, replace=False):
+        ts = DATA_TS[int(i)]
+        want = s.get(ts, np.nan)
+        if pd.isna(want):
+            continue
+        got = rd["reserve_mfrr_dn"][int(i)]
+        assert got is not None and abs(got - float(want)) < 0.01, (
+            f"ISP {i} @ {ts}: reserve {got} != CSV {want}"
+        )
+
+
+# ============================================================================
+#  ADAPTIVE mFRR↔aFRR OFFER SPLIT — the static split is the step=0 special
+#  case (must match exactly, so frozen anchors hold); step>0 follows the
+#  better-paying market block by block.
+# ============================================================================
+def _afrr_feeds():
+    with open(DATA_AFRR_15MIN_PATH, "r", encoding="utf-8") as f:
+        t = f.read()
+    A = json.loads(t[t.index("{") : t.rindex("}") + 1])
+    return (
+        winsorize(np.array(A["avg_p_pos"], dtype=np.float64), 5, 95),
+        winsorize(np.array(A["avg_p_neg"], dtype=np.float64), 5, 95),
+        np.array(A["n_pos_fav"], dtype=np.float64),
+        np.array(A["n_neg_fav"], dtype=np.float64),
+    )
+
+
+def test_split_block_logic_synthetic():
+    """Controlled: win=2, step=0.25. Block 0 = 0.5; block 1 follows block 0
+    where mFRR-up rate (10) beats aFRR (1) → +0.25 → 0.75; block 2 follows
+    block 1 where mFRR (0) < aFRR (1) → −0.25 → 0.5."""
+    pm = np.array([10.0, 10.0, 0.0, 0.0, 0.0, 0.0])
+    ap = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    s = _adaptive_split(0.5, 2, 0.25, pm, ap, "up")
+    assert np.allclose(s, [0.5, 0.5, 0.75, 0.75, 0.5, 0.5]), f"adaptive split got {s}"
+    # clamps to [0,1]
+    assert _adaptive_split(0.9, 2, 0.25, pm, ap, "up").max() <= 1.0
+
+
+def test_split_adaptive_step0_equals_static():
+    """LOAD-BEARING: adaptive split with step=0 reproduces the static scalar
+    split at the same start (the z=0 equivalence the rework relies on)."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    ap_w, an_w, npf, nnf = _afrr_feeds()
+    common = dict(X=30, Y=1, Z=1, theta=30, avg_p_pos_w=ap_w, avg_p_neg_w=an_w,
+                  n_pos_fav=npf, n_neg_fav=nnf, s3_X_cap=5)
+    stat = simulate_total_l3(F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+                             s_up=0.6, s_dn=0.3, **common)["total"]
+    adap = simulate_total_l3(F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+                             split_adaptive=True, s_up_start=0.6, s_dn_start=0.3,
+                             s_up_step=0.0, s_dn_step=0.0, s_up_win=96, s_dn_win=96, **common)["total"]
+    assert abs(stat - adap) < 1.0, f"step0 adaptive {adap:,.2f} != static {stat:,.2f}"
+
+
+def test_split_adaptive_actually_adapts():
+    """With step>0 the split moves over time, changing the total vs the
+    step=0 (static) baseline at the same start."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    ap_w, an_w, npf, nnf = _afrr_feeds()
+    common = dict(X=30, Y=1, Z=1, theta=30, avg_p_pos_w=ap_w, avg_p_neg_w=an_w,
+                  n_pos_fav=npf, n_neg_fav=nnf, s3_X_cap=5, split_adaptive=True,
+                  s_up_start=0.5, s_dn_start=0.5, s_up_win=96, s_dn_win=96)
+    base = simulate_total_l3(F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+                             s_up_step=0.0, s_dn_step=0.0, **common)["total"]
+    adap = simulate_total_l3(F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+                             s_up_step=0.1, s_dn_step=0.1, **common)["total"]
+    print(f"\n        adaptive split: static-start {base:,.0f} € vs adapting {adap:,.0f} €")
+    assert abs(base - adap) > 1000, "step>0 should change the result"
+
+
+def test_reserve_respects_adaptive_split():
+    """INTERACTION: obligatory (reserve) vs free balancing volume. Reserve down
+    MW are an unconditional per-direction floor on the down offer; the adaptive
+    split governs ONLY the free (non-reserve) remainder; reserve is added on
+    top; total down stays == da_sold; and reserve capacity income is invariant
+    to the split. Verified across the whole dataset with both features ON."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, rm, ra = _reserve_inputs()
+    ap_w, an_w, npf, nnf = _afrr_feeds()
+    base = dict(
+        X=30, Y=1, Z=1, theta=30, s3_X_cap=5,
+        avg_p_pos_w=ap_w, avg_p_neg_w=an_w, n_pos_fav=npf, n_neg_fav=nnf,
+        reserve_enabled=True, r_coef=0.5, r_split=0.7, r_min_price=5.0,
+        reserve_mfrr_dn=rm, reserve_afrr_dn=ra,
+        split_adaptive=True, s_up_win=96, s_dn_win=96,
+    )
+    call = lambda **kw: simulate_total_l3(F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, **base, **kw)
+    r = call(s_up_start=0.5, s_up_step=0.1, s_dn_start=0.3, s_dn_step=0.1)
+    # 1) reserve obligation is an unconditional floor on BOTH directions
+    assert np.all(r["Q_dn_mfrr"] >= r["R_mfrr"] - 1e-9), "mFRR-dn fell below the reserve obligation"
+    assert np.all(r["Q_dn_afrr"] >= r["R_afrr"] - 1e-9), "aFRR-dn fell below the reserve obligation"
+    # 2) the free portion follows the adaptive split exactly (reserve excluded)
+    free = r["da_sold"] - r["R_dn"]
+    assert np.allclose(r["Q_dn_mfrr"] - r["R_mfrr"], _rnd(r["s_dn_arr"] * free)), (
+        "free mFRR-dn must equal the adaptive split of the NON-reserve volume"
+    )
+    # 3) total down offer unchanged by reserve + adaptive split
+    assert np.allclose(r["Q_dn_total"], r["da_sold"]), "total down offer != da_sold"
+    # 4) reserve capacity income is invariant to the split (uses r_split, not s_dn)
+    inc_allM = call(s_up_start=1, s_up_step=0, s_dn_start=1, s_dn_step=0)["reserve"]
+    inc_allA = call(s_up_start=0, s_up_step=0, s_dn_start=0, s_dn_step=0)["reserve"]
+    assert abs(inc_allM - inc_allA) < 1e-6, f"reserve income moved with the split: {inc_allM} vs {inc_allA}"
+    # 5) extremes: free split all-aFRR ⇒ mFRR-dn is reserve-only; all-mFRR ⇒ aFRR-dn is reserve-only
+    r0 = call(s_up_start=0, s_up_step=0, s_dn_start=0, s_dn_step=0)
+    r1 = call(s_up_start=1, s_up_step=0, s_dn_start=1, s_dn_step=0)
+    assert np.allclose(r0["Q_dn_mfrr"], r0["R_mfrr"]), "s_dn=0 ⇒ mFRR-dn should carry reserve only"
+    assert np.allclose(r1["Q_dn_afrr"], r1["R_afrr"]), "s_dn=1 ⇒ aFRR-dn should carry reserve only"
+    nres = int((r["R_dn"] > 0).sum())
+    print(f"\n        reserve+adaptive OK on {nres:,} awarded ISPs; income split-invariant ({inc_allM:,.0f} €)")
+
+
 R.add("baltic_wind_da is sum of LV+EE+LT", test_baltic_wind_aggregation)
 R.add("baltic_solar_da is sum of LV+EE+LT", test_baltic_solar_aggregation)
 R.add("baltic_imb_vol is sum of LV+EE+LT", test_baltic_imb_vol_aggregation)
@@ -2073,6 +2391,19 @@ R.add("Day-type mask: values {0,1,2}; mask==1 ⇔ Sat/Sun", test_day_type_mask_v
 R.add("Day filter 'all' is a no-op (frozen L3 default preserved)", test_day_filter_all_is_noop)
 R.add("Day filter partition: all == workday + weekend/holiday", test_day_filter_partition)
 R.add("Day filter preserves S3 continuity (full-series rolling stats)", test_day_filter_preserves_s3_continuity)
+R.add("Reserve income: 10 MW @ 10 EUR/MW·h → 25 € (price×MW×0.25)", test_reserve_income_hand_example)
+R.add("Reserve DA floor overrides withhold (mandatory DA sale)", test_reserve_da_floor_overrides_withhold)
+R.add("Reserve min-price gate: below threshold → no reserve", test_reserve_min_price_filter)
+if HAVE_RESERVE_JS:
+    R.add("Reserve OFF ≡ frozen L3 default (LOAD-BEARING)", test_reserve_off_equals_l3_default)
+    R.add("Reserve re-routes but total down offer == da_sold", test_reserve_total_down_offer_unchanged)
+    R.add("data-reserve.js aligns with data.js (timestamp spot-check)", test_reserve_data_js_alignment)
+R.add("Adaptive split block logic (synthetic step toward winner)", test_split_block_logic_synthetic)
+if os.path.exists(DATA_AFRR_15MIN_PATH):
+    R.add("Adaptive split step=0 ≡ static scalar (LOAD-BEARING)", test_split_adaptive_step0_equals_static)
+    R.add("Adaptive split with step>0 actually adapts (differs from static)", test_split_adaptive_actually_adapts)
+if HAVE_RESERVE_JS and os.path.exists(DATA_AFRR_15MIN_PATH):
+    R.add("Reserve obligation is a floor; adaptive split routes only free volume", test_reserve_respects_adaptive_split)
 R.add("Window-vectorised total == per-ISP sum", test_window_consistency)
 R.add("April ISPs: NaN p_imb → 0 imb cost in L2", test_april_in_l1_not_in_l2_imbalance)
 

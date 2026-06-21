@@ -134,6 +134,34 @@
         ["25 / 75", "aggressive trimming"],
       ],
     },
+    w_res_mfrr: {
+      group: "setup",
+      label: "Winsorize mFRR reserve price (percentiles)",
+      unit: "%",
+      isWinsor: true,
+      defaultLo: 5,
+      defaultHi: 95,
+      description:
+        "Caps extreme LV mFRR-down capacity prices at the chosen percentiles within the window. The raw series has 4000 EUR/MW·h spikes that would otherwise dominate reserve income. Only matters when the Reserve market is on.",
+      extremes: [
+        ["0 / 100", "no winsorization — raw spikes retained"],
+        ["25 / 75", "aggressive trimming"],
+      ],
+    },
+    w_res_afrr: {
+      group: "setup",
+      label: "Winsorize aFRR reserve price (percentiles)",
+      unit: "%",
+      isWinsor: true,
+      defaultLo: 5,
+      defaultHi: 95,
+      description:
+        "Same for the LV aFRR-down capacity price (median ≈ 1 EUR/MW·h but with large spikes). Only matters when the Reserve market is on.",
+      extremes: [
+        ["0 / 100", "no winsorization"],
+        ["25 / 75", "aggressive trimming"],
+      ],
+    },
     theta_flat: {
       group: "setup",
       label: "Flat penalty θ",
@@ -148,6 +176,55 @@
       extremes: [
         ["θ = 0", "no extra penalty — only the imbalance price applies"],
         ["θ = 100", "very risk-averse — discourages any over-promising"],
+      ],
+    },
+    // -------- Reserve market (down capacity) ----------------------------
+    r_coef: {
+      group: "reserve",
+      label: "DA offer coefficient",
+      unit: "0–1",
+      min: 0,
+      max: 1,
+      sliderStep: 0.01,
+      numStep: 0.05,
+      decimals: 2,
+      description:
+        "Fraction of the DA forecast offered as down reserve capacity. Awarded MW = floor(coefficient × forecast); those MW are sold to DA regardless of price and offered as mFRR/aFRR-down. Swept by the optimiser.",
+      extremes: [
+        ["0", "offer no reserve capacity"],
+        ["1", "offer the entire forecast as down reserve"],
+      ],
+    },
+    r_split: {
+      group: "reserve",
+      label: "mFRR ↔ aFRR reserve split",
+      unit: "0–1",
+      min: 0,
+      max: 1,
+      sliderStep: 0.01,
+      numStep: 0.05,
+      decimals: 2,
+      description:
+        "Fraction of the awarded down capacity routed to the mFRR reserve product vs aFRR. Each product earns its own capacity price and is offered into its own down-activation market. Swept by the optimiser.",
+      extremes: [
+        ["1", "all reserve capacity to mFRR-down"],
+        ["0", "all reserve capacity to aFRR-down"],
+      ],
+    },
+    r_min_price: {
+      group: "reserve",
+      label: "Min reserve price",
+      unit: "EUR/MW·h",
+      min: 0,
+      max: 200,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Reservation-price floor, applied per product (mFRR / aFRR independently). When a product's capacity price is below this we treat the ISP as not awarded for that product — no income, no DA-sale obligation. NOT swept by the optimiser; set it manually.",
+      extremes: [
+        ["0", "accept any non-negative reserve price"],
+        ["50", "only reserve when capacity is well paid"],
       ],
     },
     X: {
@@ -198,9 +275,11 @@
         ["Z = 1", "fully trust ID — offer the entire ID−DA revision as extra mFRR-up"],
       ],
     },
-    s_up: {
+    // Adaptive split — per direction: start (x), rebalance window (y), step
+    // (z). The split follows the better-paying market over time.
+    s_up_start: {
       group: "split",
-      label: "mFRR ↔ aFRR split — UPWARD (s_up)",
+      label: "UP split — start x₁",
       unit: "0–1",
       min: 0,
       max: 1,
@@ -208,16 +287,48 @@
       numStep: 0.05,
       decimals: 2,
       description:
-        "Fraction of UPWARD offered MW routed to mFRR vs aFRR. Whole-MW market constraint preserved: Q_up_mfrr = round(s_up · Q_up_offer), Q_up_afrr = remainder. mFRR-up clears only on upside spikes (P_mfrr ≥ 1); aFRR-up earns whenever the per-ISP averaged AST_POS > 0.",
+        "Starting fraction of UPWARD offered MW routed to mFRR (rest to aFRR). The split then adapts every y₁ ISPs toward whichever market paid more per MW recently. Whole-MW constraint preserved: Q_up_mfrr = round(split · Q_up_offer).",
       extremes: [
-        ["s_up = 1", "all upward volume to mFRR"],
-        ["s_up = 0", "all upward volume to aFRR"],
-        ["0 < s_up < 1", "split: e.g. s_up = 0.7 → ~70 % mFRR-up, 30 % aFRR-up"],
+        ["x₁ = 1", "start all upward to mFRR (legacy default)"],
+        ["x₁ = 0", "start all upward to aFRR"],
       ],
     },
-    s_dn: {
+    s_up_win: {
       group: "split",
-      label: "mFRR ↔ aFRR split — DOWNWARD (s_dn)",
+      label: "UP rebalance window y₁",
+      unit: "ISPs",
+      min: 4,
+      max: 672,
+      sliderStep: 4,
+      numStep: 4,
+      decimals: 0,
+      description:
+        "How often (in 15-min ISPs) the upward split is re-evaluated. At each boundary, the average per-MW mFRR-up rate (P_mfrr when it clears up, ≥1) and aFRR-up rate (avg AST_POS) over the previous y₁ ISPs are compared; the winner pulls the split. 96 = once per day.",
+      extremes: [
+        ["y₁ = 4", "rebalance hourly (very reactive)"],
+        ["y₁ = 96", "daily (default)"],
+        ["y₁ = 672", "weekly (slow)"],
+      ],
+    },
+    s_up_step: {
+      group: "split",
+      label: "UP step z₁",
+      unit: "0–0.5",
+      min: 0,
+      max: 0.5,
+      sliderStep: 0.01,
+      numStep: 0.02,
+      decimals: 2,
+      description:
+        "How far the upward split shifts toward the winning market at each rebalance. 0 = never move (static split fixed at x₁— reproduces the old behaviour); larger = chase the better-paying market faster (more whipsaw).",
+      extremes: [
+        ["z₁ = 0", "static — split stays at x₁"],
+        ["z₁ = 0.1", "shift 10 % toward the winner per rebalance"],
+      ],
+    },
+    s_dn_start: {
+      group: "split",
+      label: "DOWN split — start x₂",
       unit: "0–1",
       min: 0,
       max: 1,
@@ -225,10 +336,43 @@
       numStep: 0.05,
       decimals: 2,
       description:
-        "Fraction of DOWNWARD offered MW (curtailment of DA position) routed to mFRR vs aFRR. Independent from s_up because the per-direction price dynamics differ: mFRR-dn fires only when P_mfrr ≤ −1; aFRR-dn earns whenever the averaged AST_NEG < 0.",
+        "Starting fraction of DOWNWARD offered MW (curtailment of the DA position) routed to mFRR. Adapts every y₂ ISPs. Independent from up because the per-direction price dynamics differ (mFRR-dn fires when P_mfrr ≤ −1; aFRR-dn when avg AST_NEG < 0).",
       extremes: [
-        ["s_dn = 1", "all downward volume to mFRR"],
-        ["s_dn = 0", "all downward volume to aFRR"],
+        ["x₂ = 1", "start all downward to mFRR"],
+        ["x₂ = 0", "start all downward to aFRR"],
+      ],
+    },
+    s_dn_win: {
+      group: "split",
+      label: "DOWN rebalance window y₂",
+      unit: "ISPs",
+      min: 4,
+      max: 672,
+      sliderStep: 4,
+      numStep: 4,
+      decimals: 0,
+      description:
+        "How often the downward split is re-evaluated, comparing the avg per-MW mFRR-dn rate (−P_mfrr when it clears down) vs aFRR-dn rate (−avg AST_NEG) over the previous y₂ ISPs. 96 = daily.",
+      extremes: [
+        ["y₂ = 4", "hourly"],
+        ["y₂ = 96", "daily (default)"],
+        ["y₂ = 672", "weekly"],
+      ],
+    },
+    s_dn_step: {
+      group: "split",
+      label: "DOWN step z₂",
+      unit: "0–0.5",
+      min: 0,
+      max: 0.5,
+      sliderStep: 0.01,
+      numStep: 0.02,
+      decimals: 2,
+      description:
+        "How far the downward split shifts toward the winning market at each rebalance. 0 = static at x₂.",
+      extremes: [
+        ["z₂ = 0", "static — split stays at x₂"],
+        ["z₂ = 0.1", "shift 10 % toward the winner per rebalance"],
       ],
     },
     // -------- S3 (speculative intraday oversell) ---------------------
@@ -358,14 +502,27 @@
   const DEFAULTS = {
     actualSource: "real",
     idSource: "real",
-    enabled: { daWithhold: true, split: true, idTrust: true, s3: true },
+    // Reserve defaults OFF — keeps the default backtester identical to the
+    // pre-reserve baseline (frozen L3 = 15,185,134 €). Toggle on to add it.
+    enabled: { reserve: false, daWithhold: true, split: true, idTrust: true, s3: true },
     params: {
       X: 30,
       Y: 1.0,
       Z: 1.0,
       theta_flat: 30,
-      s_up: 1.0,
-      s_dn: 1.0,
+      r_coef: 0.5,
+      r_split: 1.0,
+      r_min_price: 0,
+      w_res_mfrr_lo: 5,
+      w_res_mfrr_hi: 95,
+      w_res_afrr_lo: 5,
+      w_res_afrr_hi: 95,
+      s_up_start: 1.0,
+      s_up_win: 96,
+      s_up_step: 0.0,
+      s_dn_start: 1.0,
+      s_dn_win: 96,
+      s_dn_step: 0.0,
       w_mfrr_lo: 5,
       w_mfrr_hi: 95,
       w_imb_lo: 5,
@@ -386,7 +543,7 @@
 
   // Display order of strategy cards (must match index.html data-strategy
   // attribute on each .controls-card). Setup is rendered above.
-  const STRATEGY_GROUPS = ["da-withhold", "split", "id-trust", "s3"];
+  const STRATEGY_GROUPS = ["reserve", "da-withhold", "split", "id-trust", "s3"];
 
   // Setup keys in display order. The two source selectors go first so
   // they're the most prominent decision.
@@ -399,6 +556,8 @@
     "w_imb",
     "w_afrr_pos",
     "w_afrr_neg",
+    "w_res_mfrr",
+    "w_res_afrr",
     "theta_flat",
   ];
 
@@ -412,6 +571,7 @@
     { key: "aFRR_dn", label: "aFRR-dn rev", type: "eur" },
     { key: "s3_intraday", label: "S3 ID sale rev", type: "eur" },
     { key: "s3_curtail", label: "S3 curtail rev", type: "eur" },
+    { key: "reserve", label: "Reserve capacity", type: "eur" },
     { key: "imb", label: "Imbalance cost", type: "eur-cost" },
     { key: "flat", label: "Flat penalty", type: "eur-cost" },
     { key: "s3_extra_cost", label: "S3 extra imb cost", type: "eur-cost" },
@@ -427,6 +587,7 @@
     { key: "shortAvg", label: "Avg cost / short ISP", type: "eur" },
     { key: "s3Oversold", label: "ISPs with S3 oversell", type: "int", help: "ISPs where the S3 strategy passed all gates and the wind park oversold on intraday." },
     { key: "s3HedgeFired", label: "S3 hedge fired", type: "int", help: "Of the S3-oversell ISPs, how many had p_mfrr ≤ VWAP1H + M so the hedge mFRR-dn bid cleared." },
+    { key: "reserveISPs", label: "ISPs with reserve", type: "int", help: "ISPs where down reserve capacity was awarded (a product's price ≥ min reserve price, reserve market on)." },
   ];
 
   // =====================================================================
@@ -670,6 +831,8 @@
       ["w_imb", bounds && bounds.imbBounds],
       ["w_afrr_pos", bounds && bounds.afrrPosBounds],
       ["w_afrr_neg", bounds && bounds.afrrNegBounds],
+      ["w_res_mfrr", bounds && bounds.reserveMfrrBounds],
+      ["w_res_afrr", bounds && bounds.reserveAfrrBounds],
     ];
     for (const [key, b] of map) {
       const loEl = document.getElementById(`${key}-cap-lo`);
@@ -751,6 +914,10 @@
       p.w_afrr_pos_hi,
       p.w_afrr_neg_lo,
       p.w_afrr_neg_hi,
+      p.w_res_mfrr_lo,
+      p.w_res_mfrr_hi,
+      p.w_res_afrr_lo,
+      p.w_res_afrr_hi,
     );
     updateWinsorCaps(bounds);
 
@@ -798,6 +965,7 @@
     );
     setCnt("s3Oversold", fmtInt(sim.counts.s3Oversold || 0));
     setCnt("s3HedgeFired", fmtInt(sim.counts.s3HedgeFired || 0));
+    setCnt("reserveISPs", fmtInt(sim.counts.reserveISPs || 0));
 
     // 5. Robustness — use filteredRevenue so concentration reflects only the
     // days the headline total is computed over (== perISP.revenue when the
@@ -842,6 +1010,7 @@
   // =====================================================================
   // Map data-strategy attribute → state.enabled key.
   const STRATEGY_TO_ENABLE_KEY = {
+    reserve: "reserve",
     "da-withhold": "daWithhold",
     split: "split",
     "id-trust": "idTrust",
@@ -1030,7 +1199,7 @@
       }
     }
     // Winsor pair inputs
-    for (const k of ["w_mfrr", "w_imb", "w_afrr_pos", "w_afrr_neg"]) {
+    for (const k of ["w_mfrr", "w_imb", "w_afrr_pos", "w_afrr_neg", "w_res_mfrr", "w_res_afrr"]) {
       const lo = document.getElementById(`${k}-lo`);
       const hi = document.getElementById(`${k}-hi`);
       if (lo) lo.value = DEFAULTS.params[`${k}_lo`];
@@ -1100,6 +1269,20 @@
 
   function buildOptimDims() {
     const dims = [];
+    if (state.enabled.reserve) {
+      // DA-offer coefficient + mFRR/aFRR reserve split. Min reserve price is
+      // deliberately NOT swept (user-set reservation floor).
+      dims.push({
+        key: "r_coef",
+        sample: (rng) => Math.round(rng() * 100) / 100,
+        refineValues: range01(0.02),
+      });
+      dims.push({
+        key: "r_split",
+        sample: (rng) => Math.round(rng() * 100) / 100,
+        refineValues: range01(0.02),
+      });
+    }
     if (state.enabled.daWithhold) {
       dims.push({
         key: "X",
@@ -1113,16 +1296,18 @@
       });
     }
     if (state.enabled.split) {
-      dims.push({
-        key: "s_up",
-        sample: (rng) => Math.round(rng() * 100) / 100,
-        refineValues: range01(0.02),
-      });
-      dims.push({
-        key: "s_dn",
-        sample: (rng) => Math.round(rng() * 100) / 100,
-        refineValues: range01(0.02),
-      });
+      // Adaptive split: start (0–1), window (4–672 ISPs), step (0–0.5), per dir.
+      const startSample = (rng) => Math.round(rng() * 100) / 100;
+      const winSample = (rng) => 4 + 4 * Math.floor(rng() * 168);
+      const winRefine = [4, 8, 12, 24, 48, 96, 168, 288, 480, 672];
+      const stepSample = (rng) => Math.round(rng() * 50) / 100;
+      const stepRefine = rangeArr(0, 0.5, 0.02);
+      dims.push({ key: "s_up_start", sample: startSample, refineValues: range01(0.02) });
+      dims.push({ key: "s_up_win", sample: winSample, refineValues: winRefine });
+      dims.push({ key: "s_up_step", sample: stepSample, refineValues: stepRefine });
+      dims.push({ key: "s_dn_start", sample: startSample, refineValues: range01(0.02) });
+      dims.push({ key: "s_dn_win", sample: winSample, refineValues: winRefine });
+      dims.push({ key: "s_dn_step", sample: stepSample, refineValues: stepRefine });
     }
     if (state.enabled.idTrust) {
       dims.push({
@@ -1242,6 +1427,10 @@
       p.w_afrr_pos_hi,
       p.w_afrr_neg_lo,
       p.w_afrr_neg_hi,
+      p.w_res_mfrr_lo,
+      p.w_res_mfrr_hi,
+      p.w_res_afrr_lo,
+      p.w_res_afrr_hi,
     );
 
     const N = RANDOM_N;
@@ -1336,14 +1525,23 @@
         imb: [p.w_imb_lo, p.w_imb_hi],
         afrrPos: [p.w_afrr_pos_lo, p.w_afrr_pos_hi],
         afrrNeg: [p.w_afrr_neg_lo, p.w_afrr_neg_hi],
+        resMfrr: [p.w_res_mfrr_lo, p.w_res_mfrr_hi],
+        resAfrr: [p.w_res_afrr_lo, p.w_res_afrr_hi],
       },
       // Effective values after the optimise. Swept dims hold the optimum;
-      // the fixed S3 knobs (cap/lag/skip) hold whatever the user set.
+      // the fixed knobs (S3 cap/lag/skip, reserve min price) hold the user's.
       params: {
+        r_coef: p.r_coef,
+        r_split: p.r_split,
+        r_min_price: p.r_min_price,
         X: p.X,
         Y: p.Y,
-        s_up: p.s_up,
-        s_dn: p.s_dn,
+        s_up_start: p.s_up_start,
+        s_up_win: p.s_up_win,
+        s_up_step: p.s_up_step,
+        s_dn_start: p.s_dn_start,
+        s_dn_win: p.s_dn_win,
+        s_dn_step: p.s_dn_step,
         Z: p.Z,
         s3_K: p.s3_K,
         s3_S_min: p.s3_S_min,
@@ -1362,7 +1560,8 @@
 
   const OPTIM_HEADER = [
     "#", "Time", "Range", "Days", "Strategies",
-    "X", "Y", "s_up", "s_dn", "Z",
+    "Res coef", "Res split", "Res min€",
+    "X", "Y", "Split↑ x/y/z", "Split↓ x/y/z", "Z",
     "S3 K", "S3 S_min", "S3 σ_max", "S3 M", "S3 cap/lag/skip",
     "θ", "Sources", "Winsor m/i/+/−", "Revenue", "Δ vs naïve",
   ];
@@ -1370,7 +1569,7 @@
   // Per-tab persistence (sessionStorage): survives navigating to Graphs /
   // Forecast and back, clears on tab close. Bump the version suffix if the
   // run-row shape changes so a stale cache can't render wrong.
-  const OPTIM_RUNS_KEY = "tck.optimRuns.v1";
+  const OPTIM_RUNS_KEY = "tck.optimRuns.v3";
   function saveOptimRuns() {
     try {
       sessionStorage.setItem(OPTIM_RUNS_KEY, JSON.stringify(state.optimRuns));
@@ -1405,7 +1604,7 @@
     }
     const num = (v, d = 0) => (v == null || isNaN(v) ? "—" : (+v).toFixed(d));
     const dash = '<span class="optim-off">—</span>';
-    const win = (pair) => `${pair[0]}–${pair[1]}`;
+    const win = (pair) => (pair ? `${pair[0]}–${pair[1]}` : "—");
     const chip = (on, lbl) =>
       `<span class="optim-chip ${on ? "on" : "off"}">${lbl}</span>`;
     const rows = runs
@@ -1413,7 +1612,7 @@
         const en = r.enabled;
         const p = r.params;
         const strategies =
-          chip(en.daWithhold, "DA") + chip(en.split, "SP") +
+          chip(en.reserve, "RS") + chip(en.daWithhold, "DA") + chip(en.split, "SP") +
           chip(en.idTrust, "ID") + chip(en.s3, "S3");
         const diff = r.revenue - (r.naive || 0);
         const diffPct = r.naive ? (diff / Math.abs(r.naive)) * 100 : 0;
@@ -1423,10 +1622,13 @@
           `${isoToEU(r.from)}<br>${isoToEU(r.to)}`,
           DAYTYPE_LABEL[r.dayType] || r.dayType,
           strategies,
+          en.reserve ? num(p.r_coef, 2) : dash,
+          en.reserve ? num(p.r_split, 2) : dash,
+          en.reserve ? num(p.r_min_price) : dash,
           en.daWithhold ? num(p.X) : dash,
           en.daWithhold ? num(p.Y, 2) : dash,
-          en.split ? num(p.s_up, 2) : dash,
-          en.split ? num(p.s_dn, 2) : dash,
+          en.split ? `${num(p.s_up_start, 2)}/${num(p.s_up_win)}/${num(p.s_up_step, 2)}` : dash,
+          en.split ? `${num(p.s_dn_start, 2)}/${num(p.s_dn_win)}/${num(p.s_dn_step, 2)}` : dash,
           en.idTrust ? num(p.Z, 2) : dash,
           en.s3 ? num(p.s3_K) : dash,
           en.s3 ? num(p.s3_S_min) : dash,
@@ -1435,7 +1637,8 @@
           en.s3 ? `${num(p.s3_X_cap)}/${num(p.s3_lag)}/${num(p.s3_da_skip)}` : dash,
           num(r.theta),
           `${r.actualSource}/${r.idSource}`,
-          `${win(r.winsor.mfrr)} · ${win(r.winsor.imb)} · ${win(r.winsor.afrrPos)} · ${win(r.winsor.afrrNeg)}`,
+          `${win(r.winsor.mfrr)} · ${win(r.winsor.imb)} · ${win(r.winsor.afrrPos)} · ${win(r.winsor.afrrNeg)}` +
+            (en.reserve ? ` · R ${win(r.winsor.resMfrr)}/${win(r.winsor.resAfrr)}` : ""),
           `<b>${fmtEUR(r.revenue)}</b>`,
           `<span class="${diff >= 0 ? "optim-up" : "optim-down"}">${diff >= 0 ? "+" : ""}${fmtEUR(diff)}<br>(${diff >= 0 ? "+" : ""}${diffPct.toFixed(1)}%)</span>`,
         ];
@@ -1468,6 +1671,10 @@
       p.w_afrr_pos_hi,
       p.w_afrr_neg_lo,
       p.w_afrr_neg_hi,
+      p.w_res_mfrr_lo,
+      p.w_res_mfrr_hi,
+      p.w_res_afrr_lo,
+      p.w_res_afrr_hi,
     );
     const N = RANDOM_N;
     const K = REFINE_STARTS;

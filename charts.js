@@ -186,9 +186,17 @@ const Charts = (() => {
     const vwap_arr = new Array(N);
     const rev = new Array(N);
     const short = new Array(N);
-    const sUpParam =
+    const reserveRevArr = new Array(N); // reserve capacity income per ISP (EUR)
+    const splitUp = new Array(N); // adaptive s_up shown per ISP (for tooltip)
+    const splitDn = new Array(N);
+    // The split is now per-ISP (adaptive). Prefer the engine's actual per-ISP
+    // s_up/s_dn so the bars match simulate() exactly; fall back to a legacy
+    // scalar param, else 1 (all-mFRR).
+    const sUpArr = simResult.perISP.s_up;
+    const sDnArr = simResult.perISP.s_dn;
+    const sUpFallback =
       params && params.s_up != null ? Math.max(0, Math.min(1, params.s_up)) : 1;
-    const sDnParam =
+    const sDnFallback =
       params && params.s_dn != null ? Math.max(0, Math.min(1, params.s_dn)) : 1;
     // Q_pot tracks the engine's actualSource selector: DA forecast / ID
     // forecast / real generation. Keeps the chart's "potential" line and
@@ -229,8 +237,12 @@ const Charts = (() => {
       // match exactly even when s_up != s_dn.
       const Q_up_offer = simResult.perISP.Q_up[k_p];
       const Q_dn_offer = simResult.perISP.Q_dn[k_p];
-      const Q_up_mfrr = Math.round(sUpParam * Q_up_offer);
-      const Q_dn_mfrr = Math.round(sDnParam * Q_dn_offer);
+      const sUp_k = sUpArr ? sUpArr[k_p] : sUpFallback;
+      const sDn_k = sDnArr ? sDnArr[k_p] : sDnFallback;
+      splitUp[k] = sUp_k;
+      splitDn[k] = sDn_k;
+      const Q_up_mfrr = Math.round(sUp_k * Q_up_offer);
+      const Q_dn_mfrr = Math.round(sDn_k * Q_dn_offer);
       const Q_up_afrr = Q_up_offer - Q_up_mfrr;
       const Q_dn_afrr = Q_dn_offer - Q_dn_mfrr;
       const isUp = D.p_mfrr[i] >= 1;
@@ -269,6 +281,9 @@ const Charts = (() => {
       vwap_arr[k] = D.vwap_1h ? D.vwap_1h[i] : NaN;
       rev[k] = simResult.perISP.revenue[k_p];
       short[k] = simResult.perISP.Q_short[k_p];
+      reserveRevArr[k] = simResult.perISP.reserveRev
+        ? simResult.perISP.reserveRev[k_p]
+        : 0;
     }
 
     // Gap-out filtered days across every drawn series (in-place null).
@@ -367,7 +382,7 @@ const Charts = (() => {
           );
         } else if (pmf >= 1) {
           mfrrLines.push(
-            `<span style="color:${TT_COL.dim}">— mFRR-up cleared @ ${ttPrice(pmf)} but no mFRR offer placed (s_up = ${sUpParam.toFixed(2)})</span>`,
+            `<span style="color:${TT_COL.dim}">— mFRR-up cleared @ ${ttPrice(pmf)} but no mFRR offer placed (s_up = ${splitUp[k].toFixed(2)})</span>`,
           );
         } else {
           mfrrLines.push(
@@ -537,6 +552,14 @@ const Charts = (() => {
           );
         }
         s += section("Imbalance", imbLines);
+      }
+
+      // --- Reserve capacity (income from won down-capacity) ---
+      // Shown in the tooltip only (no dedicated bar, per spec). Added to the
+      // P&L equation as a positive term.
+      if (reserveRevArr[k] > 0.005) {
+        terms.push(reserveRevArr[k]);
+        s += section("Reserve", [`Capacity income: ${ttRev(reserveRevArr[k])}`]);
       }
 
       // --- Total — full P&L equation breakdown ---
@@ -880,6 +903,17 @@ const Charts = (() => {
         marker: { color: "#fa7970" },
       },
     ];
+    // Reserve capacity income — distinct gold, only shown when present so the
+    // legend stays clean while the reserve market is off.
+    if (monthly.some((m) => Math.abs(m.reserve || 0) > 1e-9)) {
+      traces.push({
+        x: months,
+        y: monthly.map((m) => m.reserve || 0),
+        type: "bar",
+        name: "Reserve capacity",
+        marker: { color: "#e3b341" },
+      });
+    }
     if (level >= 2) {
       traces.push({
         x: months,

@@ -177,6 +177,24 @@ const Engine = (() => {
     if (!havePosFav) D.afrr_n_pos_fav = D.afrr_n_pos;
     if (!haveNegFav) D.afrr_n_neg_fav = D.afrr_n_neg;
 
+    // ----- Reserve (capacity) market down-prices (optional file) -----
+    // LV mFRR-down / aFRR-down HOURLY capacity prices (EUR/MW·h), broadcast
+    // to every 15-min ISP of the hour. NaN where the market had no price
+    // that ISP → the reserve strategy treats it as "no reserve available".
+    // raw + winsorized buffers mirror p_mfrr/p_imb. Falls back to all-NaN
+    // arrays if data-reserve.js is absent (reserve strategy then never fires).
+    if (typeof RESERVE_DATA !== "undefined" && RESERVE_DATA && RESERVE_DATA.n === D.n) {
+      D.reserve_mfrr_dn_raw = _toFloat32WithNaN(RESERVE_DATA.reserve_mfrr_dn);
+      D.reserve_afrr_dn_raw = _toFloat32WithNaN(RESERVE_DATA.reserve_afrr_dn);
+      D.hasReserve = true;
+    } else {
+      D.reserve_mfrr_dn_raw = new Float32Array(D.n).fill(NaN);
+      D.reserve_afrr_dn_raw = new Float32Array(D.n).fill(NaN);
+      D.hasReserve = false;
+    }
+    D.reserve_mfrr_dn = new Float32Array(D.n); // winsorized (filled by maybeWinsorize)
+    D.reserve_afrr_dn = new Float32Array(D.n);
+
     D.dayTypeMask = _computeDayTypeMask(rawData);
     winStart = 0;
     winEnd = D.n;
@@ -188,6 +206,12 @@ const Engine = (() => {
     cachedImbBounds = { lo: 0, hi: 0 };
     cachedAfrrPosBounds = { lo: 0, hi: 0 };
     cachedAfrrNegBounds = { lo: 0, hi: 0 };
+    cachedResMfrrKey = null;
+    cachedResAfrrKey = null;
+    cachedResMfrrBounds = { lo: 0, hi: 0 };
+    cachedResAfrrBounds = { lo: 0, hi: 0 };
+    _splitFxKey = null;
+    _splitFx = null;
     _s3RollingCache.clear();
     return D;
   }
@@ -305,6 +329,14 @@ const Engine = (() => {
   let cachedImbBounds = { lo: 0, hi: 0 };
   let cachedAfrrPosBounds = { lo: 0, hi: 0 };
   let cachedAfrrNegBounds = { lo: 0, hi: 0 };
+  // Reserve (capacity) down-price winsor cache.
+  let cachedResMfrrKey = null;
+  let cachedResAfrrKey = null;
+  let cachedResMfrrBounds = { lo: 0, hi: 0 };
+  let cachedResAfrrBounds = { lo: 0, hi: 0 };
+  // Adaptive-split effective-price prefix sums, cached by winsor state.
+  let _splitFxKey = null;
+  let _splitFx = null;
 
   // ---------- S3 rolling stats cache, keyed on (K, L) --------------------
   // Computed from raw p_mfrr across the FULL dataset. Independent of
@@ -410,6 +442,10 @@ const Engine = (() => {
     pPosHigh = 90,
     pNegLow = 10,
     pNegHigh = 90,
+    pResMLow = 5,
+    pResMHigh = 95,
+    pResALow = 5,
+    pResAHigh = 95,
   ) {
     const mfrrKey = `${pMfrrLow}-${pMfrrHigh}`;
     const imbKey = `${pImbLow}-${pImbHigh}`;
@@ -431,11 +467,25 @@ const Engine = (() => {
       cachedAfrrNegBounds = applyWinsor(D.avg_p_neg_raw, D.avg_p_neg, pNegLow, pNegHigh);
       cachedAfrrNegKey = negKey;
     }
+    // Reserve down-capacity prices (only meaningful when data-reserve.js
+    // loaded; otherwise the raw arrays are all-NaN and applyWinsor no-ops).
+    const resMKey = `${pResMLow}-${pResMHigh}`;
+    const resAKey = `${pResALow}-${pResAHigh}`;
+    if (resMKey !== cachedResMfrrKey) {
+      cachedResMfrrBounds = applyWinsor(D.reserve_mfrr_dn_raw, D.reserve_mfrr_dn, pResMLow, pResMHigh);
+      cachedResMfrrKey = resMKey;
+    }
+    if (resAKey !== cachedResAfrrKey) {
+      cachedResAfrrBounds = applyWinsor(D.reserve_afrr_dn_raw, D.reserve_afrr_dn, pResALow, pResAHigh);
+      cachedResAfrrKey = resAKey;
+    }
     return {
       mfrrBounds: cachedMfrrBounds,
       imbBounds: cachedImbBounds,
       afrrPosBounds: cachedAfrrPosBounds,
       afrrNegBounds: cachedAfrrNegBounds,
+      reserveMfrrBounds: cachedResMfrrBounds,
+      reserveAfrrBounds: cachedResAfrrBounds,
     };
   }
 
@@ -444,6 +494,74 @@ const Engine = (() => {
     cachedImbKey = null;
     cachedAfrrPosKey = null;
     cachedAfrrNegKey = null;
+  }
+
+  // ---------- adaptive mFRR↔aFRR split ----------------------------------
+  // Per-direction "follow the winner" split. The static split is the z=0
+  // special case (split stays at its start). Decision metric = average
+  // per-MW revenue RATE over the previous block:
+  //   up:  mFRR = p_mfrr when it clears up (≥1) else 0 ;  aFRR = avg_p_pos
+  //   dn:  mFRR = −p_mfrr when it clears dn (≤−1) else 0;  aFRR = −avg_p_neg
+  // Prefix sums of those four rate series (over the WINSORIZED prices) are
+  // cached by winsor state so the optimiser only pays O(blocks) per eval.
+  function _splitEffPrefix() {
+    const key = `${cachedMfrrKey}|${cachedAfrrPosKey}|${cachedAfrrNegKey}`;
+    if (key === _splitFxKey && _splitFx) return _splitFx;
+    const n = D.n;
+    const pUM = new Float64Array(n + 1);
+    const pUA = new Float64Array(n + 1);
+    const pDM = new Float64Array(n + 1);
+    const pDA = new Float64Array(n + 1);
+    const pm = D.p_mfrr, ap = D.avg_p_pos, an = D.avg_p_neg;
+    for (let i = 0; i < n; i++) {
+      const m = pm[i], a = ap[i], b = an[i];
+      pUM[i + 1] = pUM[i] + (m >= 1 ? m : 0);
+      pDM[i + 1] = pDM[i] + (m <= -1 ? -m : 0);
+      pUA[i + 1] = pUA[i] + (a > 0 ? a : 0);
+      pDA[i + 1] = pDA[i] + (b < 0 ? -b : 0);
+    }
+    _splitFx = { pUM, pUA, pDM, pDA };
+    _splitFxKey = key;
+    return _splitFx;
+  }
+
+  // Block-constant split sequence over [0, upto). Block 0 = start; each later
+  // block steps the split toward whichever market had the higher average rate
+  // in the PREVIOUS block (causal — no lookahead). Returns { blocks, w }.
+  function _splitBlocks(start, win, step, fxM, fxA, upto) {
+    const w = win < 1 ? 1 : win | 0;
+    const nB = Math.max(1, Math.floor((Math.max(1, upto) - 1) / w) + 1);
+    const blocks = new Float64Array(nB);
+    let s = start < 0 ? 0 : start > 1 ? 1 : start;
+    blocks[0] = s;
+    for (let k = 1; k < nB; k++) {
+      if (step > 0) {
+        const lo = (k - 1) * w, hi = Math.min(k * w, D.n);
+        const cnt = hi - lo;
+        if (cnt > 0) {
+          const am = (fxM[hi] - fxM[lo]) / cnt;
+          const aa = (fxA[hi] - fxA[lo]) / cnt;
+          if (am > aa) s += step;
+          else if (aa > am) s -= step;
+          if (s < 0) s = 0;
+          else if (s > 1) s = 1;
+        }
+      }
+      blocks[k] = s;
+    }
+    return { blocks, w };
+  }
+
+  // Build the up/down block-split sequences for the current window (or two
+  // constant-1 stubs when the split strategy is off).
+  function _resolveSplit(p) {
+    if (!p.splitAdaptive) {
+      return { up: [1], upW: Math.max(1, winEnd || 1), dn: [1], dnW: Math.max(1, winEnd || 1) };
+    }
+    const fx = _splitEffPrefix();
+    const u = _splitBlocks(p.s_up_start, p.s_up_win, p.s_up_step, fx.pUM, fx.pUA, winEnd);
+    const v = _splitBlocks(p.s_dn_start, p.s_dn_win, p.s_dn_step, fx.pDM, fx.pDA, winEnd);
+    return { up: u.blocks, upW: u.w, dn: v.blocks, dnW: v.w };
   }
 
   // ---------- helpers: resolve sources + enable flags --------------------
@@ -465,22 +583,40 @@ const Engine = (() => {
     const split = en.split !== false;
     const idTrust = en.idTrust !== false;
     const s3On = en.s3 !== false;
+    // Reserve defaults OFF (=== true) so callers that omit it — including
+    // every existing test and the frozen-value baselines — are unaffected.
+    const reserveOn = en.reserve === true;
+    const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
     const X = +params.X || 0;
     const Y_raw = +params.Y || 0;
     const Z_raw = +params.Z || 0;
     const theta_flat = +params.theta_flat || 0;
-    const sUpRaw = params.s_up == null ? 1 : +params.s_up;
-    const sDnRaw = params.s_dn == null ? 1 : +params.s_dn;
+    // Adaptive split: start x (falls back to a scalar s_up/s_dn if supplied,
+    // so legacy static calls still resolve to a constant split), rebalance
+    // window y (ISPs), step z. step = 0 ⇒ split never moves ⇒ static = start.
+    // When the split strategy is off, the split is a constant 1 (all mFRR).
+    const sUpStart = params.s_up_start != null ? +params.s_up_start : (params.s_up != null ? +params.s_up : 1);
+    const sDnStart = params.s_dn_start != null ? +params.s_dn_start : (params.s_dn != null ? +params.s_dn : 1);
+    const clampStep = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
     return {
       X,
       Y: daWithhold ? Y_raw : 0,
       Z: idTrust ? Z_raw : 0,
       theta_flat,
-      s_up: split ? (sUpRaw < 0 ? 0 : sUpRaw > 1 ? 1 : sUpRaw) : 1,
-      s_dn: split ? (sDnRaw < 0 ? 0 : sDnRaw > 1 ? 1 : sDnRaw) : 1,
+      splitAdaptive: split,
+      s_up_start: split ? clamp01(sUpStart) : 1,
+      s_dn_start: split ? clamp01(sDnStart) : 1,
+      s_up_win: Math.max(1, (params.s_up_win | 0) || 96),
+      s_dn_win: Math.max(1, (params.s_dn_win | 0) || 96),
+      s_up_step: split ? clampStep(+params.s_up_step || 0) : 0,
+      s_dn_step: split ? clampStep(+params.s_dn_step || 0) : 0,
       actualSource: params.actualSource || "real",
       idSource: params.idSource || "real",
       dayTypeFilter: params.dayTypeFilter || "all",
+      reserveEnabled: reserveOn,
+      r_coef: reserveOn ? clamp01(+params.r_coef || 0) : 0,
+      r_split: reserveOn ? clamp01(params.r_split == null ? 1 : +params.r_split) : 1,
+      r_min_price: +params.r_min_price || 0,
       s3Enabled: s3On,
       s3_K: (params.s3_K | 0) || 0,
       s3_X_cap: s3On ? (params.s3_X_cap | 0) || 0 : 0,
@@ -519,6 +655,10 @@ const Engine = (() => {
     const Q_s3_curtail = new Float32Array(wLen);
     const Q_short = new Float32Array(wLen);
     const revenue = new Float32Array(wLen);
+    const reserveRev = new Float32Array(wLen); // capacity income per ISP (EUR)
+    const splitUpArr = new Float32Array(wLen); // adaptive s_up per ISP
+    const splitDnArr = new Float32Array(wLen); // adaptive s_dn per ISP
+    const SP = _resolveSplit(p);
     let sumDA = 0,
       sumUpMfrr = 0,
       sumDnMfrr = 0,
@@ -528,7 +668,8 @@ const Engine = (() => {
       sumFlat = 0,
       sumS3Intraday = 0,
       sumS3Curtail = 0,
-      sumS3ExtraCost = 0;
+      sumS3ExtraCost = 0,
+      sumReserve = 0;
     let nUp = 0,
       nDn = 0,
       nWasted = 0,
@@ -536,7 +677,8 @@ const Engine = (() => {
       nUpAfrr = 0,
       nDnAfrr = 0,
       nS3Oversold = 0,
-      nS3HedgeFired = 0;
+      nS3HedgeFired = 0,
+      nReserve = 0;
     let totalShortMWh = 0;
     let nNegRevWarn = 0;
 
@@ -553,25 +695,57 @@ const Engine = (() => {
     for (let i = winStart; i < winEnd; i++) {
       const k = i - winStart;
       const accept = !filtering || _dayAccepts(dtf, mask[i]);
+      // Adaptive split for this ISP (constant 1 when the split strategy is off).
+      const sUp = p.splitAdaptive ? SP.up[(i / SP.upW) | 0] : 1;
+      const sDn = p.splitAdaptive ? SP.dn[(i / SP.dnW) | 0] : 1;
       const F = D.da_forecast[i];
       const ID = ID_src[i];
       const P_da = D.p_da[i];
       const P_mfrr = D.p_mfrr[i];
       const aboveX = P_da >= p.X;
-      const da_sold_raw = aboveX ? F : F * (1 - p.Y);
-      const da_sold = Math.floor(da_sold_raw + 1e-9);
-      const Q_w_raw = aboveX ? 0 : F - da_sold;
-      const Q_w = Math.floor(Q_w_raw + 1e-9);
+      // ----- Reserve market (down capacity) -----
+      // Awarded R MW down (whole-MW), split mFRR/aFRR; a product is kept only
+      // if its winsorized capacity price is finite and ≥ min reserve price.
+      // reserve_rate is EUR/h (price·MW); the trailing ×0.25 makes the 15-min
+      // capacity payment. When reserve is off, R_*=0 and this is inert.
+      let R_mfrr = 0,
+        R_afrr = 0,
+        reserve_rate = 0;
+      if (p.reserveEnabled) {
+        const R_total = Math.floor(p.r_coef * F + 1e-9);
+        const Rm0 = Math.round(p.r_split * R_total);
+        const pr_m = D.reserve_mfrr_dn[i];
+        const pr_a = D.reserve_afrr_dn[i];
+        if (isFinite(pr_m) && pr_m >= p.r_min_price) {
+          R_mfrr = Rm0;
+          reserve_rate += R_mfrr * pr_m;
+        }
+        if (isFinite(pr_a) && pr_a >= p.r_min_price) {
+          R_afrr = R_total - Rm0;
+          reserve_rate += R_afrr * pr_a;
+        }
+      }
+      const R_dn = R_mfrr + R_afrr;
+      // DA position: reserve down MW are MANDATORY DA sales (bypass withhold);
+      // the withhold rule governs only the rest. F_int − da_sold = withheld
+      // up-offer. Identical to the pre-reserve math when R_dn = 0.
+      const F_int = Math.floor(F + 1e-9);
+      const da_sold_wh = Math.floor((aboveX ? F : F * (1 - p.Y)) + 1e-9);
+      const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
+      const Q_w = F_int - da_sold;
       const trustedRevRaw = p.Z * (ID - F);
       if (trustedRevRaw < 0) nNegRevWarn++;
       const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
       const Q_up_offer = Q_w + trustedExtra;
-      const Q_dn_offer = da_sold;
-      // mFRR ↔ aFRR split (per-direction, round-and-remainder).
-      const Q_up_mfrr = Math.round(p.s_up * Q_up_offer);
+      // mFRR ↔ aFRR split (per-direction, round-and-remainder). The reserve
+      // MW carry their own split; the non-reserve DA position uses s_dn. Total
+      // down offer (R_dn + non-reserve) == da_sold, unchanged from pre-reserve.
+      const da_nonreserve = da_sold - R_dn;
+      const Q_up_mfrr = Math.round(sUp * Q_up_offer);
       const Q_up_afrr = Q_up_offer - Q_up_mfrr;
-      const Q_dn_mfrr = Math.round(p.s_dn * Q_dn_offer);
-      const Q_dn_afrr = Q_dn_offer - Q_dn_mfrr;
+      const rest_dn_mfrr = Math.round(sDn * da_nonreserve);
+      const Q_dn_mfrr = R_mfrr + rest_dn_mfrr;
+      const Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr);
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr = isUp ? Q_up_mfrr : 0;
@@ -645,19 +819,23 @@ const Engine = (() => {
           up_afrr_rev_rate +
           dn_afrr_rev_rate +
           s3_intraday +
-          s3_curtail -
+          s3_curtail +
+          reserve_rate -
           imb -
           flat -
           s3_extra_cost) *
         0.25;
       // Per-ISP arrays are always written (full continuous window).
       Q_da_sold[k] = da_sold;
+      reserveRev[k] = reserve_rate * 0.25;
       Q_up[k] = up_mfrr + Q_up_afrr;
       Q_dn[k] = dn_mfrr + Q_dn_afrr;
       Q_s3_intraday[k] = s3_X;
       Q_s3_curtail[k] = s3_fires ? s3_X : 0;
       Q_short[k] = short;
       revenue[k] = rev;
+      splitUpArr[k] = sUp;
+      splitDnArr[k] = sDn;
       dayType[k] = mask[i];
       // Totals / counts only accumulate matching-day ISPs.
       if (!accept) continue;
@@ -673,11 +851,13 @@ const Engine = (() => {
       sumS3Intraday += s3_intraday * 0.25;
       sumS3Curtail += s3_curtail * 0.25;
       sumS3ExtraCost += s3_extra_cost * 0.25;
+      sumReserve += reserve_rate * 0.25;
       if (up_mfrr > 1e-6) nUp++;
       else if (dn_mfrr > 1e-6) nDn++;
       else if (Q_w > 1e-6 && !upAfrrActive && !dnAfrrActive) nWasted++;
       if (upAfrrActive) nUpAfrr++;
       if (dnAfrrActive) nDnAfrr++;
+      if (R_dn > 0) nReserve++;
       if (s3_X > 0) {
         nS3Oversold++;
         if (s3_fires) nS3HedgeFired++;
@@ -694,7 +874,8 @@ const Engine = (() => {
       sumUpAfrr +
       sumDnAfrr +
       sumS3Intraday +
-      sumS3Curtail -
+      sumS3Curtail +
+      sumReserve -
       sumImb -
       sumFlat -
       sumS3ExtraCost;
@@ -711,6 +892,9 @@ const Engine = (() => {
         Q_s3_curtail,
         Q_short,
         revenue,
+        reserveRev,
+        s_up: splitUpArr,
+        s_dn: splitDnArr,
         dayType,
       },
       // Revenues of matching-day ISPs only (== perISP.revenue when filter is
@@ -726,6 +910,7 @@ const Engine = (() => {
         aFRR_dn: sumDnAfrr,
         s3_intraday: sumS3Intraday,
         s3_curtail: sumS3Curtail,
+        reserve: sumReserve,
         imb: sumImb,
         flat: sumFlat,
         s3_extra_cost: sumS3ExtraCost,
@@ -740,6 +925,7 @@ const Engine = (() => {
         negRev: nNegRevWarn,
         s3Oversold: nS3Oversold,
         s3HedgeFired: nS3HedgeFired,
+        reserveISPs: nReserve,
       },
       totalShortMWh,
     };
@@ -765,6 +951,9 @@ const Engine = (() => {
     const aNeg_arr = D.avg_p_neg;
     const nPos_arr = D.afrr_n_pos_fav;
     const nNeg_arr = D.afrr_n_neg_fav;
+    const resM_arr = D.reserve_mfrr_dn;
+    const resA_arr = D.reserve_afrr_dn;
+    const SP = _resolveSplit(p);
     // Day-type filter: skip non-matching ISPs (their P&L is independent of
     // every other ISP, so dropping them from the sum is exact). Rolling stats
     // are still full-data, so S3 continuity is preserved. See _dayAccepts.
@@ -774,20 +963,43 @@ const Engine = (() => {
     let total = 0;
     for (let i = winStart; i < winEnd; i++) {
       if (filtering && !_dayAccepts(dtf, mask[i])) continue;
+      const sUp = p.splitAdaptive ? SP.up[(i / SP.upW) | 0] : 1;
+      const sDn = p.splitAdaptive ? SP.dn[(i / SP.dnW) | 0] : 1;
       const F = F_arr[i];
       const P_da = P_da_arr[i];
       const P_mfrr = P_mfrr_arr[i];
       const aboveX = P_da >= p.X;
-      const da_sold = (aboveX ? F : F * (1 - p.Y)) | 0;
-      const Q_w = aboveX ? 0 : ((F - da_sold) | 0);
+      // Reserve down capacity (mirror simulate(); inert when reserve off).
+      let R_mfrr = 0,
+        R_afrr = 0,
+        reserve_rate = 0;
+      if (p.reserveEnabled) {
+        const R_total = (p.r_coef * F) | 0;
+        const Rm0 = Math.round(p.r_split * R_total);
+        const pr_m = resM_arr[i];
+        const pr_a = resA_arr[i];
+        if (isFinite(pr_m) && pr_m >= p.r_min_price) {
+          R_mfrr = Rm0;
+          reserve_rate += R_mfrr * pr_m;
+        }
+        if (isFinite(pr_a) && pr_a >= p.r_min_price) {
+          R_afrr = R_total - Rm0;
+          reserve_rate += R_afrr * pr_a;
+        }
+      }
+      const R_dn = R_mfrr + R_afrr;
+      const da_sold_wh = (aboveX ? F : F * (1 - p.Y)) | 0;
+      const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
+      const Q_w = (F | 0) - da_sold;
       const trustedRevRaw = p.Z * (ID_src[i] - F);
       const trustedExtra = trustedRevRaw > 0 ? (trustedRevRaw | 0) : 0;
       const Q_up_offer = Q_w + trustedExtra;
-      const Q_dn_offer = da_sold;
-      const Q_up_mfrr = Math.round(p.s_up * Q_up_offer);
+      const da_nonreserve = da_sold - R_dn;
+      const Q_up_mfrr = Math.round(sUp * Q_up_offer);
       const Q_up_afrr = Q_up_offer - Q_up_mfrr;
-      const Q_dn_mfrr = Math.round(p.s_dn * Q_dn_offer);
-      const Q_dn_afrr = Q_dn_offer - Q_dn_mfrr;
+      const rest_dn_mfrr = Math.round(sDn * da_nonreserve);
+      const Q_dn_mfrr = R_mfrr + rest_dn_mfrr;
+      const Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr);
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr = isUp ? Q_up_mfrr : 0;
@@ -796,7 +1008,7 @@ const Engine = (() => {
       const avg_neg = aNeg_arr[i];
       const upAfrrActive = avg_pos > 0 && Q_up_afrr > 0;
       const dnAfrrActive = avg_neg < 0 && Q_dn_afrr > 0;
-      let rev = da_sold * P_da + up_mfrr * P_mfrr - dn_mfrr * P_mfrr;
+      let rev = da_sold * P_da + up_mfrr * P_mfrr - dn_mfrr * P_mfrr + reserve_rate;
       if (upAfrrActive) rev += Q_up_afrr * avg_pos;
       if (dnAfrrActive) rev -= Q_dn_afrr * avg_neg;
       const up_afrr_disp = upAfrrActive ? Q_up_afrr * (nPos_arr[i] / 225) : 0;
@@ -835,17 +1047,24 @@ const Engine = (() => {
     return total * 0.25;
   }
 
-  // Naïve baseline: same sources / θ / splits the user picked, but
-  // X = Y = Z = 0 (always sell everything to DA, no withhold, no ID trust)
-  // and S3 disabled. Re-uses the user's enables so a strategy switched off
-  // stays off in the baseline too.
+  // Naïve baseline: the true do-nothing reference. Same sources / θ, but
+  // every strategy neutralised so the headline "vs naïve" shows the lift from
+  // ALL enabled strategies, each comparable against the same floor:
+  //   · X = Y = Z = 0   → no DA-withhold, no ID-trust (sell everything to DA)
+  //   · s3 / reserve off
+  //   · split off       → all balancing volume to mFRR (the default market)
+  // Disabling the split here is what lets turning the adaptive split ON read
+  // as a gain — otherwise the baseline would run the same adaptive split and
+  // absorb its down-side value. (At the default split — start 1 / step 0,
+  // already all-mFRR — the baseline is unchanged, so this doesn't move the
+  // default vs-naïve number.)
   function naiveRevenue(params) {
     const naiveP = {
       ...params,
       X: 0,
       Y: 0,
       Z: 0,
-      enabled: { ...(params.enabled || {}), s3: false },
+      enabled: { ...(params.enabled || {}), s3: false, reserve: false, split: false },
     };
     return simulateTotal(naiveP);
   }
@@ -875,9 +1094,12 @@ const Engine = (() => {
     const dtf = p.dayTypeFilter;
     const filtering = dtf !== "all";
     const mask = D.dayTypeMask;
+    const SP = _resolveSplit(p);
     const buckets = new Map();
     for (let i = winStart; i < winEnd; i++) {
       if (filtering && !_dayAccepts(dtf, mask[i])) continue;
+      const sUp = p.splitAdaptive ? SP.up[(i / SP.upW) | 0] : 1;
+      const sDn = p.splitAdaptive ? SP.dn[(i / SP.dnW) | 0] : 1;
       const ts = new Date(start.getTime() + D.offsets[i] * D.step_min * 60000);
       const key = `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`;
       const F = D.da_forecast[i];
@@ -885,16 +1107,39 @@ const Engine = (() => {
       const P_da = D.p_da[i];
       const P_mfrr = D.p_mfrr[i];
       const aboveX = P_da >= p.X;
-      const da_sold = Math.floor((aboveX ? F : F * (1 - p.Y)) + 1e-9);
-      const Q_w = Math.floor((aboveX ? 0 : F - da_sold) + 1e-9);
+      // Reserve down capacity (mirror simulate(); inert when reserve off).
+      let R_mfrr = 0,
+        R_afrr = 0,
+        reserve_rate = 0;
+      if (p.reserveEnabled) {
+        const R_total = Math.floor(p.r_coef * F + 1e-9);
+        const Rm0 = Math.round(p.r_split * R_total);
+        const pr_m = D.reserve_mfrr_dn[i];
+        const pr_a = D.reserve_afrr_dn[i];
+        if (isFinite(pr_m) && pr_m >= p.r_min_price) {
+          R_mfrr = Rm0;
+          reserve_rate += R_mfrr * pr_m;
+        }
+        if (isFinite(pr_a) && pr_a >= p.r_min_price) {
+          R_afrr = R_total - Rm0;
+          reserve_rate += R_afrr * pr_a;
+        }
+      }
+      const R_dn = R_mfrr + R_afrr;
+      const F_int = Math.floor(F + 1e-9);
+      const da_sold_wh = Math.floor((aboveX ? F : F * (1 - p.Y)) + 1e-9);
+      const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
+      const Q_w = F_int - da_sold;
       const trustedRevRaw = p.Z * (ID - F);
       const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
       const up_offer = Q_w + trustedExtra;
-      const dn_offer = da_sold;
-      const Q_up_mfrr = Math.round(p.s_up * up_offer);
+      const da_nonreserve = da_sold - R_dn;
+      const Q_up_mfrr = Math.round(sUp * up_offer);
       const Q_up_afrr = up_offer - Q_up_mfrr;
-      const Q_dn_mfrr = Math.round(p.s_dn * dn_offer);
-      const Q_dn_afrr = dn_offer - Q_dn_mfrr;
+      const rest_dn_mfrr = Math.round(sDn * da_nonreserve);
+      const Q_dn_mfrr = R_mfrr + rest_dn_mfrr;
+      const Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr);
+      const Reserve_rev = reserve_rate * 0.25;
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr_q = isUp ? Q_up_mfrr : 0;
@@ -960,6 +1205,7 @@ const Engine = (() => {
           s3_intraday: 0,
           s3_curtail: 0,
           s3_extra_cost: 0,
+          reserve: 0,
           imb: 0,
           flat: 0,
         };
@@ -971,6 +1217,7 @@ const Engine = (() => {
       b.s3_intraday += S3Intraday_rev;
       b.s3_curtail += S3Curtail_rev;
       b.s3_extra_cost += S3ExtraCost;
+      b.reserve += Reserve_rev;
       b.imb += imb;
       b.flat += flat;
       buckets.set(key, b);
@@ -990,6 +1237,7 @@ const Engine = (() => {
         dn_afrr: b.dn_afrr,
         s3_intraday: b.s3_intraday,
         s3_curtail: b.s3_curtail,
+        reserve: b.reserve,
         s3_extra_cost: b.s3_extra_cost,
         imb: b.imb,
         flat: b.flat,
@@ -1000,7 +1248,8 @@ const Engine = (() => {
           b.up_afrr +
           b.dn_afrr +
           b.s3_intraday +
-          b.s3_curtail -
+          b.s3_curtail +
+          b.reserve -
           b.imb -
           b.flat -
           b.s3_extra_cost,

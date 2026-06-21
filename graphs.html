@@ -28,6 +28,7 @@
       <button class="tab active" data-section="mfrr">mFRR</button>
       <button class="tab" data-section="afrr">aFRR</button>
       <button class="tab" data-section="compare">mFRR vs aFRR</button>
+      <button class="tab" data-section="reserves">mFRR vs aFRR reserves</button>
     </nav>
 
     <main>
@@ -489,6 +490,98 @@
         </div>
 
       </section>
+
+      <!-- =================================================================
+           mFRR vs aFRR RESERVES SECTION
+           Daily-aggregated reserve (capacity) prices. Two questions:
+           (1) do high reserve prices flag days of extreme Baltic imbalance?
+           (2) do the mFRR and aFRR reserve prices move together, or is it a
+               substitution / cat-and-mouse game between the two products?
+           Each market's "daily reserve price" = mean over the day's ISPs of
+           the up/down average (winsorized). One value per market per day.
+           ================================================================= -->
+      <section id="panel-reserves" class="panel">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Reserve prices are hourly EUR/MW·h capacity prices for Latvia.
+                Each market's daily value is the mean (over the window's ISPs
+                of the chosen day type) of its up/down-average price, after
+                winsorisation — so mFRR and aFRR each have one value per day.
+              </p>
+            </div>
+            <div class="controls-grid" id="g-res-setup-params"></div>
+          </div>
+          <div class="actions">
+            <button id="g-res-recompute" class="btn primary">↻ Recompute</button>
+            <span id="g-res-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Summary statistics</h2></div>
+          <p class="card-desc">
+            Headline numbers across the daily series: how the two reserve
+            markets co-move (price levels and day-over-day changes), how
+            persistent the aFRR−mFRR spread is, and how each market's price
+            correlates with the day's Baltic imbalance magnitude.
+          </p>
+          <div id="g-res-stats" class="cmp-stats-grid"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Daily reserve price — mFRR vs aFRR</h2></div>
+          <p class="card-desc">
+            One point per day: the average reserve capacity price for each
+            market. Watch whether the two lines track each other or drift into
+            separate regimes (one market systematically cheaper for a stretch).
+          </p>
+          <div id="g-res-ts" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>aFRR vs mFRR daily price — co-movement</h2></div>
+          <p class="card-desc">
+            Each point is a day, plotted at (mFRR price, aFRR price) and
+            coloured by date. A tight diagonal cloud ⇒ the two move in unison;
+            a shapeless or anti-diagonal cloud ⇒ they're independent or
+            substitutes. The Pearson r is in the title.
+          </p>
+          <div id="g-res-scatter" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Reserve-price spread (aFRR − mFRR) over time</h2></div>
+          <p class="card-desc">
+            Positive ⇒ aFRR capacity is the pricier product that day; negative
+            ⇒ mFRR is pricier. Long runs on one side of zero indicate
+            persistent regimes (a slow tug-of-war); rapid sign-flips would
+            indicate a fast day-to-day cat-and-mouse. Lag-1 autocorrelation of
+            this series is reported in the summary above.
+          </p>
+          <div id="g-res-spread" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Baltic imbalance magnitude by reserve-price quartile</h2>
+          </div>
+          <p class="card-desc">
+            Days are split into quartiles by each market's daily reserve price
+            (Q1 = cheapest, Q4 = priciest); the box plots show the distribution
+            of that day's mean |Baltic imbalance| (MW). If pricier reserve days
+            sit higher, a high reserve price flags elevated extreme-surplus /
+            deficit risk. The two panels let you see whether the signal lives
+            in the mFRR price, the aFRR price, or both.
+          </p>
+          <div class="two-col">
+            <div id="g-res-imb-mfrr" class="chart"></div>
+            <div id="g-res-imb-afrr" class="chart"></div>
+          </div>
+        </div>
+      </section>
     </main>
 
     <footer class="site-footer">
@@ -520,13 +613,18 @@
       them up front so the Backtester and Graphs share one engine init path.
     -->
     <script src="data-afrr-15min.js?v=29"></script>
-    <script src="engine.js?v=39"></script>
+    <!--
+      data-reserve.js: LV mFRR / aFRR up+down hourly reserve (capacity) prices,
+      from preprocess-reserve.py. Drives the "mFRR vs aFRR reserves" subtab.
+    -->
+    <script src="data-reserve.js?v=43"></script>
+    <script src="engine.js?v=45"></script>
     <script src="graphs-engine.js?v=29"></script>
     <script src="graphs-charts.js?v=29"></script>
     <script src="afrr-engine.js?v=29"></script>
     <script src="afrr-charts.js?v=29"></script>
     <script src="afrr-spread-engine.js?v=29"></script>
     <script src="mfrr-vs-afrr-engine.js?v=29"></script>
-    <script src="graphs-app.js?v=29"></script>
+    <script src="graphs-app.js?v=44"></script>
   </body>
 </html>

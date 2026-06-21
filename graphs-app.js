@@ -1956,6 +1956,8 @@
         if (!afrrState.pricesLoaded) loadAfrrPriceData();
       } else if (section === "compare") {
         scheduleCmpUpdate();
+      } else if (section === "reserves") {
+        scheduleResUpdate();
       } else {
         scheduleUpdate();
       }
@@ -1984,6 +1986,310 @@
     });
   }
 
+  // =====================================================================
+  //  mFRR vs aFRR RESERVES SECTION
+  //  Daily-aggregated reserve (capacity) prices. Reads RESERVE_DATA (LV
+  //  mFRR/aFRR up+down hourly prices) + WIND_DATA.baltic_imb_vol. Each
+  //  market's daily price = mean over the day's matching ISPs of the
+  //  winsorized up/down average → one mFRR + one aFRR value per day.
+  // =====================================================================
+  const resState = {
+    // Default to Jan–May 2026: the matured-aFRR-market, fully reserve-covered
+    // window (excludes the Feb–Apr 2025 aFRR startup whose ≈0 prices created a
+    // misleading "cheap aFRR ⇒ extreme imbalance" artefact). Winsor defaults to
+    // 0/100 (off) — with that window the extreme early spikes are already gone,
+    // so raw prices are shown by default; tune the pairs to clip if needed.
+    sim: { from: "2026-01-01", to: "2026-05-01" },
+    dayType: "all",
+    winsorMfrrLo: 0,
+    winsorMfrrHi: 100,
+    winsorAfrrLo: 0,
+    winsorAfrrHi: 100,
+  };
+
+  function resSetupHTML() {
+    return `
+      <div class="control sim-range">
+        <label>Simulation date range<span class="unit">DD/MM/YYYY</span></label>
+        <div class="slider-row two">
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-res-sim-from" value="${isoToEU(resState.sim.from)}">
+          <span>→</span>
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-res-sim-to" value="${isoToEU(resState.sim.to)}">
+          <button type="button" class="btn small" id="g-res-sim-reset" title="Reset to full range">↻</button>
+        </div>
+        <div class="param-desc"><p>Restricts the daily series to days in this window. Reserve prices cover the full dataset (Oct–Dec 2025 backfilled from the official export).</p></div>
+      </div>
+      <div class="control">
+        <label>Day type filter</label>
+        <div class="day-type-toggle g-res-day-type-toggle">
+          <button type="button" class="btn small preset${resState.dayType === "all" ? " active" : ""}" data-day-type="all">All days</button>
+          <button type="button" class="btn small preset${resState.dayType === "weekend-holiday" ? " active" : ""}" data-day-type="weekend-holiday">Weekends + holidays</button>
+          <button type="button" class="btn small preset${resState.dayType === "workday" ? " active" : ""}" data-day-type="workday">Workdays only</button>
+        </div>
+        <div class="param-desc"><p>Each calendar day is a single day type, so this includes / excludes whole days from the daily series.</p></div>
+      </div>
+      <div class="control winsor">
+        <label>Winsorize mFRR reserve price (percentiles)</label>
+        <div class="slider-row two winsor-row">
+          <span class="winsor-input"><input type="number" id="g-res-winsor-mfrr-lo" value="${resState.winsorMfrrLo}" min="0" max="50" step="1"><span class="winsor-cap" id="g-res-winsor-mfrr-cap-lo">(…)</span></span>
+          <span>/</span>
+          <span class="winsor-input"><input type="number" id="g-res-winsor-mfrr-hi" value="${resState.winsorMfrrHi}" min="50" max="100" step="1"><span class="winsor-cap" id="g-res-winsor-mfrr-cap-hi">(…)</span></span>
+        </div>
+        <div class="param-desc"><p>Clip the per-ISP mFRR reserve price (up/down average) at these percentiles within the window before daily averaging — the raw series has 4000 €/MW·h spikes.</p></div>
+      </div>
+      <div class="control winsor">
+        <label>Winsorize aFRR reserve price (percentiles)</label>
+        <div class="slider-row two winsor-row">
+          <span class="winsor-input"><input type="number" id="g-res-winsor-afrr-lo" value="${resState.winsorAfrrLo}" min="0" max="50" step="1"><span class="winsor-cap" id="g-res-winsor-afrr-cap-lo">(…)</span></span>
+          <span>/</span>
+          <span class="winsor-input"><input type="number" id="g-res-winsor-afrr-hi" value="${resState.winsorAfrrHi}" min="50" max="100" step="1"><span class="winsor-cap" id="g-res-winsor-afrr-cap-hi">(…)</span></span>
+        </div>
+        <div class="param-desc"><p>Same for the aFRR reserve price. aFRR capacity has a very fat upper tail, so winsorisation matters even more here.</p></div>
+      </div>
+    `;
+  }
+  function renderResCards() {
+    document.getElementById("g-res-setup-params").innerHTML = resSetupHTML();
+  }
+
+  let resUpdateTimer = null;
+  function scheduleResUpdate() {
+    clearTimeout(resUpdateTimer);
+    resUpdateTimer = setTimeout(updateRes, 60);
+  }
+
+  // Pearson correlation, skipping non-finite pairs.
+  function _pearson(a, b) {
+    let n = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i], y = b[i];
+      if (!isFinite(x) || !isFinite(y)) continue;
+      n++; sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y;
+    }
+    if (n < 3) return NaN;
+    const cov = sab - (sa * sb) / n, va = saa - (sa * sa) / n, vb = sbb - (sb * sb) / n;
+    return va <= 0 || vb <= 0 ? NaN : cov / Math.sqrt(va * vb);
+  }
+
+  // Collapse the per-ISP reserve prices to one mFRR + one aFRR value per day,
+  // plus that day's mean |Baltic imbalance|. Winsor + day-type filter applied.
+  function computeReservesDaily() {
+    if (typeof RESERVE_DATA === "undefined" || !RESERVE_DATA) return null;
+    const W = WIND_DATA, R = RESERVE_DATA;
+    const { start, end } = rangeToIdx(resState.sim.from, resState.sim.to);
+    const mask = D.dayTypeMask;
+    const dtf = resState.dayType;
+    const accept = (i) => dtf === "all" || (dtf === "workday" ? mask[i] === 0 : mask[i] !== 0);
+    const mu = R.reserve_mfrr_up, md = R.reserve_mfrr_dn, au = R.reserve_afrr_up, ad = R.reserve_afrr_dn;
+    const comb = (u, d, i) => {
+      let x = u[i], y = d[i];
+      x = x == null ? NaN : x; y = y == null ? NaN : y;
+      if (isNaN(x) && isNaN(y)) return NaN;
+      if (isNaN(x)) return y;
+      if (isNaN(y)) return x;
+      return (x + y) / 2;
+    };
+    const mFn = (i) => comb(mu, md, i), aFn = (i) => comb(au, ad, i);
+    const idxs = [];
+    for (let i = start; i < end; i++) if (accept(i)) idxs.push(i);
+    const bounds = (fn, lo, hi) => {
+      const buf = [];
+      for (const i of idxs) { const v = fn(i); if (!isNaN(v)) buf.push(v); }
+      if (!buf.length) return [0, 0];
+      buf.sort((p, q) => p - q);
+      const at = (P) => buf[Math.min(buf.length - 1, Math.max(0, Math.round((P / 100) * (buf.length - 1))))];
+      return [at(lo), at(hi)];
+    };
+    const [mLo, mHi] = bounds(mFn, resState.winsorMfrrLo, resState.winsorMfrrHi);
+    const [aLo, aHi] = bounds(aFn, resState.winsorAfrrLo, resState.winsorAfrrHi);
+    const clip = (v, lo, hi) => (isNaN(v) ? NaN : v < lo ? lo : v > hi ? hi : v);
+    const balt = W.baltic_imb_vol;
+    const startMs = new Date(W.start_iso).getTime(), stepMs = W.step_min * 60000;
+    const acc = new Map();
+    for (const i of idxs) {
+      const ts = new Date(startMs + W.offsets[i] * stepMs);
+      const k = Date.UTC(ts.getUTCFullYear(), ts.getUTCMonth(), ts.getUTCDate());
+      let o = acc.get(k);
+      if (!o) { o = { k, mS: 0, mN: 0, aS: 0, aN: 0, iS: 0, iN: 0 }; acc.set(k, o); }
+      const mv = clip(mFn(i), mLo, mHi); if (!isNaN(mv)) { o.mS += mv; o.mN++; }
+      const av = clip(aFn(i), aLo, aHi); if (!isNaN(av)) { o.aS += av; o.aN++; }
+      const iv = balt ? balt[i] : NaN; if (iv != null && isFinite(iv)) { o.iS += Math.abs(iv); o.iN++; }
+    }
+    const days = [...acc.values()].filter((o) => o.mN > 0 && o.aN > 0 && o.iN > 0).sort((x, y) => x.k - y.k);
+    return {
+      date: days.map((o) => new Date(o.k)),
+      mfrr: days.map((o) => o.mS / o.mN),
+      afrr: days.map((o) => o.aS / o.aN),
+      imb: days.map((o) => o.iS / o.iN),
+      winsor: { mLo, mHi, aLo, aHi },
+    };
+  }
+
+  function drawResTimeSeries(d) {
+    const traces = [
+      { x: d.date, y: d.mfrr, type: "scatter", mode: "lines", name: "mFRR reserve", line: { color: "#58a6ff", width: 1.5 } },
+      { x: d.date, y: d.afrr, type: "scatter", mode: "lines", name: "aFRR reserve", line: { color: "#f0883e", width: 1.5 } },
+    ];
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: { text: "Daily reserve price — mFRR vs aFRR<br><span style='font-size:11px;color:#9aa5b1'>EUR/MW·h · up/down average, daily mean</span>", font: { size: 14, color: "#e6edf3" } },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "date" },
+      yaxis: { ...CMP_LAYOUT.yaxis, title: "EUR/MW·h" },
+      showlegend: true,
+      legend: { orientation: "h", x: 0, y: 1.12, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+    });
+    Plotly.react("g-res-ts", traces, layout, CMP_CFG);
+  }
+
+  function drawResScatter(d) {
+    const r = _pearson(d.mfrr, d.afrr);
+    const traces = [{
+      type: "scattergl", mode: "markers", x: d.mfrr, y: d.afrr,
+      marker: { color: d.date.map((_, i) => i), colorscale: "Viridis", size: 6, opacity: 0.75, showscale: true, colorbar: { title: { text: "day #", side: "right" }, thickness: 10 } },
+      text: d.date.map((dt) => dt.toISOString().slice(0, 10)),
+      hovertemplate: "%{text}<br>mFRR: %{x:.1f}<br>aFRR: %{y:.1f} €/MW·h<extra></extra>", name: "",
+    }];
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: { text: `aFRR vs mFRR daily reserve price<br><span style='font-size:11px;color:#9aa5b1'>Pearson r = ${isFinite(r) ? r.toFixed(3) : "—"} · ${d.mfrr.length} days · colour = time</span>`, font: { size: 14, color: "#e6edf3" } },
+      xaxis: { ...CMP_LAYOUT.xaxis, title: "mFRR reserve price (EUR/MW·h)" },
+      yaxis: { ...CMP_LAYOUT.yaxis, title: "aFRR reserve price (EUR/MW·h)" },
+      showlegend: false,
+    });
+    Plotly.react("g-res-scatter", traces, layout, CMP_CFG);
+  }
+
+  function drawResSpread(d) {
+    const spread = d.mfrr.map((m, i) => d.afrr[i] - m);
+    const ac = _pearson(spread.slice(0, -1), spread.slice(1));
+    const traces = [{
+      x: d.date, y: spread, type: "scatter", mode: "lines", fill: "tozeroy",
+      line: { color: "#bc8cff", width: 1.2 }, fillcolor: "rgba(188,140,255,0.15)",
+      hovertemplate: "%{x|%Y-%m-%d}<br>aFRR − mFRR: %{y:.1f} €/MW·h<extra></extra>", name: "",
+    }];
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: { text: `Reserve-price spread (aFRR − mFRR)<br><span style='font-size:11px;color:#9aa5b1'>+ ⇒ aFRR pricier · lag-1 autocorrelation = ${isFinite(ac) ? ac.toFixed(3) : "—"}</span>`, font: { size: 14, color: "#e6edf3" } },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "date" },
+      yaxis: { ...CMP_LAYOUT.yaxis, title: "aFRR − mFRR (EUR/MW·h)", zeroline: true, zerolinecolor: "#5a6470" },
+      showlegend: false,
+    });
+    Plotly.react("g-res-spread", traces, layout, CMP_CFG);
+  }
+
+  function drawResImbBox(targetId, price, imb, label) {
+    const idx = price.map((_, i) => i).filter((i) => isFinite(price[i]) && isFinite(imb[i]));
+    idx.sort((a, b) => price[a] - price[b]);
+    const qlabels = ["Q1 (cheapest)", "Q2", "Q3", "Q4 (priciest)"];
+    const colors = ["#2d6cdf", "#3fb950", "#d29922", "#f85149"];
+    const traces = [];
+    for (let q = 0; q < 4; q++) {
+      const lo = Math.floor((q * idx.length) / 4), hi = Math.floor(((q + 1) * idx.length) / 4);
+      const ys = [];
+      for (let k = lo; k < hi; k++) ys.push(imb[idx[k]]);
+      traces.push({ type: "box", y: ys, name: qlabels[q], marker: { color: colors[q] }, boxmean: true, hovertemplate: `${qlabels[q]}<br>mean |imb|: %{y:.0f} MW<extra></extra>` });
+    }
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: { text: `Imbalance vs ${label} reserve price<br><span style='font-size:11px;color:#9aa5b1'>daily mean |Baltic imbalance| by ${label} price quartile</span>`, font: { size: 13, color: "#e6edf3" } },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "category" },
+      yaxis: { ...CMP_LAYOUT.yaxis, title: "mean |Baltic imbalance| (MW)" },
+      showlegend: false,
+    });
+    Plotly.react(targetId, traces, layout, CMP_CFG);
+  }
+
+  function renderResStats(d) {
+    const spread = d.mfrr.map((m, i) => d.afrr[i] - m);
+    const dM = [], dA = [];
+    for (let i = 1; i < d.mfrr.length; i++) { dM.push(d.mfrr[i] - d.mfrr[i - 1]); dA.push(d.afrr[i] - d.afrr[i - 1]); }
+    const mean = (a) => a.reduce((s, x) => s + x, 0) / a.length;
+    const std = (a) => { const m = mean(a); return Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / a.length); };
+    const rLevel = _pearson(d.mfrr, d.afrr), rChange = _pearson(dM, dA);
+    const ac = _pearson(spread.slice(0, -1), spread.slice(1));
+    const rMimb = _pearson(d.mfrr, d.imb), rAimb = _pearson(d.afrr, d.imb);
+    const fmt = (v, dp = 2) => (isFinite(v) ? v.toFixed(dp) : "—");
+    const card = (label, val, help, color) =>
+      `<div class="cmp-stat"><div class="cmp-stat-label">${label}</div><div class="cmp-stat-val"${color ? ` style="color:${color}"` : ""}>${val}</div><div class="cmp-stat-help">${help}</div></div>`;
+    const sign = (v, good) => (!isFinite(v) ? "" : (v > 0) === good ? "#3fb950" : "#f85149");
+    document.getElementById("g-res-stats").innerHTML =
+      card("Days analysed", d.mfrr.length, "valid daily values in window") +
+      card("mFRR price", fmt(mean(d.mfrr), 1) + " €", "mean daily (EUR/MW·h)", "#58a6ff") +
+      card("aFRR price", fmt(mean(d.afrr), 1) + " €", "mean daily (EUR/MW·h)", "#f0883e") +
+      card("r(mFRR, aFRR) — levels", fmt(rLevel, 3), rLevel < 0 ? "move inversely (substitutes)" : "move together") +
+      card("r(Δ mFRR, Δ aFRR)", fmt(rChange, 3), "day-over-day price changes") +
+      card("Spread aFRR − mFRR", fmt(mean(spread), 1) + " €", "mean ± " + fmt(std(spread), 1)) +
+      card("Spread persistence", fmt(ac, 3), "lag-1 autocorr (→1 = sticky regimes)") +
+      card("r(mFRR price, |imb|)", fmt(rMimb, 3), "high mFRR price ⇒ extreme imbalance?", sign(rMimb, true)) +
+      card("r(aFRR price, |imb|)", fmt(rAimb, 3), "high aFRR price ⇒ extreme imbalance?", sign(rAimb, true));
+  }
+
+  function updateResWinsorCaps(w) {
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = `(≈ ${isFinite(v) ? v.toFixed(1) : "—"})`; };
+    set("g-res-winsor-mfrr-cap-lo", w.mLo); set("g-res-winsor-mfrr-cap-hi", w.mHi);
+    set("g-res-winsor-afrr-cap-lo", w.aLo); set("g-res-winsor-afrr-cap-hi", w.aHi);
+  }
+
+  function updateRes() {
+    const progEl = document.getElementById("g-res-progress");
+    if (typeof RESERVE_DATA === "undefined") { progEl.textContent = "data-reserve.js not loaded"; return; }
+    progEl.textContent = "computing…";
+    setTimeout(() => {
+      const t0 = performance.now();
+      const d = computeReservesDaily();
+      if (!d || d.mfrr.length < 3) { progEl.textContent = "not enough reserve data in this window"; return; }
+      renderResStats(d);
+      drawResTimeSeries(d);
+      drawResScatter(d);
+      drawResSpread(d);
+      drawResImbBox("g-res-imb-mfrr", d.mfrr, d.imb, "mFRR");
+      drawResImbBox("g-res-imb-afrr", d.afrr, d.imb, "aFRR");
+      updateResWinsorCaps(d.winsor);
+      progEl.textContent = `done in ${Math.round(performance.now() - t0)} ms · ${d.mfrr.length} days`;
+    }, 30);
+  }
+
+  function bindResControls() {
+    const fromEl = document.getElementById("g-res-sim-from");
+    const toEl = document.getElementById("g-res-sim-to");
+    const onSim = () => {
+      let f = clampDate(parseEU(fromEl.value) || dataMinDate, dataMinDate, dataMaxDate);
+      let t = clampDate(parseEU(toEl.value) || dataMaxDate, dataMinDate, dataMaxDate);
+      if (f > t) [f, t] = [t, f];
+      fromEl.value = isoToEU(f); toEl.value = isoToEU(t);
+      resState.sim = { from: f, to: t };
+      scheduleResUpdate();
+    };
+    fromEl.addEventListener("change", onSim);
+    toEl.addEventListener("change", onSim);
+    document.getElementById("g-res-sim-reset").addEventListener("click", () => {
+      fromEl.value = isoToEU(dataMinDate); toEl.value = isoToEU(dataMaxDate); onSim();
+    });
+    document.querySelectorAll(".g-res-day-type-toggle .preset[data-day-type]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const t = btn.dataset.dayType;
+        if (resState.dayType === t) return;
+        resState.dayType = t;
+        document.querySelectorAll(".g-res-day-type-toggle .preset[data-day-type]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        scheduleResUpdate();
+      });
+    });
+    const bindWinsor = (loId, hiId, loKey, hiKey) => {
+      const lo = document.getElementById(loId), hi = document.getElementById(hiId);
+      const on = () => {
+        resState[loKey] = Math.max(0, Math.min(50, parseFloat(lo.value) || 0));
+        resState[hiKey] = Math.max(50, Math.min(100, parseFloat(hi.value) || 100));
+        lo.value = resState[loKey]; hi.value = resState[hiKey];
+        scheduleResUpdate();
+      };
+      lo.addEventListener("change", on); hi.addEventListener("change", on);
+    };
+    bindWinsor("g-res-winsor-mfrr-lo", "g-res-winsor-mfrr-hi", "winsorMfrrLo", "winsorMfrrHi");
+    bindWinsor("g-res-winsor-afrr-lo", "g-res-winsor-afrr-hi", "winsorAfrrLo", "winsorAfrrHi");
+    document.getElementById("g-res-recompute").addEventListener("click", updateRes);
+  }
+
   // ---------- init -------------------------------------------------------
   renderCards();
   bindControls();
@@ -1991,8 +2297,11 @@
   bindAfrrControls();
   renderCmpCards();
   bindCmpControls();
+  renderResCards();
+  bindResControls();
   updateAll();
-  // Pre-compute aFRR + compare so switching tabs is instant
+  // Pre-compute aFRR + compare + reserves so switching tabs is instant
   setTimeout(updateAfrr, 200);
   setTimeout(updateCmp, 400);
+  setTimeout(updateRes, 600);
 })();
