@@ -60,10 +60,42 @@
            ================================================================= -->
       <section id="strategy-panel" class="panel active">
         <!-- =================================================================
+             RESERVE MARKET — UP capacity. Sits before everything: each awarded
+             MW is withheld from DA (held as ramp-up headroom), so it shrinks the
+             forecast available for DA + down capacity to F − R_up. Pays for
+             availability AND is an obligatory mFRR/aFRR-up offer regardless of
+             wind. Default OFF.
+             ================================================================= -->
+        <div class="controls-card" data-strategy="reserve-up">
+          <div class="param-group market">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-reserve-up" />
+                <span class="strategy-toggle-box"></span>
+              </label>
+              <h3>Reserve market — up capacity <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Capacity market for <em>upward</em> reserve, settled before
+                day-ahead. Unlike down capacity it is <em>not free</em>: each
+                awarded MW is held back from DA as ramp-up headroom, so DA and
+                down capacity can only use the remaining forecast
+                (F&nbsp;−&nbsp;awarded). We are paid for availability
+                (price&nbsp;×&nbsp;MW&nbsp;×&nbsp;0.25&nbsp;h) and the awarded MW
+                become an <em>obligatory</em> mFRR/aFRR-up offer regardless of
+                wind — if up-activated they enter the position, so a low-wind ISP
+                can fall short and pay imbalance. Only offered once the forecast
+                reaches "Min MW". Off ⇒ no up capacity is offered.
+              </p>
+            </div>
+            <div class="controls-grid" id="reserve-up-params"></div>
+          </div>
+        </div>
+
+        <!-- =================================================================
              RESERVE MARKET — sits before day-ahead. Winning down-capacity
              pays for availability AND makes the awarded MW mandatory DA sales
              (bypassing the withhold rule) plus an obligatory mFRR/aFRR-down
-             offer. Only down capacity is modelled. Default OFF.
+             offer. Sized within the MW left after up capacity. Default OFF.
              ================================================================= -->
         <div class="controls-card" data-strategy="reserve">
           <div class="param-group market">
@@ -361,8 +393,8 @@
       gracefully optional — engine.js falls back to all-NaN (reserve never fires).
     -->
     <script src="data-reserve.js?v=43"></script>
-    <script src="engine.js?v=45"></script>
-    <script src="charts.js?v=44"></script>
-    <script src="app.js?v=44"></script>
+    <script src="engine.js?v=46"></script>
+    <script src="charts.js?v=45"></script>
+    <script src="app.js?v=45"></script>
   </body>
 </html>

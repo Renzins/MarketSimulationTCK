@@ -527,6 +527,8 @@ def simulate_total_l3(
     day_mask=None, day_filter="all",
     reserve_enabled=False, r_coef=0.0, r_split=1.0, r_min_price=0.0,
     reserve_mfrr_dn=None, reserve_afrr_dn=None,
+    reserve_up_enabled=False, ru_coef=0.0, ru_split=1.0, ru_min_price=0.0,
+    ru_min_mw=0.0, reserve_mfrr_up=None, reserve_afrr_up=None,
 ):
     """L3 vectorised total. Adds S3 on top of L2 math (same shape as engine
     simulateTotal level=3). Rolling stats are from p_mfrr_raw (NOT p_imb_raw)
@@ -545,7 +547,31 @@ def simulate_total_l3(
     else:
         s_up_c = max(0.0, min(1.0, float(s_up)))
         s_dn_c = max(0.0, min(1.0, float(s_dn)))
-    # ----- Reserve market down capacity (mirror engine.js; inert when off) -----
+    # ----- Reserve market UP capacity (carved FIRST; mirror engine.js) -----
+    # Withheld from DA, so it shrinks the forecast available for DA + down to
+    # F_avail = F - R_up. Gated by a forecast floor (ru_min_mw) and price.
+    if reserve_up_enabled and reserve_mfrr_up is not None:
+        prum = np.asarray(reserve_mfrr_up, dtype=np.float64)
+        prua = (
+            np.asarray(reserve_afrr_up, dtype=np.float64)
+            if reserve_afrr_up is not None
+            else np.full_like(F, np.nan)
+        )
+        gate_mw = F >= ru_min_mw
+        Ru_total = np.floor(float(ru_coef) * F + 1e-9)
+        Rum0 = _rnd(float(ru_split) * Ru_total)
+        take_um = gate_mw & np.isfinite(prum) & (prum >= ru_min_price)
+        take_ua = gate_mw & np.isfinite(prua) & (prua >= ru_min_price)
+        R_up_mfrr = np.where(take_um, Rum0, 0.0)
+        R_up_afrr = np.where(take_ua, Ru_total - Rum0, 0.0)
+        reserve_up_rate = R_up_mfrr * np.where(take_um, prum, 0.0) + R_up_afrr * np.where(take_ua, prua, 0.0)
+    else:
+        R_up_mfrr = np.zeros_like(F)
+        R_up_afrr = np.zeros_like(F)
+        reserve_up_rate = np.zeros_like(F)
+    R_up = R_up_mfrr + R_up_afrr
+    F_avail = F - R_up
+    # ----- Reserve market down capacity (sized within F_avail; mirror engine) -----
     if reserve_enabled and reserve_mfrr_dn is not None:
         prm = np.asarray(reserve_mfrr_dn, dtype=np.float64)
         pra = (
@@ -553,7 +579,7 @@ def simulate_total_l3(
             if reserve_afrr_dn is not None
             else np.full_like(F, np.nan)
         )
-        R_total = np.floor(float(r_coef) * F + 1e-9)
+        R_total = np.floor(float(r_coef) * F_avail + 1e-9)
         Rm0 = _rnd(float(r_split) * R_total)
         take_m = np.isfinite(prm) & (prm >= r_min_price)
         take_a = np.isfinite(pra) & (pra >= r_min_price)
@@ -566,15 +592,16 @@ def simulate_total_l3(
         reserve_rate = np.zeros_like(F)
     R_dn = R_mfrr + R_afrr
     F_int = np.floor(F + 1e-9)
-    da_sold_wh = np.floor(np.where(above_X, F, F * (1 - Y)) + 1e-9).astype(np.float64)
+    da_sold_wh = np.floor(np.where(above_X, F_avail, F_avail * (1 - Y)) + 1e-9).astype(np.float64)
     da_sold = np.maximum(da_sold_wh, R_dn)
-    Q_w = F_int - da_sold
+    Q_w = F_int - R_up - da_sold
     trusted_raw = Z * (ID - F)
     trusted_extra = np.where(trusted_raw > 0, np.floor(trusted_raw + 1e-9), 0)
-    Q_up_offer = Q_w + trusted_extra
+    up_free = Q_w + trusted_extra
     da_nonreserve = da_sold - R_dn
-    Q_up_mfrr = _rnd(s_up_c * Q_up_offer)
-    Q_up_afrr = Q_up_offer - Q_up_mfrr
+    rest_up_mfrr = _rnd(s_up_c * up_free)
+    Q_up_mfrr = R_up_mfrr + rest_up_mfrr
+    Q_up_afrr = R_up_afrr + (up_free - rest_up_mfrr)
     rest_dn_mfrr = _rnd(s_dn_c * da_nonreserve)
     Q_dn_mfrr = R_mfrr + rest_dn_mfrr
     Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr)
@@ -593,6 +620,7 @@ def simulate_total_l3(
         + up_mfrr_active * P_mfrr_w
         - dn_mfrr_active * P_mfrr_w
         + reserve_rate
+        + reserve_up_rate
         + np.where(up_afrr_active, Q_up_afrr * avg_p_pos_w, 0)
         - np.where(dn_afrr_active, Q_dn_afrr * avg_p_neg_w, 0)
     )
@@ -655,13 +683,21 @@ def simulate_total_l3(
         "s3_extra_cost": s3_extra_cost,
         # Reserve diagnostics (for the reserve-market tests).
         "reserve": float((reserve_rate).sum() * 0.25),
+        "reserve_up": float((reserve_up_rate).sum() * 0.25),
         "da_sold": da_sold,
+        "F_avail": F_avail,
         "R_dn": R_dn,
         "R_mfrr": R_mfrr,
         "R_afrr": R_afrr,
+        "R_up": R_up,
+        "R_up_mfrr": R_up_mfrr,
+        "R_up_afrr": R_up_afrr,
         "Q_dn_mfrr": Q_dn_mfrr,
         "Q_dn_afrr": Q_dn_afrr,
         "Q_dn_total": Q_dn_mfrr + Q_dn_afrr,
+        "Q_up_mfrr": Q_up_mfrr,
+        "Q_up_afrr": Q_up_afrr,
+        "Q_up_total": Q_up_mfrr + Q_up_afrr,
         "s_up_arr": s_up_c,
         "s_dn_arr": s_dn_c,
     }
@@ -2162,6 +2198,15 @@ def _reserve_inputs():
     return F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, winsorize(rm, 5, 95), winsorize(ra, 5, 95)
 
 
+def _reserve_up_arrays():
+    """Winsorized (5/95) reserve UP-price arrays from data-reserve.js (share the
+    down percentile knob; each clipped against its own distribution)."""
+    rd = _load_reserve_js()
+    rm = np.array([np.nan if v is None else v for v in rd["reserve_mfrr_up"]], dtype=np.float64)
+    ra = np.array([np.nan if v is None else v for v in rd["reserve_afrr_up"]], dtype=np.float64)
+    return winsorize(rm, 5, 95), winsorize(ra, 5, 95)
+
+
 def test_reserve_income_hand_example():
     """User's worked example: 10 MW down @ 10 EUR/MW·h → 25 € for the 15-min
     ISP (price × MW × 0.25). Isolated: no activation, no shortfall."""
@@ -2260,6 +2305,141 @@ def test_reserve_data_js_alignment():
         assert got is not None and abs(got - float(want)) < 0.01, (
             f"ISP {i} @ {ts}: reserve {got} != CSV {want}"
         )
+
+
+# ============================================================================
+#  RESERVE MARKET — UP capacity (Backtester). Upward reserve is NOT free: each
+#  awarded MW is withheld from DA (held as ramp-up headroom), shrinking the MW
+#  available for DA + down capacity to F_avail = F - R_up. Gated by a forecast
+#  floor (ru_min_mw) and a per-product price. MANDATORY: the awarded MW are an
+#  obligatory mFRR/aFRR-up offer regardless of wind, so when up-activated they
+#  enter the position and a low-wind ISP can fall short. UP OFF must reproduce
+#  L3 exactly. Settlement = price[EUR/MW·h] × awarded_MW × 0.25h.
+# ============================================================================
+def test_reserve_up_income_hand_example():
+    """User's worked example: F=20, offer 10 MW up @ 8 EUR/MW·h → 20 € for the
+    ISP. The 10 MW are withheld from DA, so only F-10 = 10 MW reach DA."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    r = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0),
+        X=0, Y=0, Z=0, theta=0, s3_X_cap=0,
+        reserve_up_enabled=True, ru_coef=0.5, ru_split=1.0, ru_min_price=0.0, ru_min_mw=0,
+        reserve_mfrr_up=one(8.0), reserve_afrr_up=one(np.nan),
+    )
+    print(f"\n        up-reserve income (10 MW @ 8) = {r['reserve_up']:.2f} € (expect 20)")
+    assert abs(r["reserve_up"] - 20.0) < 1e-9, f"up income {r['reserve_up']} != 20"
+    assert r["R_up"][0] == 10 and r["F_avail"][0] == 10.0
+    assert r["da_sold"][0] == 10, f"DA headroom: da_sold {r['da_sold'][0]} != 10 (= F - R_up)"
+    # total = DA(10*50*0.25=125) + up capacity(20) = 145
+    assert abs(r["total"] - 145.0) < 1e-9, f"total {r['total']} != 145"
+
+
+def test_reserve_up_reduces_da_headroom():
+    """Each up-reserve MW cannot be sold to DA: da_sold drops by exactly R_up
+    relative to up-off (above X, so DA would otherwise take the full forecast)."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    common = dict(X=0, Y=0, Z=0, theta=0, s3_X_cap=0)
+    off = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0), **common,
+    )
+    on = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0),
+        reserve_up_enabled=True, ru_coef=0.5, ru_split=1.0, ru_min_price=0.0, ru_min_mw=0,
+        reserve_mfrr_up=one(8.0), reserve_afrr_up=one(np.nan), **common,
+    )
+    assert off["da_sold"][0] == 20, f"up-off da_sold {off['da_sold'][0]} != 20"
+    assert on["da_sold"][0] == off["da_sold"][0] - on["R_up"][0], "da_sold must drop by exactly R_up"
+
+
+def test_reserve_up_min_mw_gate():
+    """Up capacity is only offered once the forecast reaches ru_min_mw."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    common = dict(X=0, Y=0, Z=0, theta=0, s3_X_cap=0, reserve_up_enabled=True,
+                  ru_coef=0.5, ru_split=1.0, ru_min_price=0.0,
+                  reserve_mfrr_up=one(8.0), reserve_afrr_up=one(np.nan))
+    below = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0),
+        ru_min_mw=30, **common,
+    )
+    above = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0),
+        ru_min_mw=10, **common,
+    )
+    assert below["R_up"][0] == 0 and below["reserve_up"] == 0.0, "F<min_mw → no up reserve"
+    assert below["da_sold"][0] == 20, "gated-off up reserve must not touch DA headroom"
+    assert above["R_up"][0] == 10 and above["reserve_up"] > 0, "F>=min_mw → up reserve offered"
+
+
+def test_reserve_up_min_price_filter():
+    """Up price below the per-product floor → no award (no income, no DA headroom
+    given up)."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    r = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(0.0), one(100.0), one(0.0), one(np.nan), one(0.0),
+        X=0, Y=0, Z=0, theta=0, s3_X_cap=0,
+        reserve_up_enabled=True, ru_coef=0.5, ru_split=1.0, ru_min_price=10.0, ru_min_mw=0,
+        reserve_mfrr_up=one(5.0), reserve_afrr_up=one(np.nan),
+    )
+    assert r["reserve_up"] == 0.0 and r["R_up"][0] == 0 and r["da_sold"][0] == 20
+
+
+def test_reserve_up_mandatory_regardless_of_wind():
+    """The awarded up MW are obligatory: when up-activated they enter the
+    position even if there's no wind to back them. Here the whole upward offer
+    IS the mandatory reserve (no free withhold: up_free = F-R_up-da_sold = 0),
+    so the shortfall equals exactly the reserve MW that lack wind."""
+    one = lambda v: np.array([v], dtype=np.float64)
+    # F=20, above X so da_sold = F_avail = 10; Q_pot = 10 covers DA only.
+    # P_mfrr=10 ⇒ mFRR-up activates the 10 reserve MW ⇒ position 20, wind 10.
+    r = simulate_total_l3(
+        one(20.0), one(20.0), one(50.0), one(10.0), one(10.0), one(50.0), one(np.nan), one(10.0),
+        X=0, Y=0, Z=0, theta=0, s3_X_cap=0,
+        reserve_up_enabled=True, ru_coef=0.5, ru_split=1.0, ru_min_price=0.0, ru_min_mw=0,
+        reserve_mfrr_up=one(8.0), reserve_afrr_up=one(np.nan),
+    )
+    assert r["R_up"][0] == 10 and r["Q_up_total"][0] == 10, "entire up offer is the mandatory reserve"
+    assert abs(r["short"][0] - 10.0) < 1e-9, f"mandatory-reserve shortfall {r['short'][0]} != 10"
+    assert abs(r["reserve_up"] - 20.0) < 1e-9, "capacity income still earned (10 MW @ 8)"
+
+
+def test_reserve_up_off_equals_l3_default():
+    """LOAD-BEARING: up reserve disabled reproduces the frozen L3 default even
+    with up-price arrays attached."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    rmu, rau = _reserve_up_arrays()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30,
+        s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
+        reserve_up_enabled=False, reserve_mfrr_up=rmu, reserve_afrr_up=rau,
+    )
+    assert abs(r["total"] - FROZEN_L3_DEFAULT_EUR) < 200, (
+        f"up-off L3 = {r['total']:,.0f} but FROZEN is {FROZEN_L3_DEFAULT_EUR:,}"
+    )
+
+
+def test_reserve_up_and_down_interaction():
+    """Both reserves ON: up is carved first (da_sold + R_up <= F_int), down is
+    sized within F_avail (R_dn <= F_avail), and the total down offer is still
+    == da_sold. Checked elementwise across the whole dataset."""
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, rm, ra = _reserve_inputs()
+    rmu, rau = _reserve_up_arrays()
+    r = simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw,
+        X=30, Y=1, Z=1, theta=30, s3_X_cap=5,
+        reserve_enabled=True, r_coef=0.5, r_split=0.6, r_min_price=5.0,
+        reserve_mfrr_dn=rm, reserve_afrr_dn=ra,
+        reserve_up_enabled=True, ru_coef=0.4, ru_split=0.7, ru_min_price=1.0, ru_min_mw=5,
+        reserve_mfrr_up=rmu, reserve_afrr_up=rau,
+    )
+    F_int = np.floor(F + 1e-9)
+    assert np.all(r["da_sold"] + r["R_up"] <= F_int + 1e-9), "up reserve must be withheld from DA"
+    assert np.all(r["R_dn"] <= np.floor(r["F_avail"] + 1e-9) + 1e-9), "down reserve must fit within F_avail"
+    assert np.allclose(r["Q_dn_total"], r["da_sold"]), "total down offer must still equal da_sold"
+    assert np.all(r["da_sold"] >= r["R_dn"] - 1e-9), "da_sold must be >= down reserve floor"
+    assert np.all(r["Q_up_total"] >= r["R_up"] - 1e-9), "up offer must be >= up reserve floor"
+    print(f"\n        up+down reserve total = {r['total']:,.0f} €  "
+          f"(up cap {r['reserve_up']:,.0f} €, dn cap {r['reserve']:,.0f} €)")
 
 
 # ============================================================================

@@ -48,7 +48,7 @@ The tool is split into three pages, navigable from a top navbar:
 │
 ├── engine.js                   Backtester simulation engine (window, winsor incl.
 │                               reserve prices, day-type-filter accumulation gate,
-│                               reserve-market down capacity, adaptive split blocks,
+│                               reserve-market up + down capacity, adaptive split blocks,
 │                               S3 rolling cache, simulate / simulateTotal / monthly)
 ├── charts.js                   Backtester Plotly renderers (timeseries, monthly,
 │                               histogram). Tooltip shows DA + mFRR/aFRR up/dn +
@@ -86,7 +86,7 @@ The tool is split into three pages, navigable from a top navbar:
 │                               favourable-only filter, n_*_fav counts)
 ├── preprocess-reserve.py       Build data-reserve.js (LV mFRR/aFRR up+down reserve
 │                               prices), aligned to data.js ISP indices by timestamp
-├── tests.py                    79-test audit suite (data integrity, engine invariants,
+├── tests.py                    86-test audit suite (data integrity, engine invariants,
 │                               day-type filter, reserve market, adaptive split,
 │                               reserve↔split interaction, aFRR, frozen regressions)
 ├── scratch/patch_reserves.py   One-off backfill of the Oct–Dec 2025 reserve-price gap
@@ -326,13 +326,61 @@ aFRR contributes a time-fraction `n_*_fav / 225` — the count of 4-s
 slots where the price was favourable for that direction — same factor
 that makes the revenue formula correct.
 
+### Reserve market — up capacity (carved before everything)
+
+A toggleable **Reserve market — up capacity** card sits *above* the
+down-capacity card (default **OFF**) and models winning *upward*
+balancing-capacity. Data: hourly LV `reserves_mfrr_upward_lv` /
+`reserves_afrr_upward_lv` prices (EUR/MW·h), in `data-reserve.js`. Same
+three parameters as down — `ru_coef`, `ru_split`, `ru_min_price` — **plus
+one more**:
+
+- **Min forecast MW** `ru_min_mw` — only offer up capacity in ISPs where
+  the DA forecast ≥ this many MW (so the park doesn't commit upward reserve
+  when there's little forecast wind to ramp into). **Swept** by the optimiser.
+
+The crucial difference from down: **up capacity is not free money.** Each
+awarded MW is *withheld from DA* — it is the head-room the park would ramp
+into if the TSO activates upward — so it shrinks the forecast available for
+DA + down capacity. Per ISP (award `R_up = R_up_mfrr + R_up_afrr`,
+whole-MW, each product kept only if `F ≥ ru_min_mw` and its winsorized
+price is finite and ≥ min):
+
+```
+R_up                 = floor(ru_coef × F)              # gated by ru_min_mw + price
+F_avail              = F − R_up                         # ← DA and DOWN capacity can only use this
+capacity income      = (R_up_mfrr·p_res_mfrr_up + R_up_afrr·p_res_afrr_up) × 0.25
+da_sold              = max(withhold(F_avail), R_dn)     # ≤ F_avail
+Q_w (free up offer)  = floor(F) − R_up − da_sold        # ≥ 0
+up offer (mFRR/aFRR) : reserve MW use ru_split (a MANDATORY floor); the free Q_w uses s_up
+                       ⇒ total up offer == R_up + free
+```
+
+Down capacity is then sized **within `F_avail`** (`floor(r_coef × F_avail)`),
+so `R_up + da_sold ≤ floor(F)` always holds — the worked example (20 MW
+forecast, offer 10 MW up ⇒ DA + down capacity ≤ 10 MW) falls straight out.
+The award is **mandatory regardless of wind**: when up-activated the `R_up`
+MW enter the position, so a low-wind ISP can fall short and pay imbalance —
+a risk the (always-curtailable) down capacity doesn't carry. With the box
+off (`R_up = 0`, `F_avail = F`) every line collapses to the down-only math,
+so the frozen L3 is byte-identical (locked by
+`test_reserve_up_off_equals_l3_default`). Up income shows in the tooltip and
+as a distinct lighter-gold monthly stack; the decomposition table splits
+**Reserve cap (up)** / **Reserve cap (dn)**. JS↔Python parity holds to
+float32 drift (full-config check: 17,183,516 € oracle vs 17,183,511 €
+engine). Like `r_coef`, the swept `ru_coef` saturates toward 1.0 in
+isolation (no price-impact model) — treat it as a liquidity lever and gate
+with `ru_min_mw` / `ru_min_price`.
+
 ### Reserve market — down capacity (sits before day-ahead)
 
-A toggleable **Reserve market** card (above DA-withhold, default **OFF**)
-models winning balancing-capacity in the auction that clears *before*
-day-ahead. We model **down capacity only**. Data: hourly LV
-`reserves_mfrr_downward_lv` / `reserves_afrr_downward_lv` prices
-(EUR/MW·h), shipped in `data-reserve.js` (see Data layout). Parameters:
+A toggleable **Reserve market** card (below the up-capacity card, default
+**OFF**) models winning balancing-capacity in the auction that clears
+*before* day-ahead. This is the **down** side (the up side is the separate
+card above); the awarded MW are sized within the forecast left after any up
+capacity (`F_avail`). Data: hourly LV `reserves_mfrr_downward_lv` /
+`reserves_afrr_downward_lv` prices (EUR/MW·h), shipped in `data-reserve.js`
+(see Data layout). Parameters:
 
 - **DA offer coefficient** `r_coef` — awarded MW = `floor(r_coef × F)`.
 - **mFRR ↔ aFRR reserve split** `r_split` — routes the award between the
@@ -392,12 +440,13 @@ aFRR-down capacity price has a fat right tail (high winsorized mean).
 
 There are no more "Level 1 / 2 / 3" tabs — a single unified engine always
 runs the full codepath, and behaviour is expressed via two source
-selectors (actual-power, ID-forecast) plus **five toggleable strategy
+selectors (actual-power, ID-forecast) plus **six toggleable strategy
 cards**. Setup lives in one **shared box at the top**: anything there
 (sim window, day-type filter, winsor pairs, θ_flat) bounds the experiment
 and is **not** swept by the optimiser nor touched by "Reset to defaults".
-Below it sit the strategy cards (Reserve → DA-withhold → adaptive Split →
-ID-trust → S3), and at the very bottom the **Optimised-runs** log.
+Below it sit the strategy cards (Reserve-up → Reserve-down → DA-withhold →
+adaptive Split → ID-trust → S3), and at the very bottom the
+**Optimised-runs** log.
 
 Setup (experiment environment — NOT reset by "Reset to defaults"):
 
@@ -420,7 +469,8 @@ collapse to a neutral value):
 
 | Strategy (default enable) | Optimised params (default)                                  | Fixed / user-set         |
 | ------------------------- | ----------------------------------------------------------- | ------------------------ |
-| **Reserve** (OFF)         | DA-offer coef (0.5), mFRR/aFRR reserve split (1.0)          | min reserve price (0)    |
+| **Reserve-up** (OFF)      | DA-offer coef (0.5), mFRR/aFRR split (1.0), min MW (0)      | min reserve price (0)    |
+| **Reserve-down** (OFF)    | DA-offer coef (0.5), mFRR/aFRR reserve split (1.0)          | min reserve price (0)    |
 | **DA-withhold** (ON)      | X (30 €/MWh), Y (1.0)                                       | —                        |
 | **Adaptive split** (ON)   | up x₁/y₁/z₁ + down x₂/y₂/z₂ = start 1.0 / window 96 ISPs / step 0.0 | —                |
 | **ID-trust** (ON)         | Z (1.0)                                                     | —                        |
@@ -508,10 +558,11 @@ stop-loss framing:
 ### Unified optimiser
 
 **One ⚡ Optimise button** sweeps every optimised parameter of the
-**enabled** strategies jointly. With all five on that's up to **15
-dimensions**: reserve `(coef, split)`, DA-withhold `(X, Y)`, adaptive
-split `(x₁, y₁, z₁, x₂, y₂, z₂)`, ID-trust `(Z)`, and S3 `(K, S_min,
-σ_max, M)`. Disabling a strategy drops its dimensions; min-reserve-price,
+**enabled** strategies jointly. With all six on that's up to **18
+dimensions**: reserve-up `(ru_coef, ru_split, ru_min_mw)`, reserve-down
+`(r_coef, r_split)`, DA-withhold `(X, Y)`, adaptive split `(x₁, y₁, z₁,
+x₂, y₂, z₂)`, ID-trust `(Z)`, and S3 `(K, S_min, σ_max, M)`. Disabling a
+strategy drops its dimensions; both min-reserve-prices,
 S3 `X_cap` / lag `L` / `DA_skip` are held at the user's values because
 they're physical / liquidity constraints, not strategy levers (see
 "Known quirks" #18). More enabled strategies ⇒ a heavier sweep, so
@@ -1072,7 +1123,7 @@ Internally the canonical form is still `YYYY-MM-DD` (ISO).
 
 ## Tests
 
-`tests.py` runs 79 audit / regression tests (a few are gated on the
+`tests.py` runs 86 audit / regression tests (a few are gated on the
 optional aFRR / reserve data files, so a stripped repo still passes):
 
 ```
@@ -1083,18 +1134,22 @@ Categories:
 
 - **A — Data integrity** (9 tests): Baltic aggregations, spread
   formula, NaN handling, time monotonicity, mFRR up == down.
-- **B — Engine invariants** (~23 tests): whole-MW rounding, mFRR-dn cap,
+- **B — Engine invariants** (~30 tests): whole-MW rounding, mFRR-dn cap,
   mFRR up/dn mutual exclusion, naive value, L1 / L2 / L3 known regression
   values, window vs per-ISP consistency, NaN p_imb behaviour, the full
   S3 family (X_cap=0 ≡ L2, lag window, rolling source, decomposition);
   the **day-type filter** (mask values, "all" is a no-op, the partition
   `all == workday + weekend/holiday`, S3 continuity preserved); the
-  **reserve market** (income settlement `price×MW×0.25`, DA-floor
+  **reserve market — down** (income settlement `price×MW×0.25`, DA-floor
   override, min-price gate, reserve-OFF ≡ frozen L3, total down offer
-  unchanged, data-reserve.js alignment); the **adaptive split** (synthetic
-  block-step logic, step=0 ≡ static scalar, step>0 adapts); and the
-  **reserve↔split interaction** (reserve is a per-direction floor, the
-  adaptive split routes only the free remainder, income is split-invariant).
+  unchanged, data-reserve.js alignment); the **reserve market — up**
+  (income settlement, DA-headroom reduction `da_sold == F − R_up`, Min-MW
+  gate, min-price gate, mandatory-regardless-of-wind shortfall, up-OFF ≡
+  frozen L3, up+down interaction `da_sold + R_up ≤ floor(F)` and down sized
+  within `F_avail`); the **adaptive split** (synthetic block-step logic,
+  step=0 ≡ static scalar, step>0 adapts); and the **reserve↔split
+  interaction** (reserve is a per-direction floor, the adaptive split routes
+  only the free remainder, income is split-invariant).
   The Python mirror uses half-up rounding (`_rnd`) to match the engine's
   `Math.round`, so JS↔Python cross-checks agree to float precision.
 - **C — Spec examples** (2 tests): the original brief's two worked
@@ -1454,17 +1509,21 @@ These are non-obvious behaviours by design — read before "fixing".
      `VWAP1H > 0` outside the engine.
 
 18. **Some dims are held fixed (physical / liquidity constraints).** The
-    optimiser sweeps the enabled strategies' levers (reserve `coef`/`split`,
+    optimiser sweeps the enabled strategies' levers (reserve-up
+    `ru_coef`/`ru_split`/`ru_min_mw`, reserve-down `r_coef`/`r_split`,
     `X`, `Y`, the six adaptive-split params, `Z`, S3 `K`/`S_min`/`σ_max`/`M`)
-    but holds **min reserve price** and S3 **`X_cap` / lag `L` / `DA_skip`**
-    at the user's values — they're physical / liquidity constraints, not
-    strategy levers. `X_cap` in particular is excluded because the backtest
-    has **no price-impact term** — selling more is always net-positive on
-    this dataset's frozen liquidity assumption, so sweeping `X_cap` would
-    just pick the grid max every time. The reserve **`coef`** dimension IS
-    swept but **saturates to 1.0** for the same reason (no price-impact /
-    auction-clearing model) — treat it like `X_cap` and lean on the min
-    reserve price to gate participation. Interior dims (`K ≈ 2-4`,
+    but holds **both min reserve prices** and S3 **`X_cap` / lag `L` /
+    `DA_skip`** at the user's values — they're physical / liquidity
+    constraints, not strategy levers. `X_cap` in particular is excluded
+    because the backtest has **no price-impact term** — selling more is
+    always net-positive on this dataset's frozen liquidity assumption, so
+    sweeping `X_cap` would just pick the grid max every time. The reserve
+    **`coef`** dims (`r_coef` and `ru_coef`) ARE swept but **saturate
+    to 1.0** for the same reason (no price-impact / auction-clearing model) —
+    treat them like `X_cap` and lean on the min reserve price (and, for up,
+    `ru_min_mw`) to gate participation. Note up `ru_coef → 1.0` means
+    selling *nothing* to DA (all forecast held as upward reserve), which the
+    real auction would not clear; gate it deliberately. Interior dims (`K ≈ 2-4`,
     `M ≈ 0-5`) are genuine optima; `S_min` and `σ_max` may still
     settle on grid edges where the gates never trip (`σ_max ≈ 900-950`
     on the current data — the rolling-std rarely gets that high so

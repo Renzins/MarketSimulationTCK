@@ -227,6 +227,71 @@
         ["50", "only reserve when capacity is well paid"],
       ],
     },
+    // -------- Reserve market (UP capacity) ------------------------------
+    ru_coef: {
+      group: "reserve-up",
+      label: "DA offer coefficient",
+      unit: "0–1",
+      min: 0,
+      max: 1,
+      sliderStep: 0.01,
+      numStep: 0.05,
+      decimals: 2,
+      description:
+        "Fraction of the DA forecast offered as UP reserve capacity. Awarded MW = floor(coefficient × forecast). Unlike down capacity these MW are NOT free: they are withheld from DA (held as ramp-up headroom), so DA + down capacity can only use the remaining forecast − awarded MW. Swept by the optimiser.",
+      extremes: [
+        ["0", "offer no up capacity"],
+        ["1", "reserve the entire forecast for up capacity (sell nothing to DA)"],
+      ],
+    },
+    ru_split: {
+      group: "reserve-up",
+      label: "mFRR ↔ aFRR reserve split",
+      unit: "0–1",
+      min: 0,
+      max: 1,
+      sliderStep: 0.01,
+      numStep: 0.05,
+      decimals: 2,
+      description:
+        "Fraction of the awarded up capacity routed to the mFRR-up reserve product vs aFRR-up. Each product earns its own capacity price and is offered into its own up-activation market. Swept by the optimiser.",
+      extremes: [
+        ["1", "all up capacity to mFRR-up"],
+        ["0", "all up capacity to aFRR-up"],
+      ],
+    },
+    ru_min_mw: {
+      group: "reserve-up",
+      label: "Min forecast MW to offer",
+      unit: "MW",
+      min: 0,
+      max: 59,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Only commit up reserve in ISPs where the DA forecast is at least this many MW. Below it no up capacity is offered (no income, no DA headroom given up) — protecting against committing upward reserve when there's little forecast wind to ramp into. Swept by the optimiser.",
+      extremes: [
+        ["0", "offer up capacity at any forecast level"],
+        ["30", "only offer up capacity when the forecast is high"],
+      ],
+    },
+    ru_min_price: {
+      group: "reserve-up",
+      label: "Min reserve price",
+      unit: "EUR/MW·h",
+      min: 0,
+      max: 200,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "Reservation-price floor, applied per product (mFRR-up / aFRR-up independently). When a product's up-capacity price is below this we treat the ISP as not awarded for that product — no income, no DA headroom given up. NOT swept by the optimiser; set it manually.",
+      extremes: [
+        ["0", "accept any non-negative reserve price"],
+        ["50", "only reserve when up capacity is well paid"],
+      ],
+    },
     X: {
       group: "da-withhold",
       label: "DA price threshold X",
@@ -504,7 +569,7 @@
     idSource: "real",
     // Reserve defaults OFF — keeps the default backtester identical to the
     // pre-reserve baseline (frozen L3 = 15,185,134 €). Toggle on to add it.
-    enabled: { reserve: false, daWithhold: true, split: true, idTrust: true, s3: true },
+    enabled: { reserveUp: false, reserve: false, daWithhold: true, split: true, idTrust: true, s3: true },
     params: {
       X: 30,
       Y: 1.0,
@@ -513,6 +578,10 @@
       r_coef: 0.5,
       r_split: 1.0,
       r_min_price: 0,
+      ru_coef: 0.5,
+      ru_split: 1.0,
+      ru_min_mw: 0,
+      ru_min_price: 0,
       w_res_mfrr_lo: 5,
       w_res_mfrr_hi: 95,
       w_res_afrr_lo: 5,
@@ -543,7 +612,7 @@
 
   // Display order of strategy cards (must match index.html data-strategy
   // attribute on each .controls-card). Setup is rendered above.
-  const STRATEGY_GROUPS = ["reserve", "da-withhold", "split", "id-trust", "s3"];
+  const STRATEGY_GROUPS = ["reserve-up", "reserve", "da-withhold", "split", "id-trust", "s3"];
 
   // Setup keys in display order. The two source selectors go first so
   // they're the most prominent decision.
@@ -571,7 +640,8 @@
     { key: "aFRR_dn", label: "aFRR-dn rev", type: "eur" },
     { key: "s3_intraday", label: "S3 ID sale rev", type: "eur" },
     { key: "s3_curtail", label: "S3 curtail rev", type: "eur" },
-    { key: "reserve", label: "Reserve capacity", type: "eur" },
+    { key: "reserveUp", label: "Reserve cap (up)", type: "eur" },
+    { key: "reserve", label: "Reserve cap (dn)", type: "eur" },
     { key: "imb", label: "Imbalance cost", type: "eur-cost" },
     { key: "flat", label: "Flat penalty", type: "eur-cost" },
     { key: "s3_extra_cost", label: "S3 extra imb cost", type: "eur-cost" },
@@ -587,7 +657,8 @@
     { key: "shortAvg", label: "Avg cost / short ISP", type: "eur" },
     { key: "s3Oversold", label: "ISPs with S3 oversell", type: "int", help: "ISPs where the S3 strategy passed all gates and the wind park oversold on intraday." },
     { key: "s3HedgeFired", label: "S3 hedge fired", type: "int", help: "Of the S3-oversell ISPs, how many had p_mfrr ≤ VWAP1H + M so the hedge mFRR-dn bid cleared." },
-    { key: "reserveISPs", label: "ISPs with reserve", type: "int", help: "ISPs where down reserve capacity was awarded (a product's price ≥ min reserve price, reserve market on)." },
+    { key: "reserveUpISPs", label: "ISPs with up reserve", type: "int", help: "ISPs where up reserve capacity was awarded (forecast ≥ Min MW, a product's price ≥ min reserve price, up reserve market on)." },
+    { key: "reserveISPs", label: "ISPs with dn reserve", type: "int", help: "ISPs where down reserve capacity was awarded (a product's price ≥ min reserve price, down reserve market on)." },
   ];
 
   // =====================================================================
@@ -965,6 +1036,7 @@
     );
     setCnt("s3Oversold", fmtInt(sim.counts.s3Oversold || 0));
     setCnt("s3HedgeFired", fmtInt(sim.counts.s3HedgeFired || 0));
+    setCnt("reserveUpISPs", fmtInt(sim.counts.reserveUpISPs || 0));
     setCnt("reserveISPs", fmtInt(sim.counts.reserveISPs || 0));
 
     // 5. Robustness — use filteredRevenue so concentration reflects only the
@@ -1010,6 +1082,7 @@
   // =====================================================================
   // Map data-strategy attribute → state.enabled key.
   const STRATEGY_TO_ENABLE_KEY = {
+    "reserve-up": "reserveUp",
     reserve: "reserve",
     "da-withhold": "daWithhold",
     split: "split",
@@ -1269,6 +1342,26 @@
 
   function buildOptimDims() {
     const dims = [];
+    if (state.enabled.reserveUp) {
+      // UP capacity: DA-offer coefficient, mFRR/aFRR split, and the forecast
+      // floor (Min MW). Min reserve price is the user-set reservation floor and
+      // is deliberately NOT swept.
+      dims.push({
+        key: "ru_coef",
+        sample: (rng) => Math.round(rng() * 100) / 100,
+        refineValues: range01(0.02),
+      });
+      dims.push({
+        key: "ru_split",
+        sample: (rng) => Math.round(rng() * 100) / 100,
+        refineValues: range01(0.02),
+      });
+      dims.push({
+        key: "ru_min_mw",
+        sample: (rng) => Math.floor(rng() * 59),
+        refineValues: rangeArr(0, 58, 2),
+      });
+    }
     if (state.enabled.reserve) {
       // DA-offer coefficient + mFRR/aFRR reserve split. Min reserve price is
       // deliberately NOT swept (user-set reservation floor).
@@ -1531,6 +1624,10 @@
       // Effective values after the optimise. Swept dims hold the optimum;
       // the fixed knobs (S3 cap/lag/skip, reserve min price) hold the user's.
       params: {
+        ru_coef: p.ru_coef,
+        ru_split: p.ru_split,
+        ru_min_mw: p.ru_min_mw,
+        ru_min_price: p.ru_min_price,
         r_coef: p.r_coef,
         r_split: p.r_split,
         r_min_price: p.r_min_price,
@@ -1560,7 +1657,8 @@
 
   const OPTIM_HEADER = [
     "#", "Time", "Range", "Days", "Strategies",
-    "Res coef", "Res split", "Res min€",
+    "RUp coef", "RUp split", "RUp minMW", "RUp min€",
+    "RDn coef", "RDn split", "RDn min€",
     "X", "Y", "Split↑ x/y/z", "Split↓ x/y/z", "Z",
     "S3 K", "S3 S_min", "S3 σ_max", "S3 M", "S3 cap/lag/skip",
     "θ", "Sources", "Winsor m/i/+/−", "Revenue", "Δ vs naïve",
@@ -1569,7 +1667,7 @@
   // Per-tab persistence (sessionStorage): survives navigating to Graphs /
   // Forecast and back, clears on tab close. Bump the version suffix if the
   // run-row shape changes so a stale cache can't render wrong.
-  const OPTIM_RUNS_KEY = "tck.optimRuns.v3";
+  const OPTIM_RUNS_KEY = "tck.optimRuns.v4";
   function saveOptimRuns() {
     try {
       sessionStorage.setItem(OPTIM_RUNS_KEY, JSON.stringify(state.optimRuns));
@@ -1612,8 +1710,8 @@
         const en = r.enabled;
         const p = r.params;
         const strategies =
-          chip(en.reserve, "RS") + chip(en.daWithhold, "DA") + chip(en.split, "SP") +
-          chip(en.idTrust, "ID") + chip(en.s3, "S3");
+          chip(en.reserveUp, "RU") + chip(en.reserve, "RS") + chip(en.daWithhold, "DA") +
+          chip(en.split, "SP") + chip(en.idTrust, "ID") + chip(en.s3, "S3");
         const diff = r.revenue - (r.naive || 0);
         const diffPct = r.naive ? (diff / Math.abs(r.naive)) * 100 : 0;
         const cells = [
@@ -1622,6 +1720,10 @@
           `${isoToEU(r.from)}<br>${isoToEU(r.to)}`,
           DAYTYPE_LABEL[r.dayType] || r.dayType,
           strategies,
+          en.reserveUp ? num(p.ru_coef, 2) : dash,
+          en.reserveUp ? num(p.ru_split, 2) : dash,
+          en.reserveUp ? num(p.ru_min_mw) : dash,
+          en.reserveUp ? num(p.ru_min_price) : dash,
           en.reserve ? num(p.r_coef, 2) : dash,
           en.reserve ? num(p.r_split, 2) : dash,
           en.reserve ? num(p.r_min_price) : dash,
@@ -1638,7 +1740,7 @@
           num(r.theta),
           `${r.actualSource}/${r.idSource}`,
           `${win(r.winsor.mfrr)} · ${win(r.winsor.imb)} · ${win(r.winsor.afrrPos)} · ${win(r.winsor.afrrNeg)}` +
-            (en.reserve ? ` · R ${win(r.winsor.resMfrr)}/${win(r.winsor.resAfrr)}` : ""),
+            (en.reserve || en.reserveUp ? ` · R ${win(r.winsor.resMfrr)}/${win(r.winsor.resAfrr)}` : ""),
           `<b>${fmtEUR(r.revenue)}</b>`,
           `<span class="${diff >= 0 ? "optim-up" : "optim-down"}">${diff >= 0 ? "+" : ""}${fmtEUR(diff)}<br>(${diff >= 0 ? "+" : ""}${diffPct.toFixed(1)}%)</span>`,
         ];

@@ -186,7 +186,8 @@ const Charts = (() => {
     const vwap_arr = new Array(N);
     const rev = new Array(N);
     const short = new Array(N);
-    const reserveRevArr = new Array(N); // reserve capacity income per ISP (EUR)
+    const reserveRevArr = new Array(N); // down-capacity income per ISP (EUR)
+    const reserveUpRevArr = new Array(N); // up-capacity income per ISP (EUR)
     const splitUp = new Array(N); // adaptive s_up shown per ISP (for tooltip)
     const splitDn = new Array(N);
     // The split is now per-ISP (adaptive). Prefer the engine's actual per-ISP
@@ -283,6 +284,9 @@ const Charts = (() => {
       short[k] = simResult.perISP.Q_short[k_p];
       reserveRevArr[k] = simResult.perISP.reserveRev
         ? simResult.perISP.reserveRev[k_p]
+        : 0;
+      reserveUpRevArr[k] = simResult.perISP.reserveUpRev
+        ? simResult.perISP.reserveUpRev[k_p]
         : 0;
     }
 
@@ -554,13 +558,18 @@ const Charts = (() => {
         s += section("Imbalance", imbLines);
       }
 
-      // --- Reserve capacity (income from won down-capacity) ---
-      // Shown in the tooltip only (no dedicated bar, per spec). Added to the
-      // P&L equation as a positive term.
+      // --- Reserve capacity (won up/down capacity income) ---
+      // Shown in the tooltip only (no dedicated bar). Each is a positive P&L term.
+      const resLines = [];
+      if (reserveUpRevArr[k] > 0.005) {
+        terms.push(reserveUpRevArr[k]);
+        resLines.push(`Up capacity income: ${ttRev(reserveUpRevArr[k])}`);
+      }
       if (reserveRevArr[k] > 0.005) {
         terms.push(reserveRevArr[k]);
-        s += section("Reserve", [`Capacity income: ${ttRev(reserveRevArr[k])}`]);
+        resLines.push(`Down capacity income: ${ttRev(reserveRevArr[k])}`);
       }
+      if (resLines.length) s += section("Reserve", resLines);
 
       // --- Total — full P&L equation breakdown ---
       // Each non-zero component appears, coloured by sign, joined with
@@ -903,14 +912,23 @@ const Charts = (() => {
         marker: { color: "#fa7970" },
       },
     ];
-    // Reserve capacity income — distinct gold, only shown when present so the
-    // legend stays clean while the reserve market is off.
+    // Reserve capacity income — golds, only shown when present so the legend
+    // stays clean while the reserve markets are off. Up = lighter, dn = gold.
+    if (monthly.some((m) => Math.abs(m.reserveUp || 0) > 1e-9)) {
+      traces.push({
+        x: months,
+        y: monthly.map((m) => m.reserveUp || 0),
+        type: "bar",
+        name: "Reserve cap (up)",
+        marker: { color: "#f2cc60" },
+      });
+    }
     if (monthly.some((m) => Math.abs(m.reserve || 0) > 1e-9)) {
       traces.push({
         x: months,
         y: monthly.map((m) => m.reserve || 0),
         type: "bar",
-        name: "Reserve capacity",
+        name: "Reserve cap (dn)",
         marker: { color: "#e3b341" },
       });
     }

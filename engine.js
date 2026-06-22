@@ -40,10 +40,15 @@
 //   per-ISP rev = (DA + up + dn - imb - flat) * 0.25          [MW * h]
 //
 // MFRR ↔ AFRR SPLIT (two parameters: s_up, s_dn ∈ [0, 1]; 1 = all mFRR)
-//   Round-and-remainder per direction:
-//     Q_up_mfrr = round(s_up * Q_up_offer)      Q_up_afrr = Q_up_offer - Q_up_mfrr
-//     Q_dn_mfrr = round(s_dn * Q_dn_offer)      Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
-//   With s_up = s_dn = 1 (default) both aFRR terms are 0. aFRR prices come
+//   Round-and-remainder per direction over the FREE (non-reserve) volume:
+//     Q_up_mfrr = R_up_mfrr + round(s_up * up_free)   Q_up_afrr = R_up_afrr + remainder
+//     Q_dn_mfrr = R_mfrr    + round(s_dn * da_nonres)  Q_dn_afrr = R_afrr    + remainder
+//   The reserve-market awards (R_up_* / R_* — see the reserve blocks inside
+//   simulate()) are a MANDATORY floor carrying their own ru_split / r_split;
+//   only the free remainder follows s_up / s_dn. up_free = floor(F) − R_up −
+//   da_sold; da_nonres = da_sold − R_dn. With both reserves off (R = 0) this is
+//   exactly round(s * total). With s_up = s_dn = 1 both aFRR terms are 0.
+//   aFRR prices come
 //   from data-afrr-15min.js: avg_p_pos[i] / avg_p_neg[i] are the
 //   time-weighted means of AST_POS / AST_NEG over each ISP's 4-s slots,
 //   with the FAVOURABLE-ONLY filter at preprocess time (see init() / the
@@ -186,14 +191,25 @@ const Engine = (() => {
     if (typeof RESERVE_DATA !== "undefined" && RESERVE_DATA && RESERVE_DATA.n === D.n) {
       D.reserve_mfrr_dn_raw = _toFloat32WithNaN(RESERVE_DATA.reserve_mfrr_dn);
       D.reserve_afrr_dn_raw = _toFloat32WithNaN(RESERVE_DATA.reserve_afrr_dn);
+      // UP-capacity prices (optional — older data-reserve.js may lack them).
+      D.reserve_mfrr_up_raw = RESERVE_DATA.reserve_mfrr_up
+        ? _toFloat32WithNaN(RESERVE_DATA.reserve_mfrr_up)
+        : new Float32Array(D.n).fill(NaN);
+      D.reserve_afrr_up_raw = RESERVE_DATA.reserve_afrr_up
+        ? _toFloat32WithNaN(RESERVE_DATA.reserve_afrr_up)
+        : new Float32Array(D.n).fill(NaN);
       D.hasReserve = true;
     } else {
       D.reserve_mfrr_dn_raw = new Float32Array(D.n).fill(NaN);
       D.reserve_afrr_dn_raw = new Float32Array(D.n).fill(NaN);
+      D.reserve_mfrr_up_raw = new Float32Array(D.n).fill(NaN);
+      D.reserve_afrr_up_raw = new Float32Array(D.n).fill(NaN);
       D.hasReserve = false;
     }
     D.reserve_mfrr_dn = new Float32Array(D.n); // winsorized (filled by maybeWinsorize)
     D.reserve_afrr_dn = new Float32Array(D.n);
+    D.reserve_mfrr_up = new Float32Array(D.n); // winsorized (shares dn percentiles)
+    D.reserve_afrr_up = new Float32Array(D.n);
 
     D.dayTypeMask = _computeDayTypeMask(rawData);
     winStart = 0;
@@ -473,10 +489,13 @@ const Engine = (() => {
     const resAKey = `${pResALow}-${pResAHigh}`;
     if (resMKey !== cachedResMfrrKey) {
       cachedResMfrrBounds = applyWinsor(D.reserve_mfrr_dn_raw, D.reserve_mfrr_dn, pResMLow, pResMHigh);
+      // UP mFRR-capacity shares the same percentile knob (its own distribution).
+      applyWinsor(D.reserve_mfrr_up_raw, D.reserve_mfrr_up, pResMLow, pResMHigh);
       cachedResMfrrKey = resMKey;
     }
     if (resAKey !== cachedResAfrrKey) {
       cachedResAfrrBounds = applyWinsor(D.reserve_afrr_dn_raw, D.reserve_afrr_dn, pResALow, pResAHigh);
+      applyWinsor(D.reserve_afrr_up_raw, D.reserve_afrr_up, pResALow, pResAHigh);
       cachedResAfrrKey = resAKey;
     }
     return {
@@ -586,6 +605,7 @@ const Engine = (() => {
     // Reserve defaults OFF (=== true) so callers that omit it — including
     // every existing test and the frozen-value baselines — are unaffected.
     const reserveOn = en.reserve === true;
+    const reserveUpOn = en.reserveUp === true;
     const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
     const X = +params.X || 0;
     const Y_raw = +params.Y || 0;
@@ -617,6 +637,11 @@ const Engine = (() => {
       r_coef: reserveOn ? clamp01(+params.r_coef || 0) : 0,
       r_split: reserveOn ? clamp01(params.r_split == null ? 1 : +params.r_split) : 1,
       r_min_price: +params.r_min_price || 0,
+      reserveUpEnabled: reserveUpOn,
+      ru_coef: reserveUpOn ? clamp01(+params.ru_coef || 0) : 0,
+      ru_split: reserveUpOn ? clamp01(params.ru_split == null ? 1 : +params.ru_split) : 1,
+      ru_min_price: +params.ru_min_price || 0,
+      ru_min_mw: +params.ru_min_mw || 0,
       s3Enabled: s3On,
       s3_K: (params.s3_K | 0) || 0,
       s3_X_cap: s3On ? (params.s3_X_cap | 0) || 0 : 0,
@@ -655,7 +680,8 @@ const Engine = (() => {
     const Q_s3_curtail = new Float32Array(wLen);
     const Q_short = new Float32Array(wLen);
     const revenue = new Float32Array(wLen);
-    const reserveRev = new Float32Array(wLen); // capacity income per ISP (EUR)
+    const reserveRev = new Float32Array(wLen); // down-capacity income per ISP (EUR)
+    const reserveUpRev = new Float32Array(wLen); // up-capacity income per ISP (EUR)
     const splitUpArr = new Float32Array(wLen); // adaptive s_up per ISP
     const splitDnArr = new Float32Array(wLen); // adaptive s_dn per ISP
     const SP = _resolveSplit(p);
@@ -669,7 +695,8 @@ const Engine = (() => {
       sumS3Intraday = 0,
       sumS3Curtail = 0,
       sumS3ExtraCost = 0,
-      sumReserve = 0;
+      sumReserve = 0,
+      sumReserveUp = 0;
     let nUp = 0,
       nDn = 0,
       nWasted = 0,
@@ -678,7 +705,8 @@ const Engine = (() => {
       nDnAfrr = 0,
       nS3Oversold = 0,
       nS3HedgeFired = 0,
-      nReserve = 0;
+      nReserve = 0,
+      nReserveUp = 0;
     let totalShortMWh = 0;
     let nNegRevWarn = 0;
 
@@ -703,7 +731,34 @@ const Engine = (() => {
       const P_da = D.p_da[i];
       const P_mfrr = D.p_mfrr[i];
       const aboveX = P_da >= p.X;
-      // ----- Reserve market (down capacity) -----
+      // ----- Reserve market (UP capacity) — carved out FIRST -----
+      // Upward reserve is NOT free: each awarded MW is withheld from DA (it is
+      // the headroom we'd ramp into if activated), so it shrinks the MW left for
+      // DA + down capacity to F_avail = F − R_up. Gated by a forecast floor
+      // (ru_min_mw) and the per-product reserve price. MANDATORY: the awarded MW
+      // are offered as mFRR/aFRR-up regardless of wind, and when up-activated
+      // they enter the position ⇒ imbalance risk if actual wind is short.
+      let R_up_mfrr = 0,
+        R_up_afrr = 0,
+        reserve_up_rate = 0;
+      if (p.reserveUpEnabled && F >= p.ru_min_mw) {
+        const Ru_total = Math.floor(p.ru_coef * F + 1e-9);
+        const Rum0 = Math.round(p.ru_split * Ru_total);
+        const pru_m = D.reserve_mfrr_up[i];
+        const pru_a = D.reserve_afrr_up[i];
+        if (isFinite(pru_m) && pru_m >= p.ru_min_price) {
+          R_up_mfrr = Rum0;
+          reserve_up_rate += R_up_mfrr * pru_m;
+        }
+        if (isFinite(pru_a) && pru_a >= p.ru_min_price) {
+          R_up_afrr = Ru_total - Rum0;
+          reserve_up_rate += R_up_afrr * pru_a;
+        }
+      }
+      const R_up = R_up_mfrr + R_up_afrr;
+      const F_avail = F - R_up; // forecast left for DA + down capacity
+
+      // ----- Reserve market (down capacity) — sized within F_avail -----
       // Awarded R MW down (whole-MW), split mFRR/aFRR; a product is kept only
       // if its winsorized capacity price is finite and ≥ min reserve price.
       // reserve_rate is EUR/h (price·MW); the trailing ×0.25 makes the 15-min
@@ -712,7 +767,7 @@ const Engine = (() => {
         R_afrr = 0,
         reserve_rate = 0;
       if (p.reserveEnabled) {
-        const R_total = Math.floor(p.r_coef * F + 1e-9);
+        const R_total = Math.floor(p.r_coef * F_avail + 1e-9);
         const Rm0 = Math.round(p.r_split * R_total);
         const pr_m = D.reserve_mfrr_dn[i];
         const pr_a = D.reserve_afrr_dn[i];
@@ -726,23 +781,26 @@ const Engine = (() => {
         }
       }
       const R_dn = R_mfrr + R_afrr;
-      // DA position: reserve down MW are MANDATORY DA sales (bypass withhold);
-      // the withhold rule governs only the rest. F_int − da_sold = withheld
-      // up-offer. Identical to the pre-reserve math when R_dn = 0.
+      // DA position: down-reserve MW are MANDATORY DA sales (bypass withhold);
+      // the withhold rule governs only the rest, all within F_avail.
+      // F_int − R_up − da_sold = free withheld up-offer. With both reserves off
+      // (R_up = R_dn = 0) this is identical to the pre-reserve math.
       const F_int = Math.floor(F + 1e-9);
-      const da_sold_wh = Math.floor((aboveX ? F : F * (1 - p.Y)) + 1e-9);
+      const da_sold_wh = Math.floor((aboveX ? F_avail : F_avail * (1 - p.Y)) + 1e-9);
       const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
-      const Q_w = F_int - da_sold;
+      const Q_w = F_int - R_up - da_sold;
       const trustedRevRaw = p.Z * (ID - F);
       if (trustedRevRaw < 0) nNegRevWarn++;
       const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
-      const Q_up_offer = Q_w + trustedExtra;
-      // mFRR ↔ aFRR split (per-direction, round-and-remainder). The reserve
-      // MW carry their own split; the non-reserve DA position uses s_dn. Total
-      // down offer (R_dn + non-reserve) == da_sold, unchanged from pre-reserve.
+      // mFRR ↔ aFRR split (per-direction, round-and-remainder). Reserve MW (up
+      // and down) carry their own split as a mandatory floor; the free volume
+      // uses the adaptive s_up / s_dn. Total up offer = R_up + free; total down
+      // offer = R_dn + non-reserve == da_sold (unchanged from pre-reserve).
+      const up_free = Q_w + trustedExtra;
       const da_nonreserve = da_sold - R_dn;
-      const Q_up_mfrr = Math.round(sUp * Q_up_offer);
-      const Q_up_afrr = Q_up_offer - Q_up_mfrr;
+      const rest_up_mfrr = Math.round(sUp * up_free);
+      const Q_up_mfrr = R_up_mfrr + rest_up_mfrr;
+      const Q_up_afrr = R_up_afrr + (up_free - rest_up_mfrr);
       const rest_dn_mfrr = Math.round(sDn * da_nonreserve);
       const Q_dn_mfrr = R_mfrr + rest_dn_mfrr;
       const Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr);
@@ -820,7 +878,8 @@ const Engine = (() => {
           dn_afrr_rev_rate +
           s3_intraday +
           s3_curtail +
-          reserve_rate -
+          reserve_rate +
+          reserve_up_rate -
           imb -
           flat -
           s3_extra_cost) *
@@ -828,6 +887,7 @@ const Engine = (() => {
       // Per-ISP arrays are always written (full continuous window).
       Q_da_sold[k] = da_sold;
       reserveRev[k] = reserve_rate * 0.25;
+      reserveUpRev[k] = reserve_up_rate * 0.25;
       Q_up[k] = up_mfrr + Q_up_afrr;
       Q_dn[k] = dn_mfrr + Q_dn_afrr;
       Q_s3_intraday[k] = s3_X;
@@ -852,12 +912,14 @@ const Engine = (() => {
       sumS3Curtail += s3_curtail * 0.25;
       sumS3ExtraCost += s3_extra_cost * 0.25;
       sumReserve += reserve_rate * 0.25;
+      sumReserveUp += reserve_up_rate * 0.25;
       if (up_mfrr > 1e-6) nUp++;
       else if (dn_mfrr > 1e-6) nDn++;
       else if (Q_w > 1e-6 && !upAfrrActive && !dnAfrrActive) nWasted++;
       if (upAfrrActive) nUpAfrr++;
       if (dnAfrrActive) nDnAfrr++;
       if (R_dn > 0) nReserve++;
+      if (R_up > 0) nReserveUp++;
       if (s3_X > 0) {
         nS3Oversold++;
         if (s3_fires) nS3HedgeFired++;
@@ -875,7 +937,8 @@ const Engine = (() => {
       sumDnAfrr +
       sumS3Intraday +
       sumS3Curtail +
-      sumReserve -
+      sumReserve +
+      sumReserveUp -
       sumImb -
       sumFlat -
       sumS3ExtraCost;
@@ -893,6 +956,7 @@ const Engine = (() => {
         Q_short,
         revenue,
         reserveRev,
+        reserveUpRev,
         s_up: splitUpArr,
         s_dn: splitDnArr,
         dayType,
@@ -911,6 +975,7 @@ const Engine = (() => {
         s3_intraday: sumS3Intraday,
         s3_curtail: sumS3Curtail,
         reserve: sumReserve,
+        reserveUp: sumReserveUp,
         imb: sumImb,
         flat: sumFlat,
         s3_extra_cost: sumS3ExtraCost,
@@ -926,6 +991,7 @@ const Engine = (() => {
         s3Oversold: nS3Oversold,
         s3HedgeFired: nS3HedgeFired,
         reserveISPs: nReserve,
+        reserveUpISPs: nReserveUp,
       },
       totalShortMWh,
     };
@@ -953,6 +1019,8 @@ const Engine = (() => {
     const nNeg_arr = D.afrr_n_neg_fav;
     const resM_arr = D.reserve_mfrr_dn;
     const resA_arr = D.reserve_afrr_dn;
+    const resMU_arr = D.reserve_mfrr_up;
+    const resAU_arr = D.reserve_afrr_up;
     const SP = _resolveSplit(p);
     // Day-type filter: skip non-matching ISPs (their P&L is independent of
     // every other ISP, so dropping them from the sum is exact). Rolling stats
@@ -969,12 +1037,32 @@ const Engine = (() => {
       const P_da = P_da_arr[i];
       const P_mfrr = P_mfrr_arr[i];
       const aboveX = P_da >= p.X;
+      // Reserve UP capacity carved from forecast first (mirror simulate()).
+      let R_up_mfrr = 0,
+        R_up_afrr = 0,
+        reserve_up_rate = 0;
+      if (p.reserveUpEnabled && F >= p.ru_min_mw) {
+        const Ru_total = (p.ru_coef * F) | 0;
+        const Rum0 = Math.round(p.ru_split * Ru_total);
+        const pru_m = resMU_arr[i];
+        const pru_a = resAU_arr[i];
+        if (isFinite(pru_m) && pru_m >= p.ru_min_price) {
+          R_up_mfrr = Rum0;
+          reserve_up_rate += R_up_mfrr * pru_m;
+        }
+        if (isFinite(pru_a) && pru_a >= p.ru_min_price) {
+          R_up_afrr = Ru_total - Rum0;
+          reserve_up_rate += R_up_afrr * pru_a;
+        }
+      }
+      const R_up = R_up_mfrr + R_up_afrr;
+      const F_avail = F - R_up;
       // Reserve down capacity (mirror simulate(); inert when reserve off).
       let R_mfrr = 0,
         R_afrr = 0,
         reserve_rate = 0;
       if (p.reserveEnabled) {
-        const R_total = (p.r_coef * F) | 0;
+        const R_total = (p.r_coef * F_avail) | 0;
         const Rm0 = Math.round(p.r_split * R_total);
         const pr_m = resM_arr[i];
         const pr_a = resA_arr[i];
@@ -988,15 +1076,16 @@ const Engine = (() => {
         }
       }
       const R_dn = R_mfrr + R_afrr;
-      const da_sold_wh = (aboveX ? F : F * (1 - p.Y)) | 0;
+      const da_sold_wh = (aboveX ? F_avail : F_avail * (1 - p.Y)) | 0;
       const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
-      const Q_w = (F | 0) - da_sold;
+      const Q_w = (F | 0) - R_up - da_sold;
       const trustedRevRaw = p.Z * (ID_src[i] - F);
       const trustedExtra = trustedRevRaw > 0 ? (trustedRevRaw | 0) : 0;
-      const Q_up_offer = Q_w + trustedExtra;
+      const up_free = Q_w + trustedExtra;
       const da_nonreserve = da_sold - R_dn;
-      const Q_up_mfrr = Math.round(sUp * Q_up_offer);
-      const Q_up_afrr = Q_up_offer - Q_up_mfrr;
+      const rest_up_mfrr = Math.round(sUp * up_free);
+      const Q_up_mfrr = R_up_mfrr + rest_up_mfrr;
+      const Q_up_afrr = R_up_afrr + (up_free - rest_up_mfrr);
       const rest_dn_mfrr = Math.round(sDn * da_nonreserve);
       const Q_dn_mfrr = R_mfrr + rest_dn_mfrr;
       const Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr);
@@ -1008,7 +1097,7 @@ const Engine = (() => {
       const avg_neg = aNeg_arr[i];
       const upAfrrActive = avg_pos > 0 && Q_up_afrr > 0;
       const dnAfrrActive = avg_neg < 0 && Q_dn_afrr > 0;
-      let rev = da_sold * P_da + up_mfrr * P_mfrr - dn_mfrr * P_mfrr + reserve_rate;
+      let rev = da_sold * P_da + up_mfrr * P_mfrr - dn_mfrr * P_mfrr + reserve_rate + reserve_up_rate;
       if (upAfrrActive) rev += Q_up_afrr * avg_pos;
       if (dnAfrrActive) rev -= Q_dn_afrr * avg_neg;
       const up_afrr_disp = upAfrrActive ? Q_up_afrr * (nPos_arr[i] / 225) : 0;
@@ -1064,7 +1153,7 @@ const Engine = (() => {
       X: 0,
       Y: 0,
       Z: 0,
-      enabled: { ...(params.enabled || {}), s3: false, reserve: false, split: false },
+      enabled: { ...(params.enabled || {}), s3: false, reserve: false, reserveUp: false, split: false },
     };
     return simulateTotal(naiveP);
   }
@@ -1107,12 +1196,32 @@ const Engine = (() => {
       const P_da = D.p_da[i];
       const P_mfrr = D.p_mfrr[i];
       const aboveX = P_da >= p.X;
+      // Reserve UP capacity carved from forecast first (mirror simulate()).
+      let R_up_mfrr = 0,
+        R_up_afrr = 0,
+        reserve_up_rate = 0;
+      if (p.reserveUpEnabled && F >= p.ru_min_mw) {
+        const Ru_total = Math.floor(p.ru_coef * F + 1e-9);
+        const Rum0 = Math.round(p.ru_split * Ru_total);
+        const pru_m = D.reserve_mfrr_up[i];
+        const pru_a = D.reserve_afrr_up[i];
+        if (isFinite(pru_m) && pru_m >= p.ru_min_price) {
+          R_up_mfrr = Rum0;
+          reserve_up_rate += R_up_mfrr * pru_m;
+        }
+        if (isFinite(pru_a) && pru_a >= p.ru_min_price) {
+          R_up_afrr = Ru_total - Rum0;
+          reserve_up_rate += R_up_afrr * pru_a;
+        }
+      }
+      const R_up = R_up_mfrr + R_up_afrr;
+      const F_avail = F - R_up;
       // Reserve down capacity (mirror simulate(); inert when reserve off).
       let R_mfrr = 0,
         R_afrr = 0,
         reserve_rate = 0;
       if (p.reserveEnabled) {
-        const R_total = Math.floor(p.r_coef * F + 1e-9);
+        const R_total = Math.floor(p.r_coef * F_avail + 1e-9);
         const Rm0 = Math.round(p.r_split * R_total);
         const pr_m = D.reserve_mfrr_dn[i];
         const pr_a = D.reserve_afrr_dn[i];
@@ -1127,19 +1236,21 @@ const Engine = (() => {
       }
       const R_dn = R_mfrr + R_afrr;
       const F_int = Math.floor(F + 1e-9);
-      const da_sold_wh = Math.floor((aboveX ? F : F * (1 - p.Y)) + 1e-9);
+      const da_sold_wh = Math.floor((aboveX ? F_avail : F_avail * (1 - p.Y)) + 1e-9);
       const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
-      const Q_w = F_int - da_sold;
+      const Q_w = F_int - R_up - da_sold;
       const trustedRevRaw = p.Z * (ID - F);
       const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
-      const up_offer = Q_w + trustedExtra;
+      const up_free = Q_w + trustedExtra;
       const da_nonreserve = da_sold - R_dn;
-      const Q_up_mfrr = Math.round(sUp * up_offer);
-      const Q_up_afrr = up_offer - Q_up_mfrr;
+      const rest_up_mfrr = Math.round(sUp * up_free);
+      const Q_up_mfrr = R_up_mfrr + rest_up_mfrr;
+      const Q_up_afrr = R_up_afrr + (up_free - rest_up_mfrr);
       const rest_dn_mfrr = Math.round(sDn * da_nonreserve);
       const Q_dn_mfrr = R_mfrr + rest_dn_mfrr;
       const Q_dn_afrr = R_afrr + (da_nonreserve - rest_dn_mfrr);
       const Reserve_rev = reserve_rate * 0.25;
+      const ReserveUp_rev = reserve_up_rate * 0.25;
       const isUp = P_mfrr >= 1;
       const isDn = P_mfrr <= -1;
       const up_mfrr_q = isUp ? Q_up_mfrr : 0;
@@ -1206,6 +1317,7 @@ const Engine = (() => {
           s3_curtail: 0,
           s3_extra_cost: 0,
           reserve: 0,
+          reserveUp: 0,
           imb: 0,
           flat: 0,
         };
@@ -1218,6 +1330,7 @@ const Engine = (() => {
       b.s3_curtail += S3Curtail_rev;
       b.s3_extra_cost += S3ExtraCost;
       b.reserve += Reserve_rev;
+      b.reserveUp += ReserveUp_rev;
       b.imb += imb;
       b.flat += flat;
       buckets.set(key, b);
@@ -1238,6 +1351,7 @@ const Engine = (() => {
         s3_intraday: b.s3_intraday,
         s3_curtail: b.s3_curtail,
         reserve: b.reserve,
+        reserveUp: b.reserveUp,
         s3_extra_cost: b.s3_extra_cost,
         imb: b.imb,
         flat: b.flat,
@@ -1249,7 +1363,8 @@ const Engine = (() => {
           b.dn_afrr +
           b.s3_intraday +
           b.s3_curtail +
-          b.reserve -
+          b.reserve +
+          b.reserveUp -
           b.imb -
           b.flat -
           b.s3_extra_cost,
