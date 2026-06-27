@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1200, initial-scale=1" />
+    <title>TCK Market Dashboard — Backtester - BESS</title>
+    <link rel="stylesheet" href="style.css?v=40" />
+  </head>
+  <body>
+    <nav class="site-nav">
+      <a href="index.html" class="brand">TCK Market Dashboard</a>
+      <a href="index.html" class="navlink">Backtester - Wind Park</a>
+      <a href="bess.html" class="navlink active">Backtester - BESS</a>
+      <a href="graphs.html" class="navlink">Graphs</a>
+      <a href="forecast.html" class="navlink">Forecast</a>
+    </nav>
+
+    <header class="site-header">
+      <h1>Backtester — BESS</h1>
+      <p class="subtitle">
+        Grid-scale battery (default 40&nbsp;MWh / 20&nbsp;MW) trading the
+        Latvian day-ahead, mFRR, aFRR and intraday markets. Stateful
+        15-minute ISP simulation: state-of-charge is carried across periods,
+        so what you discharge now limits what you can discharge later. Pick
+        the battery's physical limits and operating band, toggle the
+        strategies, and the optimiser sweeps every enabled strategy jointly.
+        Data covers <span id="data-range">…</span>.
+      </p>
+    </header>
+
+    <!-- =================================================================
+         SETUP — battery physics + operating band + market bounds.
+         Everything here bounds the experiment and is NOT optimised nor
+         touched by "Reset to defaults". Unlike the wind-park page there is
+         no actual-power / intra-day-power source selector (a battery has no
+         generation forecast) and no reserve winsorisation.
+         ================================================================= -->
+    <div class="setup-wrapper">
+      <section class="setup-box">
+        <div class="param-group setup">
+          <div class="group-head">
+            <h3>Setup</h3>
+            <p class="group-desc">
+              Define the battery and the experiment environment — physical
+              limits, the safe operating band (red zones), the round-trip
+              margin we demand, and how the markets are bounded. Setup is not
+              varied by the optimiser and not touched by "Reset to defaults".
+            </p>
+          </div>
+          <div class="controls-grid" id="setup-params"></div>
+        </div>
+      </section>
+    </div>
+
+    <main>
+      <!-- =================================================================
+           STRATEGY PANEL — five toggleable cards. Unchecking a card greys
+           it out and the engine treats its strategy as neutralised:
+             · DA discharge off  → no day-ahead sell schedule
+             · Dynamic charging off → battery never charges (read-only test)
+             · mFRR↔aFRR split off → all balancing volume to mFRR
+             · Dynamic discharge off → balancing energy dumped as soon as it
+               clears (no hold-for-higher, no mFRR→aFRR switch)
+             · Opportunistic override off → committed DA is never diverted
+           ================================================================= -->
+      <section id="strategy-panel" class="panel active">
+        <div class="controls-card" data-strategy="split">
+          <div class="param-group market">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-split" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
+              <h3>mFRR ↔ aFRR adaptive offer split <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Per-direction routing of balancing volume between mFRR and
+                aFRR that <em>adapts over time</em> (carried over from the
+                wind-park backtester). Each direction starts at split x, and
+                every y ISPs it re-checks which market paid more per MW over
+                the last y ISPs and shifts toward the winner by step z. Up
+                (discharge) and down (charge) are independent. Set z = 0 for
+                a fixed split at x.
+              </p>
+            </div>
+            <div class="controls-grid" id="split-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card" data-strategy="da-discharge">
+          <div class="param-group market">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-da-discharge" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
+              <h3>Day-ahead arbitrage (sell + buy-low) <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Day-ahead is committed a day in advance, so we don't know the
+                clearing price yet — we use a simple <b>lag-24h</b> (96-ISP)
+                persistence forecast. We place <em>discharge</em> offers at the
+                day's forecast <b>peaks</b> (cleared when the actual price ≥ the
+                sell floor) and <em>buy-low</em> offers at the day's forecast
+                <b>troughs</b> (cleared when the actual price ≤ the buy ceiling)
+                to pre-stock energy for the next peaks. The day's volume can be
+                concentrated (few periods at full power) or spread (more periods
+                at lower power). All quantities are whole MW.
+              </p>
+            </div>
+            <div class="controls-grid" id="da-discharge-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card" data-strategy="charging">
+          <div class="param-group market">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-charging" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
+              <h3>Dynamic charging (real-time) <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                <em>Real-time</em> refill from the markets that can be decided
+                near delivery — mFRR-dn (25 min), aFRR-dn, intraday (30 min).
+                Day-ahead troughs are "boring" (we still pay) and are handled by
+                the committed buy-low leg above; here, <em>balancing-down can go
+                deeply negative</em>, meaning the system <b>pays us to absorb</b>.
+                The mFRR-dn↔aFRR-dn routing follows the adaptive DOWN split,
+                which shifts toward whichever pays more to absorb; a side is used
+                only if its price is at or below the max charge price, with
+                intraday as the fallback. Off ⇒ no real-time charging.
+              </p>
+            </div>
+            <div class="controls-grid" id="charging-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card" data-strategy="dynamic-discharge">
+          <div class="param-group oversell">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-dynamic-discharge" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
+              <h3>Dynamic discharge pricing <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Don't dump the whole battery the moment a price clears. If the
+                recent mFRR/aFRR price trend is rising, hold back a fraction of
+                the discharge now to capture an expected higher price a few
+                ISPs later — there is still time because the balancing gate
+                closes only 25 min before delivery, so bids more than 25 min
+                out can be re-priced, re-sized or switched from mFRR to aFRR.
+              </p>
+            </div>
+            <div class="controls-grid" id="dynamic-discharge-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card" data-strategy="opportunistic">
+          <div class="param-group oversell">
+            <div class="group-head">
+              <label class="strategy-toggle">
+                <input type="checkbox" id="enable-opportunistic" checked />
+                <span class="strategy-toggle-box"></span>
+              </label>
+              <h3>Opportunistic balancing override <span class="badge">optimised</span></h3>
+              <p class="group-desc">
+                Alternative-cost logic. If we already sold a period to DA at,
+                say, 150&nbsp;€/MWh but a sudden balancing deficit pushes the
+                price far above that, we divert the energy to the richer
+                balancing product and close the day-ahead leg on intraday (or,
+                if cheaper, take the imbalance settlement). We never divert so
+                much that a <em>committed balancing activation</em> could go
+                unfulfilled — only day-ahead positions are ever left to settle
+                at imbalance.
+              </p>
+            </div>
+            <div class="controls-grid" id="opportunistic-params"></div>
+          </div>
+        </div>
+
+        <div class="controls-card actions-card">
+          <div class="actions">
+            <button id="optimise" class="btn primary">⚡ Optimise</button>
+            <button id="reset" class="btn">⇄ Reset to defaults</button>
+            <span id="progress" class="progress"></span>
+          </div>
+        </div>
+
+        <div class="stats-card" id="stats">
+          <div class="stat-grid">
+            <div class="big-stat">
+              <div class="label" title="Sum of per-ISP P&L over the entire backtest window (DA + balancing + intraday − charging cost − imbalance).">Total revenue</div>
+              <div class="value" id="total">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Total revenue divided by total MWh discharged (delivered to the grid). A measure of how well each MWh of throughput was monetised.">Revenue per MWh discharged</div>
+              <div class="value" id="per-mwh">–</div>
+            </div>
+            <div class="big-stat">
+              <div class="label" title="Equivalent full cycles = total MWh discharged ÷ usable capacity. How hard the battery was worked over the window.">Full-cycle equivalents</div>
+              <div class="value" id="cycles">–</div>
+            </div>
+          </div>
+          <table class="decomposition" id="decomp-table"></table>
+          <table class="decomposition" id="counts-table"></table>
+        </div>
+
+        <!-- =================================================================
+             GRAPH 1 — Day-ahead forecast vs actual, with discharge markers.
+             ================================================================= -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Day-ahead: forecast vs actual</h2>
+            <div class="ts-controls">
+              <label>From:
+                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
+                       id="da-date-from" class="date-eu" />
+              </label>
+              <label>To:
+                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
+                       id="da-date-to" class="date-eu" />
+              </label>
+              <span class="hint">shares the time-series window below</span>
+            </div>
+          </div>
+          <p class="card-desc">
+            The lag-24h DA price forecast the strategy actually saw (dashed)
+            against the realised DA price (solid). Green triangles mark ISPs
+            where a discharge was sold to DA; blue down-triangles mark ISPs
+            where the battery charged from DA. Shows whether the naive
+            persistence forecast put the discharge where the peaks really were.
+          </p>
+          <div id="da-chart" class="chart"></div>
+        </div>
+
+        <!-- =================================================================
+             GRAPH 2 — State-of-charge time series (the main detail chart).
+             SoC is the only LINE; DA-sold is a blue bar with mFRR/aFRR
+             activation bars stacked on top. Carries the wind-park tooltip.
+             ================================================================= -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Time series</h2>
+            <div class="ts-controls">
+              <label>From:
+                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
+                       id="date-from" class="date-eu" />
+              </label>
+              <label>To:
+                <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                       pattern="\d{2}/\d{2}/\d{4}" maxlength="10"
+                       id="date-to" class="date-eu" />
+              </label>
+              <button id="prev-range" class="btn small" title="Shift backward by current span">◀</button>
+              <button id="next-range" class="btn small" title="Shift forward by current span">▶</button>
+              <span class="preset-group">
+                <button class="btn small preset" data-preset="1d">1d</button>
+                <button class="btn small preset" data-preset="1w">1w</button>
+                <button class="btn small preset" data-preset="1mo">1mo</button>
+                <button class="btn small preset" data-preset="3mo">3mo</button>
+                <button class="btn small preset" data-preset="all">all</button>
+              </span>
+              <span class="hint">Wheel = zoom · drag = pan · double-click = reset</span>
+            </div>
+          </div>
+          <p class="card-desc">
+            State-of-charge (line, right axis) over the chosen window. DA-sold
+            energy is a blue bar; mFRR/aFRR discharge stacks above zero and
+            mFRR/aFRR charge stacks below. aFRR bars show the dispatched
+            (partial-activation) MW. Hover any ISP for the full P&L breakdown.
+          </p>
+          <div id="ts-chart" class="chart"></div>
+        </div>
+
+        <!-- =================================================================
+             GRAPH 3 — Balancing bid lifecycle (sent / cleared / withdrawn).
+             ================================================================= -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Balancing bids — what was sent, cleared and withdrawn</h2>
+            <span class="hint">shares the time-series window above</span>
+          </div>
+          <p class="card-desc">
+            Every offer the battery placed into the balancing markets, by
+            product (mFRR / aFRR), direction (▲ discharge / ▼ charge), price
+            and MW. Filled markers cleared and were delivered; hollow markers
+            rested without clearing; ✕ markers were <b>withdrawn before the
+            25-minute gate</b> — pulled because the SoC hit a red zone, the
+            dynamic-pricing logic chose to hold for a higher price, or the
+            offer was switched to the other product.
+          </p>
+          <div id="bids-chart" class="chart"></div>
+        </div>
+
+        <!-- =================================================================
+             GRAPH 4 + 5 — operations summary + SoC safety statistics.
+             ================================================================= -->
+        <div class="card">
+          <div class="card-head">
+            <h2>Operations &amp; state-of-charge statistics</h2>
+          </div>
+          <div class="two-col">
+            <div>
+              <h3>Cycling &amp; duration</h3>
+              <p class="chart-desc">
+                Average charge / discharge block length and the idle gap
+                between them — how the battery paces itself given the
+                "min time between direction change" and round-trip margin.
+              </p>
+              <div id="ops-chart" class="chart small"></div>
+              <table class="decomposition" id="ops-table"></table>
+            </div>
+            <div>
+              <h3>SoC safety audit</h3>
+              <p class="chart-desc">
+                Periods spent at the 0 % floor or 100 % ceiling, and — most
+                importantly — any committed balancing activation that could
+                <b>not</b> be fulfilled, with the cause. By design this must be
+                zero: failing a balancing activation carries severe penalties,
+                so the engine never offers more than the battery can deliver.
+                A non-zero count here is a red flag.
+              </p>
+              <div id="soc-stats-chart" class="chart small"></div>
+              <table class="decomposition" id="soc-stats-table"></table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Robustness</h2>
+          </div>
+          <p class="card-desc">
+            How concentrated is the revenue? If a few rare periods dominate,
+            the "optimum" may be a coincidence. Read the numbers below as a
+            stress test.
+          </p>
+          <div class="robust-grid">
+            <div class="robust-item">
+              <div class="label">Top 1% concentration</div>
+              <div class="big-num" id="top1pct">–</div>
+              <div class="robust-help">
+                Share of total revenue earned by the best 1% of periods.
+                <br><b>&lt; 10%:</b> well-distributed.
+                <br><b>&gt; 30%:</b> strategy depends on rare events.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 5% concentration</div>
+              <div class="big-num" id="top5pct">–</div>
+              <div class="robust-help">
+                A balanced strategy contributes ≈ 5 % from each percentile bucket.
+              </div>
+            </div>
+            <div class="robust-item">
+              <div class="label">Top 10% concentration</div>
+              <div class="big-num" id="top10pct">–</div>
+              <div class="robust-help">
+                Anything &gt; 60 % means revenue is highly skewed.
+              </div>
+            </div>
+          </div>
+          <div class="two-col">
+            <div>
+              <h3>Monthly revenue (decomposition)</h3>
+              <p class="chart-desc">
+                Stacked bar per calendar month showing how each leg contributes.
+                Big swings between months suggest seasonality.
+              </p>
+              <div id="monthly-chart" class="chart small"></div>
+            </div>
+            <div>
+              <h3>Per-ISP revenue distribution</h3>
+              <p class="chart-desc">
+                Histogram (log-scale Y) of every ISP's revenue. A long right tail
+                means a few periods dominate.
+              </p>
+              <div id="hist-chart" class="chart small"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- =================================================================
+             OPTIMISED RUNS — running log of every Optimise click, persisted
+             per browser tab (sessionStorage). Mirrors the wind-park page.
+             ================================================================= -->
+        <div class="card" id="optim-runs-card">
+          <div class="card-head">
+            <h2>Optimised runs</h2>
+            <button id="clear-optim-runs" class="btn small" title="Remove all recorded runs">Clear</button>
+          </div>
+          <p class="card-desc">
+            Every time you press <b>⚡ Optimise</b>, this table gains a row: the
+            experiment setup, which strategies were on/off, and the optimal
+            parameters found — plus the resulting revenue. Use it to compare
+            configurations side by side. Persisted per browser tab; clears when
+            the tab closes.
+          </p>
+          <div class="optim-runs-wrap">
+            <table class="optim-runs" id="optim-runs-table"></table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Hover the time-series chart for per-ISP detail. State-of-charge is
+        carried across periods — all math runs client-side, no server required.
+      </p>
+    </footer>
+
+    <!-- Plotly via plot.ly CDN (no SRI hash published by Plotly). -->
+    <script
+      src="https://cdn.plot.ly/plotly-2.35.2.min.js"
+      charset="utf-8"
+    ></script>
+    <!-- date-holidays plugin (UMD) — drives the day-type filter (LV/EE/LT). -->
+    <script src="https://cdn.jsdelivr.net/npm/date-holidays@3.28.0/dist/umd.min.js"></script>
+    <script src="data.js?v=36"></script>
+    <script src="data-afrr.js?v=36"></script>
+    <script src="data-afrr-15min.js?v=36"></script>
+    <script src="data-reserve.js?v=43"></script>
+    <!--
+      engine.js is loaded for its SHARED utilities only — Engine.init builds
+      the typed arrays + day-type mask + winsorisation that bess-engine.js
+      reads via Engine.getData(). The BESS state-of-charge simulation itself
+      lives entirely in bess-engine.js (BessEngine).
+    -->
+    <script src="engine.js?v=46"></script>
+    <script src="bess-engine.js?v=3"></script>
+    <script src="bess-charts.js?v=3"></script>
+    <script src="bess-app.js?v=2"></script>
+  </body>
+</html>
