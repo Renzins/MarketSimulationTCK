@@ -481,12 +481,14 @@ def s3_rolling_stats(src: np.ndarray, K: int, L: int):
     return mean, std
 
 
-def _adaptive_split(start, win, step, pm_w, second_w, direction):
-    """Per-ISP follow-the-winner split — mirror of engine.js _splitBlocks.
-    Block 0 = start; each later block steps the split toward whichever market
-    had the higher average per-MW rate in the PREVIOUS block (causal). Rates:
+def _adaptive_split(start, win, step, wait, pm_w, second_w, direction):
+    """Piecewise-constant follow-the-winner split — mirror of engine.js
+    _splitBlocks. The split is held for `wait` ISPs (rebalance CADENCE), then at
+    each segment boundary it steps toward whichever market had the higher
+    average per-MW rate over the trailing `win` ISPs (LOOKBACK), causal. Rates:
       up:  mFRR = p_mfrr when ≥1 else 0 ;  aFRR = avg_p_pos
       dn:  mFRR = −p_mfrr when ≤−1 else 0;  aFRR = −avg_p_neg
+    wait and win are decoupled; wait = win reproduces the old block behaviour.
     """
     pm = np.asarray(pm_w, float)
     sec = np.asarray(second_w, float)
@@ -497,21 +499,23 @@ def _adaptive_split(start, win, step, pm_w, second_w, direction):
         effM = np.where(pm <= -1, -pm, 0.0)
         effA = np.where(sec < 0, -sec, 0.0)
     n = len(pm)
-    w = max(1, int(win))
+    lb = max(1, int(win))    # lookback length
+    wt = max(1, int(wait))   # cadence (segment length)
     step = float(step)
     out = np.empty(n)
     cur = min(1.0, max(0.0, float(start)))
-    nB = (n - 1) // w + 1
+    nB = (n - 1) // wt + 1
     for k in range(nB):
         if k > 0 and step > 0:
-            plo, phi = (k - 1) * w, min(k * w, n)
+            boundary = k * wt
+            plo, phi = max(0, boundary - lb), min(boundary, n)
             if phi > plo:
                 am, aa = effM[plo:phi].mean(), effA[plo:phi].mean()
                 if am > aa:
                     cur = min(1.0, cur + step)
                 elif aa > am:
                     cur = max(0.0, cur - step)
-        out[k * w : min((k + 1) * w, n)] = cur
+        out[k * wt : min((k + 1) * wt, n)] = cur
     return out
 
 
@@ -521,6 +525,7 @@ def simulate_total_l3(
     s_up=1.0, s_dn=1.0,
     split_adaptive=False, s_up_start=None, s_dn_start=None,
     s_up_win=96, s_dn_win=96, s_up_step=0.0, s_dn_step=0.0,
+    s_up_wait=1, s_dn_wait=1,
     avg_p_pos_w=None, avg_p_neg_w=None, n_pos_fav=None, n_neg_fav=None,
     s3_K=4, s3_L=4, s3_S_min=25, s3_sigma_max=75, s3_X_cap=5, s3_M=5,
     s3_da_skip=50,
@@ -542,8 +547,8 @@ def simulate_total_l3(
         sd = s_dn if s_dn_start is None else s_dn_start
         ap = avg_p_pos_w if avg_p_pos_w is not None else np.zeros_like(F)
         an = avg_p_neg_w if avg_p_neg_w is not None else np.zeros_like(F)
-        s_up_c = _adaptive_split(su, s_up_win, s_up_step, P_mfrr_w, ap, "up")
-        s_dn_c = _adaptive_split(sd, s_dn_win, s_dn_step, P_mfrr_w, an, "dn")
+        s_up_c = _adaptive_split(su, s_up_win, s_up_step, s_up_wait, P_mfrr_w, ap, "up")
+        s_dn_c = _adaptive_split(sd, s_dn_win, s_dn_step, s_dn_wait, P_mfrr_w, an, "dn")
     else:
         s_up_c = max(0.0, min(1.0, float(s_up)))
         s_dn_c = max(0.0, min(1.0, float(s_dn)))
@@ -2465,10 +2470,30 @@ def test_split_block_logic_synthetic():
     block 1 where mFRR (0) < aFRR (1) → −0.25 → 0.5."""
     pm = np.array([10.0, 10.0, 0.0, 0.0, 0.0, 0.0])
     ap = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-    s = _adaptive_split(0.5, 2, 0.25, pm, ap, "up")
+    # wait = win = 2 reproduces the original non-overlapping block behaviour.
+    s = _adaptive_split(0.5, 2, 0.25, 2, pm, ap, "up")
     assert np.allclose(s, [0.5, 0.5, 0.75, 0.75, 0.5, 0.5]), f"adaptive split got {s}"
     # clamps to [0,1]
-    assert _adaptive_split(0.9, 2, 0.25, pm, ap, "up").max() <= 1.0
+    assert _adaptive_split(0.9, 2, 0.25, 2, pm, ap, "up").max() <= 1.0
+
+
+def test_split_wait_decouples_cadence_from_lookback():
+    """The new `wait` (cadence) is independent of `win` (lookback). wait=win
+    reproduces the block behaviour; wait=1 re-evaluates every ISP off a sliding
+    win-ISP window (so it can step on every ISP, not only every win)."""
+    pm = np.array([10.0, 10.0, 0.0, 0.0, 0.0, 0.0])
+    ap = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    # wait=win=2 == the block result above
+    assert np.allclose(_adaptive_split(0.5, 2, 0.25, 2, pm, ap, "up"),
+                       [0.5, 0.5, 0.75, 0.75, 0.5, 0.5])
+    # wait=1, win=2: step every ISP off the trailing 2-ISP window.
+    #   i1: look [max(0,1-2),1)=[0,1) mFRR(10)>aFRR(1) → 0.75
+    #   i2: look [0,2) mFRR(10)>aFRR(1) → 1.0 (clamped)
+    #   i3: look [1,3) mFRR(5)>aFRR(1) → 1.0
+    #   i4: look [2,4) mFRR(0)<aFRR(1) → 0.75
+    #   i5: look [3,5) mFRR(0)<aFRR(1) → 0.5
+    s1 = _adaptive_split(0.5, 2, 0.25, 1, pm, ap, "up")
+    assert np.allclose(s1, [0.5, 0.75, 1.0, 1.0, 0.75, 0.5]), f"wait=1 got {s1}"
 
 
 def test_split_adaptive_step0_equals_static():
@@ -2579,6 +2604,7 @@ if HAVE_RESERVE_JS:
     R.add("Reserve re-routes but total down offer == da_sold", test_reserve_total_down_offer_unchanged)
     R.add("data-reserve.js aligns with data.js (timestamp spot-check)", test_reserve_data_js_alignment)
 R.add("Adaptive split block logic (synthetic step toward winner)", test_split_block_logic_synthetic)
+R.add("Split wait/cadence decoupled from lookback (wait=win≡old; wait=1 per-ISP)", test_split_wait_decouples_cadence_from_lookback)
 if os.path.exists(DATA_AFRR_15MIN_PATH):
     R.add("Adaptive split step=0 ≡ static scalar (LOAD-BEARING)", test_split_adaptive_step0_equals_static)
     R.add("Adaptive split with step>0 actually adapts (differs from static)", test_split_adaptive_actually_adapts)

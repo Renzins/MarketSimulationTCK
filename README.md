@@ -305,10 +305,11 @@ Q_dn_mfrr = round(s_dn · Q_dn_offer)     Q_dn_afrr = Q_dn_offer − Q_dn_mfrr
 ```
 
 But `s_up` / `s_dn` are no longer constants — they **adapt over time,
-per direction**, with three params each: **start `x`**, **rebalance
-window `y`** (ISPs), **step `z`**. The split begins at `x`; every `y`
-ISPs it compares the average per-MW revenue *rate* of the two markets
-over the previous block and steps toward the winner by `z`:
+per direction**, with **four** params each: **start `x`**, **lookback
+window `y`** (ISPs), **rebalance wait `w`** (ISPs), **step `z`**. The
+split begins at `x`; every `w` ISPs (the **cadence**) it compares the
+average per-MW revenue *rate* of the two markets over the **trailing `y`
+ISPs** (the **lookback**) and steps toward the winner by `z`:
 
 ```
 up rate:  mFRR = p_mfrr when it clears up (≥1) else 0 ;  aFRR = avg_p_pos
@@ -316,11 +317,14 @@ dn rate:  mFRR = −p_mfrr when it clears dn (≤−1) else 0;  aFRR = −avg_p_
 mFRR wins → s += z   ·   aFRR wins → s −= z   ·   tie → no move   ·   clamp [0,1]
 ```
 
-The adaptation is **causal** (block `k` uses block `k−1`'s prices) and
-runs continuously from the dataset start (like the S3 rolling stats),
-so a sub-window inherits the right split state; a winsor-keyed
-prefix-sum cache (`_splitEffPrefix`) keeps the optimiser fast. All six
-params (`x₁ y₁ z₁` up, `x₂ y₂ z₂` down) are swept by the optimiser.
+`w` (cadence) and `y` (lookback) are **decoupled**: `w = 1` (the default)
+re-evaluates *every ISP* off a sliding `y`-ISP window — responsive *and*
+stable; `w = y` reproduces the original non-overlapping block behaviour.
+The adaptation is **causal** (each step uses only past prices) and runs
+continuously from the dataset start (like the S3 rolling stats), so a
+sub-window inherits the right split state; a winsor-keyed prefix-sum
+cache (`_splitEffPrefix`) keeps the optimiser fast. All eight params
+(`x₁ y₁ w₁ z₁` up, `x₂ y₂ w₂ z₂` down) are swept by the optimiser.
 
 **`z = 0` ⇒ the split never moves ⇒ static split at `x`** — the engine
 collapses to the pre-feature behaviour, so `x = 1, z = 0` (the default)
@@ -491,7 +495,7 @@ collapse to a neutral value):
 | **Reserve-up** (OFF)      | DA-offer coef (0.5), mFRR/aFRR split (1.0), min MW (0)      | min reserve price (0)    |
 | **Reserve-down** (OFF)    | DA-offer coef (0.5), mFRR/aFRR reserve split (1.0)          | min reserve price (0)    |
 | **DA-withhold** (ON)      | X (30 €/MWh), Y (1.0)                                       | —                        |
-| **Adaptive split** (ON)   | up x₁/y₁/z₁ + down x₂/y₂/z₂ = start 1.0 / window 96 ISPs / step 0.0 | —                |
+| **Adaptive split** (ON)   | up x₁/y₁/w₁/z₁ + down x₂/y₂/w₂/z₂ = start 1.0 / lookback 96 ISPs / wait 1 ISP / step 0.0 | —          |
 | **ID-trust** (ON)         | Z (1.0)                                                     | —                        |
 | **S3 oversell** (ON)      | K, S_min, σ_max, M                                          | X_cap, lag, DA-skip      |
 
@@ -577,10 +581,10 @@ stop-loss framing:
 ### Unified optimiser
 
 **One ⚡ Optimise button** sweeps every optimised parameter of the
-**enabled** strategies jointly. With all six on that's up to **18
+**enabled** strategies jointly. With all six on that's up to **20
 dimensions**: reserve-up `(ru_coef, ru_split, ru_min_mw)`, reserve-down
-`(r_coef, r_split)`, DA-withhold `(X, Y)`, adaptive split `(x₁, y₁, z₁,
-x₂, y₂, z₂)`, ID-trust `(Z)`, and S3 `(K, S_min, σ_max, M)`. Disabling a
+`(r_coef, r_split)`, DA-withhold `(X, Y)`, adaptive split `(x₁, y₁, w₁, z₁,
+x₂, y₂, w₂, z₂)`, ID-trust `(Z)`, and S3 `(K, S_min, σ_max, M)`. Disabling a
 strategy drops its dimensions; both min-reserve-prices,
 S3 `X_cap` / lag `L` / `DA_skip` are held at the user's values because
 they're physical / liquidity constraints, not strategy levers (see
@@ -798,7 +802,7 @@ winsor, θ_flat. New battery parameters:
 | Max power | 20 MW | inverter limit; grid-side `eMax = Pmax × 0.25 h` per ISP |
 | Round-trip efficiency | 90 % | `etaLeg = √η` applied each leg, grid-side |
 | Initial SoC | 50 % | SoC at the first ISP of the window (treated as zero-cost) |
-| Min time between direction change | 4 ISPs (1 h) | dwell gate on discretionary flips |
+| Min time between direction change | 4 ISPs (1 h) | cooldown/rest: ≥ this many idle ISPs since the last action before flipping to the OPPOSITE direction (measured from a block's END, so it forces a real break between phases; DA commitments exempt) |
 | Upper red zone | 80 % | stop placing new **charge** bids above this |
 | Lower red zone | 20 % | stop placing new discretionary **discharge** bids below this |
 | Min delta | 100 €/MWh | required round-trip margin per delivered MWh |
@@ -870,7 +874,7 @@ matching-day ISPs. Because the filter gates accumulation rather than the SoC
 
 | Strategy (default ON) | Optimised params (default) | Notes |
 | --------------------- | -------------------------- | ----- |
-| **mFRR↔aFRR adaptive split** | up x₁/y₁/z₁ + down x₂/y₂/z₂ = 1 / 96 / 0 | carried over verbatim from the wind park; routes balancing offers between mFRR and aFRR, adapting to the better-paying market. Static (step 0) = all-mFRR. |
+| **mFRR↔aFRR adaptive split** | up x₁/y₁/w₁/z₁ + down x₂/y₂/w₂/z₂ = 1 / 96 / 1 / 0 | carried over from the wind park; routes balancing offers between mFRR and aFRR, adapting to the better-paying market. Lookback `y` and cadence `w` are decoupled (w=1 → re-evaluate every ISP). Static (step 0) = all-mFRR. |
 | **Day-ahead arbitrage** | sell floor (100), buy-low ceiling (0), periods/day (8), MW/period (20) | committed a day ahead via the lag-96 forecast: discharge at the day's forecast **peaks** (clears if actual ≥ floor) and buy-low at the **troughs** (clears if actual ≤ ceiling, to pre-stock energy). 8×20 MW concentrates, 16×10 MW spreads. Whole-MW. |
 | **Dynamic charging (real-time)** | max charge price (20) | real-time refill from mFRR-dn / aFRR-dn / intraday (decidable near delivery). Balancing-down is routed by the adaptive **down split**, which shifts toward whichever pays MORE to absorb (most-negative) — the user's "DA lows are boring; balancing can go deeply negative" insight; a side is used only if its price ≤ the ceiling, with intraday as fallback. |
 | **Dynamic discharge pricing** | trend lookback (4), rising-trend threshold (20), max hold fraction (0.5) | holds back a fraction of discharge when the mFRR price trend is rising, to re-offer higher (the held MW shows as a **withdrawn** bid); also switches mFRR→aFRR when aFRR pays more. |
@@ -885,7 +889,7 @@ runs log as the wind-park page.
 ### Per-ISP decision order
 
 1. **Day-ahead** (committed a day ahead): discharge at a forecast peak (deliver from SoC; shortfall → imbalance) OR buy-low at a forecast trough.
-2. **Direction pick** for leftover power (discharge vs real-time charge), respecting the dwell gate (DA commitments are exempt).
+2. **Direction pick** for leftover power (discharge vs real-time charge), respecting the dwell cooldown — a flip to the opposite direction needs ≥ dwell idle ISPs since the last action, so opposite phases are separated by a real rest (DA commitments are exempt).
 3. **Discharge leg**: opportunistic divert (re-route DA energy to a balancing spike, close on intraday, keep the DA revenue) → dynamic hold-back → **up-split** routing to mFRR-up/aFRR-up.
 4. **Real-time charge leg**: route into mFRR-dn/aFRR-dn by the **down split** (each side price-gated), with intraday as fallback.
 

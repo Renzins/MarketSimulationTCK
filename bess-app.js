@@ -51,7 +51,7 @@
     },
     dwell_isps: {
       group: "setup", label: "Min time between direction change", unit: "ISPs (×15 min)", min: 0, max: 96, sliderStep: 1, numStep: 1, decimals: 0,
-      description: "Discretionary charge↔discharge flips are suppressed until this many ISPs have passed since the last flip (avoids whipsawing the battery). Committed balancing activations override it.",
+      description: "A cooldown/rest: after the last charge or discharge, the battery must idle at least this many ISPs before it may switch to the OPPOSITE direction (continuing the same direction is unconstrained). Measured from the end of a block, so it forces a genuine break between a discharge phase and the next charge phase. Day-ahead-committed sells/buys override it.",
       extremes: [["4 (default)", "1 hour"], ["0", "flip freely"], ["96", "at most one flip per day"]],
     },
     upper_red_pct: {
@@ -98,18 +98,24 @@
     s_up_start: { group: "split", label: "UP split — start x₁", unit: "0–1", min: 0, max: 1, sliderStep: 0.01, numStep: 0.05, decimals: 2,
       description: "Starting fraction of UPWARD (discharge) balancing MW routed to mFRR (rest to aFRR). Adapts every y₁ ISPs toward the better-paying market.",
       extremes: [["1", "start all discharge to mFRR"], ["0", "start all to aFRR"]] },
-    s_up_win: { group: "split", label: "UP rebalance window y₁", unit: "ISPs", min: 4, max: 672, sliderStep: 4, numStep: 4, decimals: 0,
-      description: "How often the upward split is re-evaluated. 96 = daily.",
-      extremes: [["4", "hourly"], ["96", "daily"], ["672", "weekly"]] },
+    s_up_win: { group: "split", label: "UP lookback window y₁", unit: "ISPs", min: 4, max: 672, sliderStep: 4, numStep: 4, decimals: 0,
+      description: "How far back the upward split looks when comparing markets (trailing y₁-ISP average). Lookback only — cadence is 'wait' below. 96 = one day.",
+      extremes: [["4", "1 h of history"], ["96", "one day"], ["672", "one week"]] },
+    s_up_wait: { group: "split", label: "UP rebalance wait w₁", unit: "ISPs", min: 1, max: 672, sliderStep: 1, numStep: 1, decimals: 0,
+      description: "How often the upward split is recomputed (cadence). 1 = every ISP off the trailing y₁-window. Decoupled from lookback; w₁ = y₁ reproduces the old block behaviour.",
+      extremes: [["1", "every ISP (default)"], ["96", "once a day"], ["= y₁", "old behaviour"]] },
     s_up_step: { group: "split", label: "UP step z₁", unit: "0–0.5", min: 0, max: 0.5, sliderStep: 0.01, numStep: 0.02, decimals: 2,
       description: "Shift toward the winning market per rebalance. 0 = static at x₁.",
       extremes: [["0", "static"], ["0.1", "10% per rebalance"]] },
     s_dn_start: { group: "split", label: "DOWN split — start x₂", unit: "0–1", min: 0, max: 1, sliderStep: 0.01, numStep: 0.05, decimals: 2,
       description: "Starting fraction of DOWNWARD (charge) balancing MW routed to mFRR-dn (rest to aFRR-dn). Independent of up.",
       extremes: [["1", "start all charge to mFRR-dn"], ["0", "start all to aFRR-dn"]] },
-    s_dn_win: { group: "split", label: "DOWN rebalance window y₂", unit: "ISPs", min: 4, max: 672, sliderStep: 4, numStep: 4, decimals: 0,
-      description: "How often the downward split is re-evaluated. 96 = daily.",
-      extremes: [["4", "hourly"], ["96", "daily"], ["672", "weekly"]] },
+    s_dn_win: { group: "split", label: "DOWN lookback window y₂", unit: "ISPs", min: 4, max: 672, sliderStep: 4, numStep: 4, decimals: 0,
+      description: "How far back the downward split looks (trailing y₂-ISP average). Lookback only; cadence is 'wait' below. 96 = one day.",
+      extremes: [["4", "1 h of history"], ["96", "one day"], ["672", "one week"]] },
+    s_dn_wait: { group: "split", label: "DOWN rebalance wait w₂", unit: "ISPs", min: 1, max: 672, sliderStep: 1, numStep: 1, decimals: 0,
+      description: "How often the downward split is recomputed (cadence). 1 = every ISP. Decoupled from lookback; w₂ = y₂ reproduces the old block behaviour.",
+      extremes: [["1", "every ISP (default)"], ["96", "once a day"], ["= y₂", "old behaviour"]] },
     s_dn_step: { group: "split", label: "DOWN step z₂", unit: "0–0.5", min: 0, max: 0.5, sliderStep: 0.01, numStep: 0.02, decimals: 2,
       description: "Shift toward the winning market per rebalance. 0 = static at x₂.",
       extremes: [["0", "static"], ["0.1", "10% per rebalance"]] },
@@ -153,7 +159,7 @@
       upper_red_pct: 80, lower_red_pct: 20, min_delta: 100, theta_flat: 30,
       w_mfrr_lo: 5, w_mfrr_hi: 95, w_imb_lo: 5, w_imb_hi: 95,
       w_afrr_pos_lo: 5, w_afrr_pos_hi: 95, w_afrr_neg_lo: 5, w_afrr_neg_hi: 95,
-      s_up_start: 1, s_up_win: 96, s_up_step: 0, s_dn_start: 1, s_dn_win: 96, s_dn_step: 0,
+      s_up_start: 1, s_up_win: 96, s_up_wait: 1, s_up_step: 0, s_dn_start: 1, s_dn_win: 96, s_dn_wait: 1, s_dn_step: 0,
       da_min_price: 100, da_charge_price: 0, da_n_periods: 8, da_mw: 20, max_charge_price: 20,
       dd_lookback: 4, dd_threshold: 20, dd_hold: 0.5, opp_threshold: 100,
     },
@@ -563,13 +569,17 @@
     const dims = [];
     const winRefine = [4, 8, 12, 24, 48, 96, 168, 288, 480, 672];
     const winSample = (rng) => 4 + 4 * Math.floor(rng() * 168);
+    const waitRefine = [1, 2, 4, 8, 12, 24, 48, 96, 168, 288, 480, 672];
+    const waitSample = (rng) => 1 + Math.floor(rng() * 672);
     const r100 = (rng) => Math.round(rng() * 100) / 100;
     if (state.enabled.split) {
       dims.push({ key: "s_up_start", sample: r100, refineValues: range01(0.02) });
       dims.push({ key: "s_up_win", sample: winSample, refineValues: winRefine });
+      dims.push({ key: "s_up_wait", sample: waitSample, refineValues: waitRefine });
       dims.push({ key: "s_up_step", sample: (rng) => Math.round(rng() * 50) / 100, refineValues: rangeArr(0, 0.5, 0.02) });
       dims.push({ key: "s_dn_start", sample: r100, refineValues: range01(0.02) });
       dims.push({ key: "s_dn_win", sample: winSample, refineValues: winRefine });
+      dims.push({ key: "s_dn_wait", sample: waitSample, refineValues: waitRefine });
       dims.push({ key: "s_dn_step", sample: (rng) => Math.round(rng() * 50) / 100, refineValues: rangeArr(0, 0.5, 0.02) });
     }
     if (state.enabled.daDischarge) {
@@ -662,7 +672,7 @@
   //  OPTIMISED RUNS LOG (per-tab sessionStorage)
   // =====================================================================
   const DAYTYPE_LABEL = { all: "All", "weekend-holiday": "Wknd+Hol", workday: "Workday" };
-  const OPTIM_RUNS_KEY = "tck.bessOptimRuns.v1";
+  const OPTIM_RUNS_KEY = "tck.bessOptimRuns.v2";
   function nowClock() { const d = new Date(); const p2 = (x) => String(x).padStart(2, "0"); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; }
 
   function recordOptimRun(best, ms) {
@@ -684,7 +694,7 @@
     if (!raw) return;
     try { const arr = JSON.parse(raw); if (Array.isArray(arr)) state.optimRuns = arr; } catch (_) {}
   }
-  const OPTIM_HEADER = ["#", "Time", "Range", "Days", "Strategies", "Split↑ x/y/z", "Split↓ x/y/z", "DA sell/buy/n/MW", "Max chg €", "DynDis lb/thr/hold", "Opp €", "Revenue", "€/MWh", "Cycles"];
+  const OPTIM_HEADER = ["#", "Time", "Range", "Days", "Strategies", "Split↑ x/y/w/z", "Split↓ x/y/w/z", "DA sell/buy/n/MW", "Max chg €", "DynDis lb/thr/hold", "Opp €", "Revenue", "€/MWh", "Cycles"];
   function renderOptimRuns() {
     const table = document.getElementById("optim-runs-table");
     if (!table) return;
@@ -698,8 +708,8 @@
       const strategies = chip(en.split, "SP") + chip(en.daDischarge, "DA") + chip(en.charging, "CH") + chip(en.dynamicDischarge, "DD") + chip(en.opportunistic, "OP");
       const cells = [
         r.n, r.when, `${isoToEU(r.from)}<br>${isoToEU(r.to)}`, DAYTYPE_LABEL[r.dayType] || r.dayType, strategies,
-        en.split ? `${num(p.s_up_start, 2)}/${num(p.s_up_win)}/${num(p.s_up_step, 2)}` : dash,
-        en.split ? `${num(p.s_dn_start, 2)}/${num(p.s_dn_win)}/${num(p.s_dn_step, 2)}` : dash,
+        en.split ? `${num(p.s_up_start, 2)}/${num(p.s_up_win)}/${num(p.s_up_wait)}/${num(p.s_up_step, 2)}` : dash,
+        en.split ? `${num(p.s_dn_start, 2)}/${num(p.s_dn_win)}/${num(p.s_dn_wait)}/${num(p.s_dn_step, 2)}` : dash,
         en.daDischarge ? `${num(p.da_min_price)}/${num(p.da_charge_price)}/${num(p.da_n_periods)}/${num(p.da_mw)}` : dash,
         en.charging ? num(p.max_charge_price) : dash,
         en.dynamicDischarge ? `${num(p.dd_lookback)}/${num(p.dd_threshold)}/${num(p.dd_hold, 2)}` : dash,

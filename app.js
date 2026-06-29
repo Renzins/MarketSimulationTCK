@@ -360,7 +360,7 @@
     },
     s_up_win: {
       group: "split",
-      label: "UP rebalance window y₁",
+      label: "UP lookback window y₁",
       unit: "ISPs",
       min: 4,
       max: 672,
@@ -368,11 +368,28 @@
       numStep: 4,
       decimals: 0,
       description:
-        "How often (in 15-min ISPs) the upward split is re-evaluated. At each boundary, the average per-MW mFRR-up rate (P_mfrr when it clears up, ≥1) and aFRR-up rate (avg AST_POS) over the previous y₁ ISPs are compared; the winner pulls the split. 96 = once per day.",
+        "How far back the upward split looks when comparing markets: the average per-MW mFRR-up rate (P_mfrr when it clears up, ≥1) and aFRR-up rate (avg AST_POS) over the trailing y₁ ISPs. This is the LOOKBACK only — how OFTEN it re-evaluates is the separate 'wait' below. 96 = one day of history.",
       extremes: [
-        ["y₁ = 4", "rebalance hourly (very reactive)"],
-        ["y₁ = 96", "daily (default)"],
-        ["y₁ = 672", "weekly (slow)"],
+        ["y₁ = 4", "look back 1 hour (very reactive, noisy)"],
+        ["y₁ = 96", "one day of history (default)"],
+        ["y₁ = 672", "one week of history (smooth)"],
+      ],
+    },
+    s_up_wait: {
+      group: "split",
+      label: "UP rebalance wait w₁",
+      unit: "ISPs",
+      min: 1,
+      max: 672,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "How OFTEN the upward split is recomputed (the cadence), in ISPs. 1 = re-evaluate every ISP off the trailing y₁-window; larger = act less often. Decoupled from the lookback y₁: w₁ = 1 with a long y₁ is responsive yet stable; setting w₁ = y₁ reproduces the old block behaviour.",
+      extremes: [
+        ["w₁ = 1", "recompute every ISP (default)"],
+        ["w₁ = 96", "recompute once a day"],
+        ["w₁ = y₁", "old behaviour (cadence = lookback)"],
       ],
     },
     s_up_step: {
@@ -409,7 +426,7 @@
     },
     s_dn_win: {
       group: "split",
-      label: "DOWN rebalance window y₂",
+      label: "DOWN lookback window y₂",
       unit: "ISPs",
       min: 4,
       max: 672,
@@ -417,11 +434,28 @@
       numStep: 4,
       decimals: 0,
       description:
-        "How often the downward split is re-evaluated, comparing the avg per-MW mFRR-dn rate (−P_mfrr when it clears down) vs aFRR-dn rate (−avg AST_NEG) over the previous y₂ ISPs. 96 = daily.",
+        "How far back the downward split looks: the trailing y₂-ISP average per-MW mFRR-dn rate (−P_mfrr when it clears down) vs aFRR-dn rate (−avg AST_NEG). Lookback only; cadence is 'wait' below. 96 = one day.",
       extremes: [
-        ["y₂ = 4", "hourly"],
-        ["y₂ = 96", "daily (default)"],
-        ["y₂ = 672", "weekly"],
+        ["y₂ = 4", "1 hour of history"],
+        ["y₂ = 96", "one day (default)"],
+        ["y₂ = 672", "one week"],
+      ],
+    },
+    s_dn_wait: {
+      group: "split",
+      label: "DOWN rebalance wait w₂",
+      unit: "ISPs",
+      min: 1,
+      max: 672,
+      sliderStep: 1,
+      numStep: 1,
+      decimals: 0,
+      description:
+        "How often the downward split is recomputed (cadence), in ISPs. 1 = every ISP off the trailing y₂-window. Decoupled from the lookback y₂; w₂ = y₂ reproduces the old block behaviour.",
+      extremes: [
+        ["w₂ = 1", "recompute every ISP (default)"],
+        ["w₂ = 96", "recompute once a day"],
+        ["w₂ = y₂", "old behaviour"],
       ],
     },
     s_dn_step: {
@@ -588,9 +622,11 @@
       w_res_afrr_hi: 95,
       s_up_start: 1.0,
       s_up_win: 96,
+      s_up_wait: 1,
       s_up_step: 0.0,
       s_dn_start: 1.0,
       s_dn_win: 96,
+      s_dn_wait: 1,
       s_dn_step: 0.0,
       w_mfrr_lo: 5,
       w_mfrr_hi: 95,
@@ -1389,17 +1425,22 @@
       });
     }
     if (state.enabled.split) {
-      // Adaptive split: start (0–1), window (4–672 ISPs), step (0–0.5), per dir.
+      // Adaptive split per direction: start (0–1), lookback win (4–672 ISPs),
+      // wait/cadence (1–672 ISPs), step (0–0.5).
       const startSample = (rng) => Math.round(rng() * 100) / 100;
       const winSample = (rng) => 4 + 4 * Math.floor(rng() * 168);
       const winRefine = [4, 8, 12, 24, 48, 96, 168, 288, 480, 672];
+      const waitSample = (rng) => 1 + Math.floor(rng() * 672);
+      const waitRefine = [1, 2, 4, 8, 12, 24, 48, 96, 168, 288, 480, 672];
       const stepSample = (rng) => Math.round(rng() * 50) / 100;
       const stepRefine = rangeArr(0, 0.5, 0.02);
       dims.push({ key: "s_up_start", sample: startSample, refineValues: range01(0.02) });
       dims.push({ key: "s_up_win", sample: winSample, refineValues: winRefine });
+      dims.push({ key: "s_up_wait", sample: waitSample, refineValues: waitRefine });
       dims.push({ key: "s_up_step", sample: stepSample, refineValues: stepRefine });
       dims.push({ key: "s_dn_start", sample: startSample, refineValues: range01(0.02) });
       dims.push({ key: "s_dn_win", sample: winSample, refineValues: winRefine });
+      dims.push({ key: "s_dn_wait", sample: waitSample, refineValues: waitRefine });
       dims.push({ key: "s_dn_step", sample: stepSample, refineValues: stepRefine });
     }
     if (state.enabled.idTrust) {
@@ -1635,9 +1676,11 @@
         Y: p.Y,
         s_up_start: p.s_up_start,
         s_up_win: p.s_up_win,
+        s_up_wait: p.s_up_wait,
         s_up_step: p.s_up_step,
         s_dn_start: p.s_dn_start,
         s_dn_win: p.s_dn_win,
+        s_dn_wait: p.s_dn_wait,
         s_dn_step: p.s_dn_step,
         Z: p.Z,
         s3_K: p.s3_K,
@@ -1659,7 +1702,7 @@
     "#", "Time", "Range", "Days", "Strategies",
     "RUp coef", "RUp split", "RUp minMW", "RUp min€",
     "RDn coef", "RDn split", "RDn min€",
-    "X", "Y", "Split↑ x/y/z", "Split↓ x/y/z", "Z",
+    "X", "Y", "Split↑ x/y/w/z", "Split↓ x/y/w/z", "Z",
     "S3 K", "S3 S_min", "S3 σ_max", "S3 M", "S3 cap/lag/skip",
     "θ", "Sources", "Winsor m/i/+/−", "Revenue", "Δ vs naïve",
   ];
@@ -1667,7 +1710,7 @@
   // Per-tab persistence (sessionStorage): survives navigating to Graphs /
   // Forecast and back, clears on tab close. Bump the version suffix if the
   // run-row shape changes so a stale cache can't render wrong.
-  const OPTIM_RUNS_KEY = "tck.optimRuns.v4";
+  const OPTIM_RUNS_KEY = "tck.optimRuns.v5";
   function saveOptimRuns() {
     try {
       sessionStorage.setItem(OPTIM_RUNS_KEY, JSON.stringify(state.optimRuns));
@@ -1729,8 +1772,8 @@
           en.reserve ? num(p.r_min_price) : dash,
           en.daWithhold ? num(p.X) : dash,
           en.daWithhold ? num(p.Y, 2) : dash,
-          en.split ? `${num(p.s_up_start, 2)}/${num(p.s_up_win)}/${num(p.s_up_step, 2)}` : dash,
-          en.split ? `${num(p.s_dn_start, 2)}/${num(p.s_dn_win)}/${num(p.s_dn_step, 2)}` : dash,
+          en.split ? `${num(p.s_up_start, 2)}/${num(p.s_up_win)}/${num(p.s_up_wait)}/${num(p.s_up_step, 2)}` : dash,
+          en.split ? `${num(p.s_dn_start, 2)}/${num(p.s_dn_win)}/${num(p.s_dn_wait)}/${num(p.s_dn_step, 2)}` : dash,
           en.idTrust ? num(p.Z, 2) : dash,
           en.s3 ? num(p.s3_K) : dash,
           en.s3 ? num(p.s3_S_min) : dash,

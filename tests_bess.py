@@ -44,8 +44,8 @@ E4 = 0.25  # hours per ISP
 # Cross-checked against the browser JS (BessEngine) at the default config over
 # the full dataset. Re-freeze after any engine change (the test prints the value).
 # Cross-checked against the browser JS (BessEngine) at the default config over
-# the full dataset (opportunistic divert is mFRR-up only).
-FROZEN_DEFAULT_REVENUE_EUR = 2944157.09
+# the full dataset. (Dwell is a cooldown/rest measured from the last action.)
+FROZEN_DEFAULT_REVENUE_EUR = 2896808.88
 
 
 # =============================================================================
@@ -220,6 +220,8 @@ def resolve_params(params):
         s_dn_start=c01(num("s_dn_start", 1)) if split_on else 1.0,
         s_up_win=max(1, int(params.get("s_up_win", 96) or 96)),
         s_dn_win=max(1, int(params.get("s_dn_win", 96) or 96)),
+        s_up_wait=max(1, int(params.get("s_up_wait", 1) or 1)),
+        s_dn_wait=max(1, int(params.get("s_dn_wait", 1) or 1)),
         s_up_step=(c01(num("s_up_step", 0)) if split_on else 0.0),
         s_dn_step=(c01(num("s_dn_step", 0)) if split_on else 0.0),
         daOn=da_on, da_min_price=num("da_min_price", 100), da_charge_price=num("da_charge_price", 0),
@@ -233,15 +235,17 @@ def resolve_params(params):
     )
 
 
-def _split_blocks(start, win, step, fxM, fxA, upto, n):
-    w = 1 if win < 1 else int(win)
-    nB = max(1, (max(1, upto) - 1) // w + 1)
+def _split_blocks(start, win, step, wait, fxM, fxA, upto, n):
+    lb = 1 if win < 1 else int(win)    # lookback length
+    wt = 1 if wait < 1 else int(wait)  # cadence (segment length)
+    nB = max(1, (max(1, upto) - 1) // wt + 1)
     blocks = np.zeros(nB)
     s = 0.0 if start < 0 else (1.0 if start > 1 else start)
     blocks[0] = s
     for k in range(1, nB):
         if step > 0:
-            lo, hi = (k - 1) * w, min(k * w, n)
+            boundary = k * wt
+            lo, hi = max(0, boundary - lb), min(boundary, n)
             cnt = hi - lo
             if cnt > 0:
                 am = (fxM[hi] - fxM[lo]) / cnt
@@ -252,7 +256,7 @@ def _split_blocks(start, win, step, fxM, fxA, upto, n):
                     s -= step
                 s = 0.0 if s < 0 else (1.0 if s > 1 else s)
         blocks[k] = s
-    return blocks, w
+    return blocks, wt
 
 
 def resolve_split(p, we, A):
@@ -268,8 +272,8 @@ def resolve_split(p, we, A):
         pDM[i + 1] = pDM[i] + (-m if m <= -1 else 0)
         pUA[i + 1] = pUA[i] + (a if a > 0 else 0)
         pDA[i + 1] = pDA[i] + (-b if b < 0 else 0)
-    up, upW = _split_blocks(p["s_up_start"], p["s_up_win"], p["s_up_step"], pUM, pUA, we, n)
-    dn, dnW = _split_blocks(p["s_dn_start"], p["s_dn_win"], p["s_dn_step"], pDM, pDA, we, n)
+    up, upW = _split_blocks(p["s_up_start"], p["s_up_win"], p["s_up_step"], p["s_up_wait"], pUM, pUA, we, n)
+    dn, dnW = _split_blocks(p["s_dn_start"], p["s_dn_win"], p["s_dn_step"], p["s_dn_wait"], pDM, pDA, we, n)
     return up, upW, dn, dnW
 
 
@@ -293,7 +297,7 @@ def bess_run(A, params):
     ceiling = p["max_charge_price"]
     filtering = p["dayTypeFilter"] != "all"
 
-    soc, cb, mode, last_flip = p["socInit"], 0.0, 0, -(1 << 20)
+    soc, cb, actMode, lastActISP = p["socInit"], 0.0, 0, -(1 << 20)
     total = 0.0
     b = dict(DA=0.0, mFRR_up=0.0, aFRR_up=0.0, mFRR_dn=0.0, aFRR_dn=0.0, intraday=0.0, charge=0.0, imb=0.0, flat=0.0)
     c = dict(discharge=0, charge=0, idle=0, daCleared=0, upMfrr=0, upAfrr=0, dnMfrr=0, dnAfrr=0,
@@ -366,22 +370,24 @@ def bess_run(A, params):
 
         dischargeOK = soc > loRed + EPS and budgetMW >= 1 and bestUp > -math.inf and bestUp >= effCost + minDelta
         chargeOK = soc < hiRed - EPS and budgetMW >= 1 and anyChgU
-        can_flip = lambda want: mode == 0 or mode == want or (i - last_flip) >= dwell
+        # cooldown rest measured from the last action (block END), not flip start
+        in_cooldown = (i - lastActISP) < dwell
+        rest_ok = lambda want: actMode == 0 or actMode == want or not in_cooldown
 
         if da_charge_committed:
             pass
         elif dir_ == 1:
             pass
         elif dischargeOK and chargeOK:
-            if mode == -1 and (i - last_flip) < dwell:
+            if actMode == -1 and in_cooldown:
                 dir_ = -1
-            elif mode == 1 and (i - last_flip) < dwell:
+            elif actMode == 1 and in_cooldown:
                 dir_ = 1
             else:
                 dir_ = 1 if (bestUp - effCost) >= (ceiling - bestChg) else -1
-        elif dischargeOK and can_flip(1):
+        elif dischargeOK and rest_ok(1):
             dir_ = 1
-        elif chargeOK and can_flip(-1):
+        elif chargeOK and rest_ok(-1):
             dir_ = -1
 
         # 3a. discharge leg (not budget-gated: opportunistic redirects already-
@@ -469,9 +475,9 @@ def bess_run(A, params):
         netDis = daSellMW + upMmw + upAmw
         netChg = dnMmw + dnAmw + chgOtherMW
         ispDir = 1 if netDis > 1e-6 else (-1 if netChg > 1e-6 else 0)
-        if ispDir != 0 and ispDir != mode:
-            last_flip = i
-            mode = ispDir
+        if ispDir != 0:  # anchor the cooldown on every action (block END)
+            lastActISP = i
+            actMode = ispDir
 
         socs.append(soc); revs.append(rev)
         daSells.append(daSellMW); upMs.append(upMmw); dnMs.append(dnMmw); chgOs.append(chgOtherMW)
@@ -541,7 +547,7 @@ def real_ctx():
 DEFAULT_PARAMS = dict(
     cap_mwh=40, power_mw=20, eff_pct=90, init_soc_pct=50, dwell_isps=4,
     upper_red_pct=80, lower_red_pct=20, min_delta=100, theta_flat=30,
-    s_up_start=1, s_up_win=96, s_up_step=0, s_dn_start=1, s_dn_win=96, s_dn_step=0,
+    s_up_start=1, s_up_win=96, s_up_wait=1, s_up_step=0, s_dn_start=1, s_dn_win=96, s_dn_wait=1, s_dn_step=0,
     da_min_price=100, da_charge_price=0, da_n_periods=8, da_mw=20, max_charge_price=20,
     dd_lookback=4, dd_threshold=20, dd_hold=0.5, opp_threshold=100,
     enabled=dict(split=True, daDischarge=True, charging=True, dynamicDischarge=True, opportunistic=True),
@@ -625,6 +631,27 @@ def test_dwell_blocks_fast_flip():
     p = dict(DEFAULT_PARAMS, init_soc_pct=50, dwell_isps=4, min_delta=0, da_n_periods=0, max_charge_price=20,
              enabled=dict(split=False, daDischarge=False, charging=True, dynamicDischarge=False, opportunistic=False))
     assert bess_run(A, p)["mwhDischarged"] == 0
+
+
+def test_dwell_enforces_rest_between_opposite_phases():
+    """The dwell is a COOLDOWN measured from the last action (block END): after a
+    discharge block, the battery must idle >= dwell ISPs before it may start
+    charging, even when charging is immediately attractive."""
+    n = 10
+    pm = np.array([300.0, 300, 300, 300, -50, -50, -50, -50, -50, -50])
+    A = synth(n, p_mfrr=pm)
+    p = dict(DEFAULT_PARAMS, init_soc_pct=100, dwell_isps=4, min_delta=0, da_n_periods=0, max_charge_price=20,
+             enabled=dict(split=False, daDischarge=False, charging=True, dynamicDischarge=False, opportunistic=False))
+    r = bess_run(A, p)
+    dis = [k for k in range(n) if r["upM"][k] > 1e-6]       # discharge ISPs
+    chg = [k for k in range(n) if r["dnM"][k] > 1e-6]       # charge ISPs
+    assert dis and chg, "scenario should both discharge then charge"
+    last_dis, first_chg = max(dis), min(chg)
+    assert first_chg - last_dis >= 4, (
+        f"charge started {first_chg - last_dis} ISPs after last discharge; "
+        f"expected a >= dwell (4) rest. dis={dis} chg={chg}"
+    )
+    assert first_chg > last_dis + 1, "there must be idle ISPs (a real break) between the phases"
 
 
 def test_must_fulfil_no_soc_violation_random():
@@ -755,6 +782,7 @@ R.add("whole-MW: daSell / mFRR / charge volumes are integers", test_whole_mw_mar
 R.add("min-delta gate blocks thin discharge, passes above gate", test_min_delta_blocks_thin_discharge)
 R.add("red zones bound discretionary discharge at the lower red", test_red_zones_bound_discretionary)
 R.add("dwell-time suppresses a discharge right after a charge", test_dwell_blocks_fast_flip)
+R.add("dwell enforces a real rest (>= dwell idle ISPs) between opposite phases", test_dwell_enforces_rest_between_opposite_phases)
 R.add("must-fulfil: SoC never sized out of [0, cap] over random prices", test_must_fulfil_no_soc_violation_random)
 R.add("price-aware charging skips an above-ceiling side, uses the usable one", test_charge_price_aware_skips_above_ceiling)
 R.add("day-ahead buy-low fires at a committed forecast trough", test_da_buy_low_committed_at_trough)

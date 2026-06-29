@@ -250,8 +250,17 @@ const Charts = (() => {
       const isDn = D.p_mfrr[i] <= -1;
       upMfrrActive[k] = isUp ? Q_up_mfrr : 0;
       dnMfrrActive[k] = -(isDn ? Q_dn_mfrr : 0);
-      upAfrrOffered[k] = Q_up_afrr;
-      dnAfrrOffered[k] = Q_dn_afrr;
+      // Offered aFRR MW: read the engine's TRUE offered volume. The local
+      // split reconstruction (Q_up_afrr) double-applies the split whenever the
+      // same-direction mFRR leg didn't clear (Q_up then already holds the aFRR
+      // portion alone), which under-shows "offered". Fall back to it only if an
+      // older engine build lacks the explicit arrays.
+      upAfrrOffered[k] = simResult.perISP.Q_up_afrr_off
+        ? simResult.perISP.Q_up_afrr_off[k_p]
+        : Q_up_afrr;
+      dnAfrrOffered[k] = simResult.perISP.Q_dn_afrr_off
+        ? simResult.perISP.Q_dn_afrr_off[k_p]
+        : Q_dn_afrr;
       upAfrrDisp[k] = simResult.perISP.Q_up_afrr_disp
         ? simResult.perISP.Q_up_afrr_disp[k_p]
         : 0;

@@ -544,18 +544,26 @@ const Engine = (() => {
     return _splitFx;
   }
 
-  // Block-constant split sequence over [0, upto). Block 0 = start; each later
-  // block steps the split toward whichever market had the higher average rate
-  // in the PREVIOUS block (causal — no lookahead). Returns { blocks, w }.
-  function _splitBlocks(start, win, step, fxM, fxA, upto) {
-    const w = win < 1 ? 1 : win | 0;
-    const nB = Math.max(1, Math.floor((Math.max(1, upto) - 1) / w) + 1);
+  // Piecewise-constant split sequence over [0, upto). The split is held for a
+  // segment of `wait` ISPs (the rebalance CADENCE), then at each segment
+  // boundary it steps toward whichever market had the higher average per-MW
+  // rate over the trailing `win` ISPs (the LOOKBACK window) — causal, no
+  // lookahead. `wait` and `win` are decoupled: wait=1 re-evaluates every ISP
+  // off a sliding win-ISP window; wait=win reproduces the old non-overlapping
+  // block behaviour exactly. Returns { blocks, w } where w is the SEGMENT
+  // length (cadence) used to index blocks (SP.up[(i/w)|0]).
+  function _splitBlocks(start, win, step, wait, fxM, fxA, upto) {
+    const lb = win < 1 ? 1 : win | 0; // lookback length
+    const wt = wait < 1 ? 1 : wait | 0; // cadence (segment length)
+    const nB = Math.max(1, Math.floor((Math.max(1, upto) - 1) / wt) + 1);
     const blocks = new Float64Array(nB);
     let s = start < 0 ? 0 : start > 1 ? 1 : start;
     blocks[0] = s;
     for (let k = 1; k < nB; k++) {
       if (step > 0) {
-        const lo = (k - 1) * w, hi = Math.min(k * w, D.n);
+        const boundary = k * wt; // ISP at the start of segment k
+        const lo = boundary - lb < 0 ? 0 : boundary - lb; // trailing lookback start
+        const hi = boundary < D.n ? boundary : D.n;
         const cnt = hi - lo;
         if (cnt > 0) {
           const am = (fxM[hi] - fxM[lo]) / cnt;
@@ -568,7 +576,7 @@ const Engine = (() => {
       }
       blocks[k] = s;
     }
-    return { blocks, w };
+    return { blocks, w: wt };
   }
 
   // Build the up/down block-split sequences for the current window (or two
@@ -578,8 +586,8 @@ const Engine = (() => {
       return { up: [1], upW: Math.max(1, winEnd || 1), dn: [1], dnW: Math.max(1, winEnd || 1) };
     }
     const fx = _splitEffPrefix();
-    const u = _splitBlocks(p.s_up_start, p.s_up_win, p.s_up_step, fx.pUM, fx.pUA, winEnd);
-    const v = _splitBlocks(p.s_dn_start, p.s_dn_win, p.s_dn_step, fx.pDM, fx.pDA, winEnd);
+    const u = _splitBlocks(p.s_up_start, p.s_up_win, p.s_up_step, p.s_up_wait, fx.pUM, fx.pUA, winEnd);
+    const v = _splitBlocks(p.s_dn_start, p.s_dn_win, p.s_dn_step, p.s_dn_wait, fx.pDM, fx.pDA, winEnd);
     return { up: u.blocks, upW: u.w, dn: v.blocks, dnW: v.w };
   }
 
@@ -628,6 +636,10 @@ const Engine = (() => {
       s_dn_start: split ? clamp01(sDnStart) : 1,
       s_up_win: Math.max(1, (params.s_up_win | 0) || 96),
       s_dn_win: Math.max(1, (params.s_dn_win | 0) || 96),
+      // rebalance cadence (ISPs between recomputes); 1 = every ISP. Decoupled
+      // from the lookback window above. wait = win reproduces the old behaviour.
+      s_up_wait: Math.max(1, (params.s_up_wait | 0) || 1),
+      s_dn_wait: Math.max(1, (params.s_dn_wait | 0) || 1),
       s_up_step: split ? clampStep(+params.s_up_step || 0) : 0,
       s_dn_step: split ? clampStep(+params.s_dn_step || 0) : 0,
       actualSource: params.actualSource || "real",
@@ -676,6 +688,13 @@ const Engine = (() => {
     const Q_dn = new Float32Array(wLen);
     const Q_up_afrr_disp = new Float32Array(wLen);
     const Q_dn_afrr_disp = new Float32Array(wLen);
+    // aFRR OFFERED MW per direction (whole-MW). Stored explicitly so the chart
+    // tooltip never has to reconstruct the split from Q_up/Q_dn — that
+    // reconstruction double-applies the split when the same-direction mFRR leg
+    // didn't clear (Q_up then already equals the aFRR portion alone), which
+    // under-showed "offered". Dispatched stays Q_*_afrr_disp = offered × n_*_fav/225.
+    const Q_up_afrr_off = new Float32Array(wLen);
+    const Q_dn_afrr_off = new Float32Array(wLen);
     const Q_s3_intraday = new Float32Array(wLen);
     const Q_s3_curtail = new Float32Array(wLen);
     const Q_short = new Float32Array(wLen);
@@ -890,6 +909,8 @@ const Engine = (() => {
       reserveUpRev[k] = reserve_up_rate * 0.25;
       Q_up[k] = up_mfrr + Q_up_afrr;
       Q_dn[k] = dn_mfrr + Q_dn_afrr;
+      Q_up_afrr_off[k] = Q_up_afrr; // true aFRR-up MW offered (whole-MW)
+      Q_dn_afrr_off[k] = Q_dn_afrr; // true aFRR-dn MW offered
       Q_s3_intraday[k] = s3_X;
       Q_s3_curtail[k] = s3_fires ? s3_X : 0;
       Q_short[k] = short;
@@ -951,6 +972,8 @@ const Engine = (() => {
         Q_dn,
         Q_up_afrr_disp,
         Q_dn_afrr_disp,
+        Q_up_afrr_off,
+        Q_dn_afrr_off,
         Q_s3_intraday,
         Q_s3_curtail,
         Q_short,

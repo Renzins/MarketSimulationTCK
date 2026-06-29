@@ -153,16 +153,23 @@ const BessEngine = (() => {
     return _splitFx;
   }
 
-  function _splitBlocks(start, win, step, fxM, fxA, upto) {
-    const w = win < 1 ? 1 : win | 0;
-    const nB = Math.max(1, Math.floor((Math.max(1, upto) - 1) / w) + 1);
+  // The split is held for `wait` ISPs (rebalance CADENCE), then steps toward the
+  // better-paying market over the trailing `win` ISPs (LOOKBACK). wait and win
+  // are decoupled: wait=1 re-evaluates every ISP off a sliding win-window;
+  // wait=win reproduces the old non-overlapping block behaviour. Returned w is
+  // the segment length (cadence) used to index blocks.
+  function _splitBlocks(start, win, step, wait, fxM, fxA, upto) {
+    const lb = win < 1 ? 1 : win | 0; // lookback length
+    const wt = wait < 1 ? 1 : wait | 0; // cadence (segment length)
+    const nB = Math.max(1, Math.floor((Math.max(1, upto) - 1) / wt) + 1);
     const blocks = new Float64Array(nB);
     let s = start < 0 ? 0 : start > 1 ? 1 : start;
     blocks[0] = s;
     for (let k = 1; k < nB; k++) {
       if (step > 0) {
-        const lo = (k - 1) * w,
-          hi = Math.min(k * w, D.n);
+        const boundary = k * wt;
+        const lo = boundary - lb < 0 ? 0 : boundary - lb;
+        const hi = boundary < D.n ? boundary : D.n;
         const cnt = hi - lo;
         if (cnt > 0) {
           const am = (fxM[hi] - fxM[lo]) / cnt;
@@ -175,7 +182,7 @@ const BessEngine = (() => {
       }
       blocks[k] = s;
     }
-    return { blocks, w };
+    return { blocks, w: wt };
   }
 
   function _resolveSplit(p, winEnd) {
@@ -184,8 +191,8 @@ const BessEngine = (() => {
       return { up: [1], upW: w, dn: [1], dnW: w };
     }
     const fx = _ensureSplitFx();
-    const u = _splitBlocks(p.s_up_start, p.s_up_win, p.s_up_step, fx.pUM, fx.pUA, winEnd);
-    const v = _splitBlocks(p.s_dn_start, p.s_dn_win, p.s_dn_step, fx.pDM, fx.pDA, winEnd);
+    const u = _splitBlocks(p.s_up_start, p.s_up_win, p.s_up_step, p.s_up_wait, fx.pUM, fx.pUA, winEnd);
+    const v = _splitBlocks(p.s_dn_start, p.s_dn_win, p.s_dn_step, p.s_dn_wait, fx.pDM, fx.pDA, winEnd);
     return { up: u.blocks, upW: u.w, dn: v.blocks, dnW: v.w };
   }
 
@@ -217,6 +224,8 @@ const BessEngine = (() => {
       s_dn_start: splitOn ? clamp01(num(params.s_dn_start, 1)) : 1,
       s_up_win: Math.max(1, (params.s_up_win | 0) || 96),
       s_dn_win: Math.max(1, (params.s_dn_win | 0) || 96),
+      s_up_wait: Math.max(1, (params.s_up_wait | 0) || 1), // cadence (ISPs); 1 = every ISP
+      s_dn_wait: Math.max(1, (params.s_dn_wait | 0) || 1),
       s_up_step: splitOn ? clamp01(num(params.s_up_step, 0)) : 0,
       s_dn_step: splitOn ? clamp01(num(params.s_dn_step, 0)) : 0,
       daOn,
@@ -268,8 +277,13 @@ const BessEngine = (() => {
 
     let soc = p.socInit;
     let cb = 0;
-    let mode = 0;
-    let lastFlip = -1 << 20;
+    // Dwell COOLDOWN state: actMode = direction of the most recent action
+    // (+1 discharge / −1 charge / 0 none yet); lastActISP = the ISP it happened.
+    // A discretionary flip to the opposite direction needs `dwell` idle ISPs
+    // since the last action — i.e. a genuine rest/break between opposite phases
+    // (measured from the END of a block, not its start).
+    let actMode = 0;
+    let lastActISP = -1 << 20;
 
     let total = 0;
     let bDA = 0, bUpM = 0, bUpA = 0, bDnM = 0, bDnA = 0, bID = 0, bChg = 0, bImb = 0, bFlat = 0;
@@ -357,19 +371,25 @@ const BessEngine = (() => {
 
       const dischargeOK = soc > loRed + EPS && budgetMW >= 1 && bestUp > -Infinity && bestUp >= effCost + minDelta;
       const chargeOK = soc < hiRed - EPS && budgetMW >= 1 && anyChgUsable;
-      const canFlipTo = (want) => mode === 0 || mode === want || i - lastFlip >= dwell;
+      // Cooldown: a flip to the opposite of the LAST action's direction needs
+      // `dwell` idle ISPs since that action. Same direction (or none yet) is
+      // always allowed; the rest is measured from the last action (block END).
+      const inCooldown = i - lastActISP < dwell;
+      const restOK = (want) => actMode === 0 || actMode === want || !inCooldown;
 
       if (daChargeCommitted) {
         // committed DA charge — no extra discretionary action this ISP
       } else if (dir === 1) {
         // DA discharge already set; extra discharge handled below
       } else if (dischargeOK && chargeOK) {
-        if (mode === -1 && i - lastFlip < dwell) dir = -1;
-        else if (mode === 1 && i - lastFlip < dwell) dir = 1;
+        // both attractive: while still cooling down, continue the last
+        // direction (no flip); once the rest has elapsed, take the better side.
+        if (actMode === -1 && inCooldown) dir = -1;
+        else if (actMode === 1 && inCooldown) dir = 1;
         else dir = bestUp - effCost >= ceiling - bestChg ? 1 : -1;
-      } else if (dischargeOK && canFlipTo(1)) {
+      } else if (dischargeOK && restOK(1)) {
         dir = 1;
-      } else if (chargeOK && canFlipTo(-1)) {
+      } else if (chargeOK && restOK(-1)) {
         dir = -1;
       }
 
@@ -491,9 +511,11 @@ const BessEngine = (() => {
       const netDis = daSellMW + upMmw + upAmw;
       const netChg = dnMmw + dnAmw + chgOtherMW;
       const ispDir = netDis > 1e-6 ? 1 : netChg > 1e-6 ? -1 : 0;
-      if (ispDir !== 0 && ispDir !== mode) {
-        lastFlip = i;
-        mode = ispDir;
+      // Update the cooldown anchor on EVERY action (not only on a change), so
+      // the rest is measured from the END of a block. Idle ISPs leave it be.
+      if (ispDir !== 0) {
+        lastActISP = i;
+        actMode = ispDir;
       }
 
       if (detail) {
