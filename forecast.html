@@ -13,6 +13,7 @@
       <a href="bess.html" class="navlink">Backtester - BESS</a>
       <a href="graphs.html" class="navlink">Graphs</a>
       <a href="forecast.html" class="navlink active">Forecast</a>
+      <a href="bids.html" class="navlink">Bid data</a>
     </nav>
 
     <header class="site-header">
@@ -124,10 +125,16 @@
             <h2>Expected imbalance price</h2>
           </div>
           <p class="card-desc">
-            Per-horizon model-weighted expected price (solid line) plus
-            the calendar-only baseline (dashed) for reference. The gap
-            between them is the value the model adds beyond what a
-            no-model expectation gives.
+            Per-horizon expected imbalance price in two sets.
+            <strong style="color:#58a6ff">Static</strong> (blue) uses each grid
+            state's mean price over the whole rolling window;
+            <strong style="color:#f0883e">dynamic</strong> (orange) re-prices
+            each horizon off its own day-ahead level (state × DA-price cell), so
+            it tracks DA context. Within each set the <em>solid</em> line is the
+            model-weighted expectation and the <em>dashed</em> line the
+            calendar-only baseline (no model). Solid-vs-dashed is the value the
+            model adds; blue-vs-orange is the day-ahead-context adjustment.
+            (Dynamic lines appear once a fresh run emits them.)
           </p>
           <div id="price-chart" class="chart"></div>
         </div>
@@ -157,7 +164,7 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="forecast-charts.js?v=38"></script>
+    <script src="forecast-charts.js?v=39"></script>
     <script src="forecast-app.js?v=40"></script>
   </body>
 </html>

@@ -22,8 +22,12 @@ const ForecastCharts = (() => {
   const C_NEG = "#f85149";
   const C_ZRO = "#7d8590";
   const C_POS = "#3fb950";
-  const C_MODEL = "#58a6ff";
-  const C_BASELINE = "#d29922";
+  // Expected-price lines. Hue encodes the SET (static vs dynamic); line style
+  // encodes model-weighted (solid) vs no-model baseline (dashed). Blue/orange
+  // is a colourblind-safe pair, and the solid/dashed split is a redundant
+  // (non-colour) cue for model-vs-baseline.
+  const C_STATIC = "#58a6ff"; // static — mean over all DA levels (blue)
+  const C_DYNAMIC = "#f0883e"; // dynamic — DA-conditioned per horizon (orange)
 
   const COMMON_LAYOUT = {
     paper_bgcolor: "rgba(0,0,0,0)",
@@ -108,6 +112,14 @@ const ForecastCharts = (() => {
   }
 
   // ----- chart 2: expected imbalance price -----------------------------
+  // Two "sets" of expected price, each with a model-weighted line (solid) and
+  // a no-model baseline (dashed):
+  //   • STATIC  (blue)   — each grid state's mean imbalance price over the
+  //                        whole rolling window (blended across all DA levels).
+  //   • DYNAMIC (orange) — re-priced off each horizon's own day-ahead level
+  //                        (state × DA-price cell), so it tracks DA context.
+  // The dynamic pair is only drawn when the horizons carry those fields —
+  // older forecast.json predates them, and then only the two static lines show.
   function drawExpectedPriceLine(targetId, horizons) {
     const target = document.getElementById(targetId);
     if (!target) return;
@@ -116,29 +128,55 @@ const ForecastCharts = (() => {
       return;
     }
     const x = _xValues(horizons);
+    const hasDynamic = horizons.some(
+      (h) => h.expected_dynamic_imbalance_price_eur_mwh != null,
+    );
     const traces = [
       {
         x,
         y: horizons.map((h) => h.expected_imbalance_price_eur_mwh),
         type: "scatter",
         mode: "lines+markers",
-        name: "model-weighted",
-        line: { color: C_MODEL, width: 2 },
+        name: "static — model",
+        line: { color: C_STATIC, width: 2 },
         marker: { size: 5 },
-        hovertemplate: "model: %{y:.1f} €/MWh<extra></extra>",
+        hovertemplate: "static model: %{y:.1f} €/MWh<extra></extra>",
       },
       {
         x,
-        y: horizons.map(
-          (h) => h.expected_imbalance_price_baseline_eur_mwh,
-        ),
+        y: horizons.map((h) => h.expected_imbalance_price_baseline_eur_mwh),
         type: "scatter",
         mode: "lines",
-        name: "baseline (no model)",
-        line: { color: C_BASELINE, width: 1.5, dash: "dash" },
-        hovertemplate: "baseline: %{y:.1f} €/MWh<extra></extra>",
+        name: "static — baseline",
+        line: { color: C_STATIC, width: 1.5, dash: "dash" },
+        hovertemplate: "static baseline: %{y:.1f} €/MWh<extra></extra>",
       },
     ];
+    if (hasDynamic) {
+      traces.push(
+        {
+          x,
+          y: horizons.map((h) => h.expected_dynamic_imbalance_price_eur_mwh),
+          type: "scatter",
+          mode: "lines+markers",
+          name: "dynamic — model",
+          line: { color: C_DYNAMIC, width: 2 },
+          marker: { size: 5 },
+          hovertemplate: "dynamic model: %{y:.1f} €/MWh<extra></extra>",
+        },
+        {
+          x,
+          y: horizons.map(
+            (h) => h.expected_dynamic_imbalance_price_baseline_eur_mwh,
+          ),
+          type: "scatter",
+          mode: "lines",
+          name: "dynamic — baseline",
+          line: { color: C_DYNAMIC, width: 1.5, dash: "dash" },
+          hovertemplate: "dynamic baseline: %{y:.1f} €/MWh<extra></extra>",
+        },
+      );
+    }
     const layout = {
       ...COMMON_LAYOUT,
       yaxis: {
@@ -165,6 +203,18 @@ const ForecastCharts = (() => {
       el.innerHTML = "";
       return;
     }
+    // Match the chart: static price columns tinted blue, dynamic ones orange.
+    // The dynamic + DA columns only appear when the horizons carry them.
+    const hasDynamic = horizons.some(
+      (h) => h.expected_dynamic_imbalance_price_eur_mwh != null,
+    );
+    const priceHeader = hasDynamic
+      ? `<th style="color:${C_STATIC}">static model €/MWh</th>` +
+        `<th style="color:${C_STATIC}">static base €/MWh</th>` +
+        `<th style="color:${C_DYNAMIC}">dyn model €/MWh</th>` +
+        `<th style="color:${C_DYNAMIC}">dyn base €/MWh</th>` +
+        `<th>DA €/MWh</th>`
+      : `<th>model €/MWh</th><th>baseline €/MWh</th>`;
     const header = `
       <thead><tr>
         <th>h</th>
@@ -173,8 +223,7 @@ const ForecastCharts = (() => {
         <th>p_zero</th>
         <th>p_pos</th>
         <th>argmax</th>
-        <th>model €/MWh</th>
-        <th>baseline €/MWh</th>
+        ${priceHeader}
       </tr></thead>`;
     const fmtPct = (v) => (v * 100).toFixed(0) + "%";
     const fmtEUR = (v) => (v == null ? "—" : v.toFixed(1));
@@ -191,6 +240,14 @@ const ForecastCharts = (() => {
           const highlight = h.argmax_label === lbl ? ' style="font-weight:600"' : "";
           return `<td${highlight}>${fmtPct(v)}</td>`;
         };
+        const priceCells = hasDynamic
+          ? `<td>${fmtEUR(h.expected_imbalance_price_eur_mwh)}</td>` +
+            `<td>${fmtEUR(h.expected_imbalance_price_baseline_eur_mwh)}</td>` +
+            `<td>${fmtEUR(h.expected_dynamic_imbalance_price_eur_mwh)}</td>` +
+            `<td>${fmtEUR(h.expected_dynamic_imbalance_price_baseline_eur_mwh)}</td>` +
+            `<td>${fmtEUR(h.da_price_eur_mwh)}</td>`
+          : `<td>${fmtEUR(h.expected_imbalance_price_eur_mwh)}</td>` +
+            `<td>${fmtEUR(h.expected_imbalance_price_baseline_eur_mwh)}</td>`;
         return `
           <tr>
             <td>${h.h}</td>
@@ -199,8 +256,7 @@ const ForecastCharts = (() => {
             ${tCol("p_zero", "ZRO")}
             ${tCol("p_pos", "POS")}
             <td class="${labelClass(h.argmax_label)}">${h.argmax_label}</td>
-            <td>${fmtEUR(h.expected_imbalance_price_eur_mwh)}</td>
-            <td>${fmtEUR(h.expected_imbalance_price_baseline_eur_mwh)}</td>
+            ${priceCells}
           </tr>`;
       })
       .join("");

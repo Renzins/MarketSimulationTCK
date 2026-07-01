@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1200, initial-scale=1" />
+    <title>Baltic Balancing-Energy Bids — TCK Market Dashboard</title>
+    <link rel="stylesheet" href="style.css?v=42" />
+  </head>
+  <body>
+    <nav class="site-nav">
+      <a href="index.html" class="brand">TCK Market Dashboard</a>
+      <a href="index.html" class="navlink">Backtester - Wind Park</a>
+      <a href="bess.html" class="navlink">Backtester - BESS</a>
+      <a href="graphs.html" class="navlink">Graphs</a>
+      <a href="forecast.html" class="navlink">Forecast</a>
+      <a href="bids.html" class="navlink active">Bid data</a>
+    </nav>
+
+    <header class="site-header">
+      <h1>Baltic Balancing-Energy Bids — mFRR</h1>
+      <p class="subtitle">
+        Live individual mFRR balancing-energy bids for the three Baltic
+        scheduling areas — Estonia, Latvia, Lithuania (ENTSO-E GL EB
+        12.3.B&amp;C), pulled on demand via GitHub Actions. Pick an area below
+        to see eight histograms — the offered MW by price bin for the four most
+        recent 15-minute delivery periods (UTC), split into
+        <strong>mFRR up</strong> and <strong>mFRR down</strong>. Scheduled and
+        scheduled+direct products are pooled; a switch re-filters the same pull
+        (no re-run). Last pull: <span id="last-updated">—</span>.
+      </p>
+    </header>
+
+    <main>
+      <!-- =================================================================
+           CONTROL CARD — identical mechanism to the Forecast page: the same
+           shared password unlocks the same encrypted GitHub PAT, which
+           dispatches the private repo's `bids.yml` workflow and reads the
+           committed `bids.json`. Only the workflow + output file differ.
+           ================================================================= -->
+      <section class="panel active">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Bid data control</h3>
+              <p class="group-desc">
+                Enter the shared password and click <em>Run bids pull</em> to
+                dispatch a single <code>bids.yml</code> run. The page polls for
+                completion (up to 15 minutes; a bids pull is typically ~1–2
+                min), refetches <code>bids.json</code> and redraws the eight
+                histograms. It runs exactly once per click — click again for a
+                fresher pull. While a run is in flight the button becomes
+                <em>Cancel</em>.
+              </p>
+            </div>
+            <div class="controls-grid" id="bids-controls">
+              <div class="control">
+                <label>Repository</label>
+                <div class="slider-row">
+                  <span id="repo-display" class="winsor-cap">—</span>
+                </div>
+                <div class="param-desc">
+                  <p>
+                    Private GitHub repository hosting the bids workflow and
+                    <code>bids.json</code>. Same repo as the Forecast page;
+                    edit the constants at the top of <code>bids-app.js</code>
+                    to point elsewhere.
+                  </p>
+                </div>
+              </div>
+              <div class="control">
+                <label for="pwd-input">Run password</label>
+                <div class="slider-row">
+                  <input
+                    type="password"
+                    id="pwd-input"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="(empty)"
+                  />
+                  <button id="activate-btn" class="btn primary">
+                    Run bids pull
+                  </button>
+                </div>
+                <div class="param-desc">
+                  <p>
+                    The same shared password used by the Forecast page. It
+                    gates workflow dispatches server-side and is never
+                    persisted to disk, browser storage or URL — it stays only
+                    in the masked field and in memory during a run. Reload to
+                    clear it.
+                  </p>
+                </div>
+              </div>
+              <div class="control">
+                <label>Status</label>
+                <div class="slider-row">
+                  <span id="status-text" class="winsor-cap">idle</span>
+                </div>
+                <div class="param-desc">
+                  <p id="bids-summary">
+                    Current run state and last-pull result. Wrong password →
+                    the workflow exits in ~5 s and shows "auth failed"; the
+                    displayed bids stay at the last successful read.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Scheduling-area selector — filters the eight charts below. One
+             bids.json holds EE/LV/LT, so switching areas is instant (a pure
+             client-side re-filter + redraw; no workflow re-run). -->
+        <div class="bids-area-bar">
+          <span class="bids-area-bar-label">Scheduling area</span>
+          <div
+            class="area-toggle"
+            id="area-toggle"
+            role="group"
+            aria-label="Scheduling area"
+          >
+            <button type="button" class="btn preset" data-area="EE">
+              Estonia
+            </button>
+            <button type="button" class="btn preset active" data-area="LV">
+              Latvia
+            </button>
+            <button type="button" class="btn preset" data-area="LT">
+              Lithuania
+            </button>
+          </div>
+          <span id="area-availability" class="winsor-cap"></span>
+        </div>
+
+        <!-- ===== mFRR UP ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>mFRR up — offered MW by price</h2>
+          </div>
+          <p class="card-desc">
+            Upward balancing-energy bids (the price/volume the market offered
+            to increase supply). One histogram per delivery period, oldest to
+            newest. X = bid price (€/MWh, binned); Y = total MW offered in each
+            price bin. The four panels share price and MW scales so you can see
+            the bid stack shift period-to-period.
+          </p>
+          <div class="bid-grid">
+            <div id="bid-up-0" class="chart bid-chart"></div>
+            <div id="bid-up-1" class="chart bid-chart"></div>
+            <div id="bid-up-2" class="chart bid-chart"></div>
+            <div id="bid-up-3" class="chart bid-chart"></div>
+          </div>
+        </div>
+
+        <!-- ===== mFRR DOWN ===== -->
+        <div class="card">
+          <div class="card-head">
+            <h2>mFRR down — offered MW by price</h2>
+          </div>
+          <p class="card-desc">
+            Downward balancing-energy bids (the price/volume the market offered
+            to decrease supply; prices are frequently negative). Same layout as
+            above — one histogram per delivery period, shared scales across the
+            four panels.
+          </p>
+          <div class="bid-grid">
+            <div id="bid-down-0" class="chart bid-chart"></div>
+            <div id="bid-down-1" class="chart bid-chart"></div>
+            <div id="bid-down-2" class="chart bid-chart"></div>
+            <div id="bid-down-3" class="chart bid-chart"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Bid data and runner code live in a separate private repository; this
+        page only reads <code>bids.json</code> and triggers workflow runs.
+        Source: classic ENTSO-E REST API (documentType A37, businessType B74).
+      </p>
+    </footer>
+
+    <script
+      src="https://cdn.plot.ly/plotly-2.35.2.min.js"
+      charset="utf-8"
+    ></script>
+    <script src="bids-charts.js?v=41"></script>
+    <script src="bids-app.js?v=42"></script>
+  </body>
+</html>

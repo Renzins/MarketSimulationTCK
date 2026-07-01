@@ -976,6 +976,63 @@ table.optim-runs tbody tr:hover {
   }
 }
 
+/* ---------- Bid data histograms (4 periods per direction) ------------ */
+/* Four compact histograms across on desktop (one per delivery period),
+   collapsing to 2 then 1 on narrower viewports. Panels are shorter than
+   the standard .chart so two four-up rows (up + down) fit without endless
+   scrolling. */
+.bid-grid {
+  display: grid;
+  /* minmax(0, 1fr) — NOT 1fr — so a Plotly panel's intrinsic width can't
+     blow out its track and squeeze the siblings; keeps all four equal. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.bid-grid .bid-chart {
+  min-height: 300px;
+  min-width: 0; /* allow the chart to shrink to its grid track */
+}
+
+@media (max-width: 1100px) {
+  .bid-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .bid-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Scheduling-area selector on the Bid data page (EE / LV / LT). Segmented
+   buttons reusing the .btn.preset / .preset.active look from the graphs page. */
+.bids-area-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.bids-area-bar-label {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.area-toggle {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.area-toggle .btn.preset {
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
 select {
   background: var(--bg3);
   border: 1px solid var(--border);
