@@ -747,6 +747,7 @@
     lastSim: null,
     lastNaive: null,
     lastSweep: null,
+    lastSens: null, // last parameter-sensitivity analysis (per session)
     // Optimised-runs log (#4) — one entry per completed Optimise. In-memory.
     optimRuns: [],
   };
@@ -1328,7 +1329,9 @@
   // =====================================================================
   const RANDOM_N = 4000;
   const REFINE_STARTS = 5;
-  const RAND_PROGRESS = 0.35;
+  const RAND_PROGRESS = 0.35; // progress fraction consumed by the random phase
+  const REFINE_END = 0.8; // refine ends here; sensitivity analysis takes the rest
+  const SENS_TOL = 0.01; // "as good as the optimum" band = within 1% of it
 
   const _yieldChannel =
     typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
@@ -1577,10 +1580,12 @@
     await yieldToBrowser();
 
     const topK = [];
+    const pop = []; // full random population — reused by the sensitivity analysis
     let lastYield = performance.now();
     for (let i = 0; i < N; i++) {
       const s = randomSampleByDims(dims, rng);
       const r = evaluateSample(s);
+      pop.push({ sample: s, revenue: r });
       if (topK.length < K) {
         topK.push({ sample: s, revenue: r });
         topK.sort((a, b) => b.revenue - a.revenue);
@@ -1602,17 +1607,20 @@
     for (let k = 0; k < topK.length; k++) {
       const refined = await coordRefine(topK[k].sample, dims);
       if (!best || refined.revenue > best.revenue) best = refined;
-      const f = RAND_PROGRESS + ((k + 1) / K) * (1 - RAND_PROGRESS);
-      const label = k + 1 < topK.length ? `refining ${k + 2}/${K}…` : "finalising…";
+      const f = RAND_PROGRESS + ((k + 1) / K) * (REFINE_END - RAND_PROGRESS);
+      const label = k + 1 < topK.length ? `refining ${k + 2}/${K}…` : "analysing sensitivity…";
       renderProgressBar(progEl, f, label);
       await yieldToBrowser();
     }
+    const sens = await analyseSensitivity(best, dims, pop, progEl);
+    state.lastSens = sens;
     const ms = Math.round(performance.now() - t0);
 
     applyOptimisedSample(best.sample);
     state.lastSweep = { best: { ...best.sample, revenue: best.revenue } };
     update();
-    recordOptimRun(best, ms);
+    recordOptimRun(best, ms, sens);
+    renderSensitivity(sens);
     renderProgressBar(
       progEl,
       1,
@@ -1620,6 +1628,120 @@
     );
     optimiseBtn.disabled = false;
     resetBtn.disabled = false;
+  }
+
+  // =====================================================================
+  //  SENSITIVITY ANALYSIS — what actually drives the found optimum.
+  //  One-at-a-time sweeps around the optimum (local weight / tolerance
+  //  band / shape / edge saturation), global stats over the random
+  //  population (Spearman rho, top-decile clustering), pairwise
+  //  interaction scores, and a 2-D sweep of the strongest pair.
+  //  All math + renderers live in optim-sens.js (OptimSens — shared with
+  //  the BESS page, mirrored in tests_bess.py). NOT run by the headless
+  //  __optimiseSilent hook (variance experiments stay lean).
+  // =====================================================================
+  function _heatGrid(refineValues, vStar, maxN = 9) {
+    const vals = [...new Set([...refineValues, vStar])].sort((x, y) => x - y);
+    if (vals.length <= maxN) return vals;
+    const step = (vals.length - 1) / (maxN - 1);
+    const out = [];
+    for (let i = 0; i < maxN; i++) out.push(vals[Math.round(i * step)]);
+    if (!out.includes(vStar)) out.push(vStar);
+    return [...new Set(out)].sort((x, y) => x - y);
+  }
+
+  async function analyseSensitivity(best, dims, pop, progEl) {
+    const denom = Math.max(1, Math.abs(best.revenue));
+    const perParam = {}, curves = {};
+    const totalEvals = Math.max(1, dims.reduce((s, d) => s + d.refineValues.length, 0));
+    let done = 0, lastYield = performance.now();
+    for (const dim of dims) {
+      const vStar = best.sample[dim.key];
+      const values = [...new Set([...dim.refineValues, vStar])].sort((a, b) => a - b);
+      const curve = [];
+      for (const v of values) {
+        const r = v === vStar ? best.revenue : evaluateSample({ ...best.sample, [dim.key]: v });
+        curve.push({ v, r });
+        done++;
+        if (performance.now() - lastYield > 200) {
+          renderProgressBar(progEl, REFINE_END + 0.17 * (done / totalEvals), "analysing sensitivity…");
+          await yieldToBrowser();
+          lastYield = performance.now();
+        }
+      }
+      perParam[dim.key] = Object.assign(
+        { vStar },
+        OptimSens.weightAndBand(curve, vStar, best.revenue, SENS_TOL),
+        OptimSens.globalStats(pop, dim.key),
+      );
+      curves[dim.key] = curve;
+    }
+    const keys = dims.map((d) => d.key);
+    const pairs = keys.length >= 2 ? OptimSens.interactionScores(pop, keys, best.revenue).slice(0, 5) : [];
+    let heat = null;
+    if (pairs.length) {
+      const { a, b } = pairs[0];
+      const ga = _heatGrid(dims.find((d) => d.key === a).refineValues, best.sample[a]);
+      const gb = _heatGrid(dims.find((d) => d.key === b).refineValues, best.sample[b]);
+      const z = [];
+      for (const va of ga) {
+        const row = [];
+        for (const vb of gb) {
+          const r = va === best.sample[a] && vb === best.sample[b]
+            ? best.revenue
+            : evaluateSample({ ...best.sample, [a]: va, [b]: vb });
+          row.push(((r - best.revenue) / denom) * 100); // Δ% vs the optimum
+          if (performance.now() - lastYield > 200) {
+            renderProgressBar(progEl, 0.98, "mapping interaction…");
+            await yieldToBrowser();
+            lastYield = performance.now();
+          }
+        }
+        z.push(row);
+      }
+      heat = { a, b, va: ga, vb: gb, z, aStar: best.sample[a], bStar: best.sample[b] };
+    }
+    return { revenue: best.revenue, perParam, curves, pairs, heat };
+  }
+
+  const SHAPE_LABEL = { flat: "— flat", up: "↑ higher is better", down: "↓ lower is better", peaked: "▲ interior peak" };
+  function renderSensitivity(sens) {
+    const table = document.getElementById("sens-table");
+    if (!table) return;
+    if (!sens) {
+      table.innerHTML = '<tbody><tr><td class="optim-empty">No analysis yet — click ⚡ Optimise. The report is per session (not persisted).</td></tr></tbody>';
+      const list = document.getElementById("sens-pairs-list");
+      if (list) list.textContent = "";
+      return;
+    }
+    const keys = Object.keys(sens.perParam).sort((a, b) => sens.perParam[b].weight - sens.perParam[a].weight);
+    const num = (v, d = 0) => (v == null || isNaN(v) ? "—" : (+v).toFixed(d));
+    const rows = keys.map((k) => {
+      const s = sens.perParam[k];
+      // 0–1 fractions get 2 decimals; MW / € / ISP params are integers
+      const dec = /_(coef|split|start|step)$/.test(k) || k === "Y" || k === "Z" ? 2 : 0;
+      return `<tr>
+        <td>${k}${s.edge ? ' <span title="optimum sits on the sweep boundary — saturated lever">⚠</span>' : ""}</td>
+        <td><b>${num(s.vStar, dec)}</b></td>
+        <td>${(s.weight * 100).toFixed(1)}%${s.sharp ? ' <span title="one grid step next to the optimum already loses >5%">✶</span>' : ""}</td>
+        <td>${num(s.band[0], dec)} … ${num(s.band[1], dec)}</td>
+        <td>${SHAPE_LABEL[s.shape] || s.shape}</td>
+        <td>${s.rho >= 0 ? "+" : ""}${s.rho.toFixed(2)}</td>
+        <td>${num(s.topBand[0], dec)} … ${num(s.topBand[1], dec)}</td>
+      </tr>`;
+    }).join("");
+    table.innerHTML =
+      `<thead><tr><th>Parameter</th><th>Optimum</th><th>Weight (max loss)</th><th>1%-band</th><th>Shape (local)</th><th>Global ρ</th><th>Top-10% cluster</th></tr></thead>` +
+      `<tbody>${rows}</tbody>`;
+    const list = document.getElementById("sens-pairs-list");
+    if (list) {
+      list.innerHTML = sens.pairs.length
+        ? "Ranking: " + sens.pairs.map((p, i) => `${i + 1}. ${p.a} × ${p.b} (${(p.score * 100).toFixed(1)}%)`).join(" · ")
+        : "fewer than two optimised parameters — no pairs to rank.";
+    }
+    OptimSens.drawWeights("sens-weights", sens.perParam);
+    OptimSens.drawCurves("sens-curves", sens.curves, sens.perParam, sens.revenue);
+    OptimSens.drawHeatmap("sens-heatmap", sens.heat);
   }
 
   // =====================================================================
@@ -1641,12 +1763,21 @@
     return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
   }
 
-  function recordOptimRun(best, ms) {
+  function recordOptimRun(best, ms, sens) {
     const p = state.params;
+    // compact per-run sensitivity summary (full curves stay in-memory only)
+    let sensTop = null;
+    if (sens) {
+      sensTop = Object.keys(sens.perParam)
+        .sort((a, b) => sens.perParam[b].weight - sens.perParam[a].weight)
+        .slice(0, 3)
+        .map((k) => ({ k, w: sens.perParam[k].weight, edge: sens.perParam[k].edge }));
+    }
     state.optimRuns.push({
       n: state.optimRuns.length + 1,
       when: nowClock(),
       ms,
+      sensTop,
       from: state.simRange.from,
       to: state.simRange.to,
       dayType: state.dayType,
@@ -1704,7 +1835,7 @@
     "RDn coef", "RDn split", "RDn min€",
     "X", "Y", "Split↑ x/y/w/z", "Split↓ x/y/w/z", "Z",
     "S3 K", "S3 S_min", "S3 σ_max", "S3 M", "S3 cap/lag/skip",
-    "θ", "Sources", "Winsor m/i/+/−", "Revenue", "Δ vs naïve",
+    "θ", "Sources", "Winsor m/i/+/−", "Top drivers (weight)", "Revenue", "Δ vs naïve",
   ];
 
   // Per-tab persistence (sessionStorage): survives navigating to Graphs /
@@ -1784,6 +1915,9 @@
           `${r.actualSource}/${r.idSource}`,
           `${win(r.winsor.mfrr)} · ${win(r.winsor.imb)} · ${win(r.winsor.afrrPos)} · ${win(r.winsor.afrrNeg)}` +
             (en.reserve || en.reserveUp ? ` · R ${win(r.winsor.resMfrr)}/${win(r.winsor.resAfrr)}` : ""),
+          r.sensTop && r.sensTop.length
+            ? r.sensTop.map((t) => `${t.edge ? "⚠" : ""}${t.k} ${(t.w * 100).toFixed(0)}%`).join("<br>")
+            : dash,
           `<b>${fmtEUR(r.revenue)}</b>`,
           `<span class="${diff >= 0 ? "optim-up" : "optim-down"}">${diff >= 0 ? "+" : ""}${fmtEUR(diff)}<br>(${diff >= 0 ? "+" : ""}${diffPct.toFixed(1)}%)</span>`,
         ];
@@ -1961,6 +2095,7 @@
   }
   loadOptimRuns();
   renderOptimRuns();
+  renderSensitivity(null); // empty state until the first ⚡ Optimise
 
   update();
 })();

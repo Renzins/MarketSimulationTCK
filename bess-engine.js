@@ -29,6 +29,22 @@
 //                                          never a *chosen* close; it only happens
 //                                          passively when a DA delivery falls short.
 //
+// INFORMATION SET — NO FUTURE LEAKAGE
+//   ISP i covers [t0, t0+15). The intraday gate closes at t0−30 (= the END of
+//   ISP i−3); the balancing gate at t0−25 (ISP i−2 is still running). So at
+//   BOTH gates the newest fully-settled balancing prices are ISP i−3's.
+//   Rule enforced throughout: every DECISION — direction, sizing, routing,
+//   re-pricing, the opportunistic divert — reads settled prices (≤ i−3, via
+//   LAG_SETTLED) plus the live intraday quote; the CURRENT ISP's realised
+//   mFRR/aFRR prices decide only whether a placed, priced bid CLEARS and what
+//   it settles at (standard bid mechanics, not clairvoyance). vwap_1h is a
+//   NordPool snapshot captured 1 h before delivery — earlier than both gates
+//   — treated as an executable intraday quote at decision time (documented
+//   simplification: we assume fills at that snapshot price). The DA price is
+//   known from the D−1 auction. The adaptive-split windows also end at the
+//   last settled ISP. Locked by a perturbation test: shocking the CURRENT
+//   ISP's balancing prices must not change what was placed, only what clears.
+//
 // SIGN CONVENTIONS  (energy MWh = MW × 0.25 h; price €/MWh; + = money in)
 //   DA discharge    +E · p_da                           (sell stored energy to DA)
 //   mFRR-up         +E · p_mfrr      (p_mfrr ≥ +1)       (discharge into balancing)
@@ -37,7 +53,8 @@
 //   aFRR-dn charge  −E · avg_p_neg   (avg_p_neg < 0)     (partial dispatch n_neg_fav/225)
 //   intraday charge −E · vwap                            (charge cost; vwap<0 ⇒ income)
 //   DA buy-low      −E · p_da                            (day-ahead committed trough buy)
-//   opportunistic   close a diverted DA leg on intraday: −E · vwap (DA revenue kept)
+//   opportunistic   close a diverted DA leg on intraday: −E · vwap (DA revenue kept;
+//                   a divert MISS keeps the energy stored — net (p_da − vwap)·E)
 //   DA shortfall    −E_short · (p_imb + θ)               (unmet DA settles at imbalance)
 //
 // EFFICIENCY  (round-trip η, default 0.90): etaLeg = √η per leg, grid-side.
@@ -59,6 +76,21 @@
 //   ceiling; unusable shares fall back to the other balancing side, then to
 //   intraday. z = 0 ⇒ static split at the start.
 //
+// DISCRETIONARY ASK + REACTIVE RE-PRICING (dynamic discharge pricing)
+//   Every discretionary balancing discharge offer carries an ASK. Resting
+//   level: effCost + minDelta (break-even + demanded margin). A leg clears
+//   only when ITS OWN price reaches the ask (mFRR: p_mfrr ≥ ask; aFRR:
+//   avg_p_pos ≥ ask — an ISP-average approximation of the 4-s merit order).
+//   When the run-up over SETTLED ISPs fires — p_mfrr[i−3] − p_mfrr[i−3−
+//   dd_lookback] ≥ dd_threshold — the WHOLE offer is re-priced to
+//   p_mfrr[i−3] + dd_markup. Nothing is withheld: full volume stays offered
+//   and clears only if the spike keeps running past the raised ask; if it
+//   stalls, the offer rests unfilled. (The old dd_hold volume-withholding is
+//   gone — it fired clairvoyantly at spikes and sold the held half into the
+//   fade. The old hard mFRR→aFRR switch is gone too: under fair timing it was
+//   measured value-destroying, and trailing-window routing is the adaptive
+//   split's job.)
+//
 // MUST-FULFIL GUARANTEE
 //   Balancing offers are sized within physical [0, cap] + power each ISP, so a
 //   committed balancing activation is never short (SoC-safety audit:
@@ -66,6 +98,12 @@
 //
 // RED ZONES — discretionary NEW offers keep SoC in [lowerRed, upperRed]·cap; the
 //   buffers cover committed activations / DA commitments.
+//   Red-zone TIME AUDIT: whole-MW quantisation parks SoC just outside a zone
+//   (within one MW-step of the boundary), so "time in a zone" is counted as
+//   PINNED-AT-OR-BEYOND it: soc < loRed + 0.25/etaLeg (can't discharge 1 whole
+//   MW without entering the lower zone) / soc > hiRed − 0.25·etaLeg (can't
+//   absorb 1 whole MW without entering the upper zone). Committed DA legs may
+//   dig strictly inside a zone; those ISPs count too.
 //
 // DAY-TYPE FILTER — SoC evolves over EVERY ISP; totals/decomp/stats accumulate
 //   matching-day ISPs only, so total(all) == workday + weekend/holiday exactly.
@@ -75,6 +113,10 @@
 
 const BessEngine = (() => {
   const LAG = 96; // 24 h = 96 × 15-min ISPs
+  // Newest SETTLED ISP at decision time is i−3: the intraday gate (t0−30)
+  // coincides with the end of ISP i−3 and the balancing gate (t0−25) falls
+  // inside ISP i−2 — see "INFORMATION SET" above.
+  const LAG_SETTLED = 3;
   const EPS = 1e-9;
 
   let D = null;
@@ -157,7 +199,9 @@ const BessEngine = (() => {
   // better-paying market over the trailing `win` ISPs (LOOKBACK). wait and win
   // are decoupled: wait=1 re-evaluates every ISP off a sliding win-window;
   // wait=win reproduces the old non-overlapping block behaviour. Returned w is
-  // the segment length (cadence) used to index blocks.
+  // the segment length (cadence) used to index blocks. The window ends at the
+  // last SETTLED ISP before the block boundary (LAG_SETTLED back) — the split
+  // is a bidding decision and must not read unsettled prices.
   function _splitBlocks(start, win, step, wait, fxM, fxA, upto) {
     const lb = win < 1 ? 1 : win | 0; // lookback length
     const wt = wait < 1 ? 1 : wait | 0; // cadence (segment length)
@@ -167,7 +211,7 @@ const BessEngine = (() => {
     blocks[0] = s;
     for (let k = 1; k < nB; k++) {
       if (step > 0) {
-        const boundary = k * wt;
+        const boundary = k * wt - LAG_SETTLED + 1 < 0 ? 0 : k * wt - LAG_SETTLED + 1;
         const lo = boundary - lb < 0 ? 0 : boundary - lb;
         const hi = boundary < D.n ? boundary : D.n;
         const cnt = hi - lo;
@@ -236,9 +280,9 @@ const BessEngine = (() => {
       chargeOn,
       max_charge_price: chargeOn ? num(params.max_charge_price, 20) : -1e9,
       ddOn,
-      dd_lookback: Math.max(1, (params.dd_lookback | 0) || 4),
+      dd_lookback: Math.max(1, (params.dd_lookback | 0) || 1),
       dd_threshold: Math.max(0, num(params.dd_threshold, 20)),
-      dd_hold: ddOn ? clamp01(num(params.dd_hold, 0.5)) : 0,
+      dd_markup: ddOn ? Math.max(0, num(params.dd_markup, 75)) : 0,
       oppOn,
       opp_threshold: oppOn ? Math.max(0, num(params.opp_threshold, 100)) : 1e9,
       dayTypeFilter: params.dayTypeFilter || "all",
@@ -274,6 +318,10 @@ const BessEngine = (() => {
     const ceiling = p.max_charge_price;
     const e4 = 0.25; // hours per ISP
     const filtering = p.dayTypeFilter !== "all";
+    // Red-zone time audit thresholds (see header): pinned at/inside a zone =
+    // within one whole-MW step of its boundary, or beyond it.
+    const pinLo = loRed + e4 / etaLeg;
+    const pinHi = hiRed - e4 * etaLeg;
 
     let soc = p.socInit;
     let cb = 0;
@@ -288,7 +336,7 @@ const BessEngine = (() => {
     let total = 0;
     let bDA = 0, bUpM = 0, bUpA = 0, bDnM = 0, bDnA = 0, bID = 0, bChg = 0, bImb = 0, bFlat = 0;
     let nDis = 0, nChg = 0, nIdle = 0, nDAcleared = 0, nUpM = 0, nUpA = 0, nDnM = 0, nDnA = 0,
-      nWithdraw = 0, nShort = 0, nUnfulfilled = 0, nAt0 = 0, nAtFull = 0;
+      nRepriced = 0, nRepClear = 0, nDivMiss = 0, nShort = 0, nUnfulfilled = 0, nLowRed = 0, nUpRed = 0;
     let mwhDischarged = 0, mwhCharged = 0, shortMWh = 0;
     let curRun = 0, curRunMode = 0, sumDisRun = 0, cntDisRun = 0, sumChgRun = 0, cntChgRun = 0,
       curIdle = 0, sumIdleGap = 0, cntIdleGap = 0;
@@ -311,11 +359,24 @@ const BessEngine = (() => {
       // aFRR OFFERED MW (whole-MW); dispatched = offered × n_*_fav/225 (the
       // favourable fraction of the 15-min ISP), exactly as the wind park.
       let upAoffMW = 0, dnAoffMW = 0;
-      let shortE = 0, dir = 0, daChargeCommitted = false;
+      let shortE = 0, dir = 0, daChargeCommitted = false, divRefundE = 0, divFlag = 0;
 
+      // Realised same-ISP favourability — used ONLY as clearing conditions.
       const mfrrUp = P_mfrr >= 1;
       const afrrUp = Apos > 0;
-      const bestUp = Math.max(mfrrUp ? P_mfrr : -Infinity, afrrUp ? Apos : -Infinity);
+
+      // KNOWN information at the gates (see header): settled ISP i−3 prices
+      // + the live intraday quote. Every decision below reads only these.
+      const jLag = i - LAG_SETTLED;
+      const lagKnown = jLag >= 0;
+      const pmfJ = lagKnown ? pmf[jLag] : NaN;
+      const aposJ = lagKnown ? apos[jLag] : 0;
+      const anegJ = lagKnown ? aneg[jLag] : 0;
+      const mfrrUpLag = pmfJ >= 1;
+      const afrrUpLag = aposJ > 0;
+      const bestUpLag = Math.max(mfrrUpLag ? pmfJ : -Infinity, afrrUpLag ? aposJ : -Infinity);
+      const mfrrChgLag = pmfJ <= -1 && pmfJ <= ceiling;
+      const afrrChgLag = anegJ < 0 && anegJ <= ceiling;
 
       // 1. DAY-AHEAD discharge (committed peak)
       const daDisTarget =
@@ -357,20 +418,22 @@ const BessEngine = (() => {
         }
       }
 
-      // 2. Discretionary charge sources (real-time only; NO day-ahead here)
-      const mfrrDn = P_mfrr <= -1;
-      const afrrDn = Aneg < 0;
-      const mfrrChgUsable = mfrrDn && P_mfrr <= ceiling;
-      const afrrChgUsable = afrrDn && Aneg <= ceiling;
+      // 2. Discretionary charge sources (real-time only; NO day-ahead here).
+      //    Realised usability = clearing conditions; the intraday quote is
+      //    known pre-gate (1-h snapshot) so it gates both placement and fill.
+      const mfrrChgUsable = P_mfrr <= -1 && P_mfrr <= ceiling;
+      const afrrChgUsable = Aneg < 0 && Aneg <= ceiling;
       const idChgUsable = !isNaN(Vwap) && Vwap <= ceiling;
-      let bestChg = Infinity;
-      if (mfrrChgUsable && P_mfrr < bestChg) bestChg = P_mfrr;
-      if (afrrChgUsable && Aneg < bestChg) bestChg = Aneg;
-      if (idChgUsable && Vwap < bestChg) bestChg = Vwap;
-      const anyChgUsable = mfrrChgUsable || afrrChgUsable || idChgUsable;
+      // best KNOWN charge source (settled balancing / live intraday quote)
+      let bestChgKnown = Infinity;
+      if (mfrrChgLag && pmfJ < bestChgKnown) bestChgKnown = pmfJ;
+      if (afrrChgLag && anegJ < bestChgKnown) bestChgKnown = anegJ;
+      if (idChgUsable && Vwap < bestChgKnown) bestChgKnown = Vwap;
 
-      const dischargeOK = soc > loRed + EPS && budgetMW >= 1 && bestUp > -Infinity && bestUp >= effCost + minDelta;
-      const chargeOK = soc < hiRed - EPS && budgetMW >= 1 && anyChgUsable;
+      // Placement is a POSTURE, not information: offers are placed whenever
+      // physically possible and simply rest if the market never reaches them.
+      const canDis = soc > loRed + EPS && budgetMW >= 1;
+      const canChg = soc < hiRed - EPS && budgetMW >= 1;
       // Cooldown: a flip to the opposite of the LAST action's direction needs
       // `dwell` idle ISPs since that action. Same direction (or none yet) is
       // always allowed; the rest is measured from the last action (block END).
@@ -381,15 +444,22 @@ const BessEngine = (() => {
         // committed DA charge — no extra discretionary action this ISP
       } else if (dir === 1) {
         // DA discharge already set; extra discharge handled below
-      } else if (dischargeOK && chargeOK) {
-        // both attractive: while still cooling down, continue the last
-        // direction (no flip); once the rest has elapsed, take the better side.
+      } else if (canDis && canChg) {
+        // both physically possible: while still cooling down, continue the
+        // last direction (no flip); else compare the KNOWN richness of each
+        // side — settled balancing prices / live intraday quote, never the
+        // current ISP's realised prices. No known signal ⇒ rest a discharge
+        // offer (default posture).
         if (actMode === -1 && inCooldown) dir = -1;
         else if (actMode === 1 && inCooldown) dir = 1;
-        else dir = bestUp - effCost >= ceiling - bestChg ? 1 : -1;
-      } else if (dischargeOK && restOK(1)) {
+        else {
+          const upScore = bestUpLag > -Infinity ? bestUpLag - effCost : -Infinity;
+          const dnScore = bestChgKnown < Infinity ? ceiling - bestChgKnown : -Infinity;
+          dir = upScore >= dnScore ? 1 : -1;
+        }
+      } else if (canDis && restOK(1)) {
         dir = 1;
-      } else if (chargeOK && restOK(-1)) {
+      } else if (canChg && restOK(-1)) {
         dir = -1;
       }
 
@@ -397,102 +467,144 @@ const BessEngine = (() => {
       // already-delivered DA energy (no extra battery power); the extra-balancing
       // block below is self-gated by availMW (= 0 when budget is exhausted).
       if (dir === 1 && !daChargeCommitted) {
-        // 4. opportunistic override — divert the DA-sold MW into a balancing
-        //    spike, covering the DA obligation by buying INTRADAY (the only
-        //    close price known at decision time). DA revenue is KEPT.
-        // Divert ONLY into mFRR-up: it is binary / full-dispatch (a deficit
-        // spike activates the whole bid), so the already-delivered DA energy
-        // maps cleanly to it. aFRR's partial activation would leave the drained
-        // battery only fractionally sold, so we never divert into aFRR here.
-        if (p.oppOn && daSellMW > 0 && mfrrUp && !isNaN(Vwap) && P_mfrr - Vwap >= p.opp_threshold) {
+        // 4. opportunistic override — REACTIVE, no clairvoyance. Trigger: the
+        //    last SETTLED balancing price already ran ≥ threshold above the
+        //    live intraday quote. Commitment (T−30): buy the DA-sold volume
+        //    back on intraday at the quote — this cost is SUNK either way.
+        //    Then (T−25) the freed energy is offered to mFRR at ask = quote +
+        //    threshold. If the spike persists (realised P_mfrr ≥ ask) it
+        //    clears: DA revenue kept, gain ≈ mFRR − intraday. If it fizzles,
+        //    the offer rests, the energy STAYS in the battery (SoC refunded)
+        //    and the round trip costs (Vwap − p_da)·E — the honest price of a
+        //    failed bet. Divert ONLY into mFRR-up (binary / full-dispatch);
+        //    aFRR's partial activation would leave the freed energy only
+        //    fractionally sold.
+        if (p.oppOn && daSellMW > 0 && mfrrUpLag && !isNaN(Vwap) && pmfJ - Vwap >= p.opp_threshold) {
           const e = daSellMW * e4;
-          cID -= e * Vwap; // buy intraday to cover the DA delivery
-          cUpM += e * P_mfrr;
-          upMmw += daSellMW;
-          if (bids) bids.push({ i, prod: "mfrr", dir: 1, price: P_mfrr, mw: daSellMW, status: "cleared" });
-          daSellMW = 0; // battery energy now goes to balancing, not DA
+          const askDiv = Vwap + p.opp_threshold;
+          cID -= e * Vwap; // committed intraday buy-back (covers the DA delivery)
+          if (mfrrUp && P_mfrr >= askDiv) {
+            divFlag = 1; // divert cleared at the raised ask
+            cUpM += e * P_mfrr;
+            upMmw += daSellMW;
+            if (bids) bids.push({ i, prod: "mfrr", dir: 1, price: P_mfrr, mw: daSellMW, status: "cleared" });
+          } else {
+            divFlag = 2; // divert MISS — buy-back paid, energy retained
+            // The energy never left the battery — but at the gate it was
+            // committed to the divert offer, so it is NOT available to the
+            // extra discretionary offer below (sizing must not depend on
+            // whether the divert cleared). Refund the SoC after that leg.
+            divRefundE = e;
+            if (accept) nDivMiss++;
+            if (bids) bids.push({ i, prod: "mfrr", dir: 1, price: askDiv, mw: daSellMW, status: "resting" });
+          }
+          daSellMW = 0; // the battery no longer delivers the DA leg either way
         }
 
         const availMW = Math.floor(Math.min(budgetMW, (Math.max(0, soc - loRed) * etaLeg) / e4));
-        if (availMW > 0 && bestUp >= effCost + minDelta) {
-          let hold = 0;
-          if (p.ddOn && p.dd_hold > 0 && i - p.dd_lookback >= 0) {
-            const past = pmf[i - p.dd_lookback];
-            if (!isNaN(past) && P_mfrr - past >= p.dd_threshold) hold = p.dd_hold;
-          }
-          const offerMW = Math.floor(availMW * (1 - hold));
-          const heldMW = availMW - offerMW;
-          if (heldMW > 0 && bids) {
-            bids.push({ i, prod: "mfrr", dir: 1, price: P_mfrr, mw: heldMW, status: "withdrawn" });
-            if (accept) nWithdraw++;
-          }
-          if (offerMW > 0) {
-            let toMfrr = sUp;
-            if (p.ddOn && afrrUp && mfrrUp && Apos > P_mfrr) toMfrr = 0; // switch to aFRR
-            const routedMfrr = Math.round(toMfrr * offerMW);
-            const routedAfrr = offerMW - routedMfrr;
-            budgetMW -= offerMW;
-            if (routedMfrr > 0) {
-              if (mfrrUp) {
-                soc -= (routedMfrr * e4) / etaLeg;
-                cUpM += routedMfrr * e4 * P_mfrr;
-                upMmw += routedMfrr;
-                if (bids) bids.push({ i, prod: "mfrr", dir: 1, price: P_mfrr, mw: routedMfrr, status: "cleared" });
-              } else if (bids) {
-                bids.push({ i, prod: "mfrr", dir: 1, price: P_mfrr, mw: routedMfrr, status: "resting" });
-              }
+        if (availMW > 0) {
+          // REACTIVE ASK (dynamic discharge pricing, see header). Resting ask
+          // = break-even + margin. On a run-up over SETTLED ISPs the whole
+          // offer is re-priced ABOVE the last settled level — full volume
+          // stays offered (nothing withheld); it clears only if its market's
+          // realised price reaches the ask.
+          let ask = effCost + minDelta;
+          let repriced = false;
+          if (p.ddOn && p.dd_markup > 0 && lagKnown && jLag - p.dd_lookback >= 0) {
+            const past = pmf[jLag - p.dd_lookback];
+            if (!isNaN(pmfJ) && !isNaN(past) && pmfJ - past >= p.dd_threshold) {
+              const raised = pmfJ + p.dd_markup;
+              if (raised > ask) { ask = raised; repriced = true; }
             }
-            if (routedAfrr > 0) {
-              upAoffMW += routedAfrr; // offered to aFRR-up (whether or not it clears)
-              if (afrrUp) {
-                const disp = routedAfrr * (nposf[i] / 225);
-                soc -= (disp * e4) / etaLeg;
-                cUpA += routedAfrr * e4 * Apos;
-                upAmw += disp;
-                if (bids) bids.push({ i, prod: "afrr", dir: 1, price: Apos, mw: routedAfrr, status: "cleared" });
-              } else if (bids) {
-                bids.push({ i, prod: "afrr", dir: 1, price: Apos, mw: routedAfrr, status: "resting" });
-              }
+          }
+          const toMfrr = sUp; // mFRR↔aFRR routing is the adaptive split's job (trailing, settled)
+          const routedMfrr = Math.round(toMfrr * availMW);
+          const routedAfrr = availMW - routedMfrr;
+          budgetMW -= availMW; // offered capacity is reserved whether or not it clears
+          let anyClear = false;
+          if (routedMfrr > 0) {
+            if (mfrrUp && P_mfrr >= ask) {
+              soc -= (routedMfrr * e4) / etaLeg;
+              cUpM += routedMfrr * e4 * P_mfrr;
+              upMmw += routedMfrr;
+              anyClear = true;
+              if (bids) bids.push({ i, prod: "mfrr", dir: 1, price: P_mfrr, mw: routedMfrr, status: "cleared", rep: repriced ? 1 : 0 });
+            } else if (bids) {
+              bids.push({ i, prod: "mfrr", dir: 1, price: ask, mw: routedMfrr, status: repriced ? "repriced" : "resting" });
             }
+          }
+          if (routedAfrr > 0) {
+            upAoffMW += routedAfrr; // offered to aFRR-up (whether or not it clears)
+            if (afrrUp && Apos >= ask) {
+              const disp = routedAfrr * (nposf[i] / 225);
+              soc -= (disp * e4) / etaLeg;
+              cUpA += routedAfrr * e4 * Apos;
+              upAmw += disp;
+              anyClear = true;
+              if (bids) bids.push({ i, prod: "afrr", dir: 1, price: Apos, mw: routedAfrr, status: "cleared", rep: repriced ? 1 : 0 });
+            } else if (bids) {
+              bids.push({ i, prod: "afrr", dir: 1, price: ask, mw: routedAfrr, status: repriced ? "repriced" : "resting" });
+            }
+          }
+          if (repriced && accept) {
+            nRepriced++;
+            if (anyClear) nRepClear++;
           }
         }
       }
+      // Deferred failed-divert refund — the energy returns to the battery for
+      // FUTURE ISPs (at the gate it was committed to the divert offer).
+      if (divRefundE > 0) soc += divRefundE / etaLeg;
 
-      // 3b. CHARGE leg (real-time, discretionary) — route between mFRR-dn /
-      //     aFRR-dn by the DOWN split, gated per-ISP on price, intraday fallback.
-      if (dir === -1 && !daChargeCommitted && budgetMW >= 1 && chargeOK) {
+      // 3b. CHARGE leg (real-time, discretionary) — sizing/routing on KNOWN
+      //     info only. Balancing bids are priced at the ceiling and clear iff
+      //     the realised price is at/below it; a share whose side was
+      //     unusable in the last SETTLED ISP re-routes to the other side;
+      //     intraday (which must commit FIRST, at T−30) takes the headroom
+      //     only when the settled balancing market couldn't charge us at the
+      //     ceiling AT ALL and the live quote is at/below the ceiling.
+      if (dir === -1 && !daChargeCommitted && canChg) {
         const headMW = Math.floor(Math.min(budgetMW, (hiRed - soc) / (e4 * etaLeg)));
         if (headMW > 0) {
-          let mShare = Math.round(sDn * headMW);
-          let aShare = headMW - mShare;
-          // route unusable shares to the other usable balancing side
-          let mMW = mfrrChgUsable ? mShare : 0;
-          let aMW = afrrChgUsable ? aShare : 0;
-          if (!mfrrChgUsable && afrrChgUsable) aMW += mShare;
-          else if (mfrrChgUsable && !afrrChgUsable) mMW += aShare;
-          let idMW = headMW - mMW - aMW; // whatever neither balancing side took
-          if (!idChgUsable) idMW = 0;
-          // mFRR-dn (binary full absorb)
+          let mMW = 0, aMW = 0, idMW = 0;
+          if (lagKnown && !mfrrChgLag && !afrrChgLag) {
+            idMW = idChgUsable ? headMW : 0; // balancing lag-dead → intraday (if quoted ≤ ceiling)
+          } else {
+            const mShare = Math.round(sDn * headMW);
+            const aShare = headMW - mShare;
+            if (lagKnown && !mfrrChgLag && afrrChgLag) aMW = aShare + mShare;
+            else if (lagKnown && mfrrChgLag && !afrrChgLag) mMW = mShare + aShare;
+            else { mMW = mShare; aMW = aShare; }
+          }
+          // mFRR-dn bid @ ceiling (binary full absorb) — clears iff realised ≤ ceiling
           if (mMW > 0) {
-            const stored = mMW * e4 * etaLeg;
-            cb = (cb * soc + P_mfrr * mMW * e4) / (soc + stored);
-            soc += stored;
-            cDnM -= mMW * e4 * P_mfrr;
-            dnMmw += mMW;
-            if (bids) bids.push({ i, prod: "mfrr", dir: -1, price: P_mfrr, mw: mMW, status: "cleared" });
+            if (mfrrChgUsable) {
+              const stored = mMW * e4 * etaLeg;
+              cb = (cb * soc + P_mfrr * mMW * e4) / (soc + stored);
+              soc += stored;
+              cDnM -= mMW * e4 * P_mfrr;
+              dnMmw += mMW;
+              if (bids) bids.push({ i, prod: "mfrr", dir: -1, price: P_mfrr, mw: mMW, status: "cleared" });
+            } else if (bids) {
+              bids.push({ i, prod: "mfrr", dir: -1, price: ceiling, mw: mMW, status: "resting" });
+            }
           }
-          // aFRR-dn (partial absorb)
+          // aFRR-dn bid @ ceiling (partial absorb) — clears iff realised avg ≤ ceiling
           if (aMW > 0) {
-            dnAoffMW += aMW; // offered to aFRR-dn
-            const absorbed = aMW * (nnegf[i] / 225);
-            const stored = absorbed * e4 * etaLeg;
-            if (soc + stored > 0) cb = (cb * soc + Aneg * aMW * e4) / (soc + stored);
-            soc += stored;
-            cDnA -= aMW * e4 * Aneg;
-            dnAmw += absorbed;
-            if (bids) bids.push({ i, prod: "afrr", dir: -1, price: Aneg, mw: aMW, status: "cleared" });
+            dnAoffMW += aMW; // offered to aFRR-dn (whether or not it clears)
+            if (afrrChgUsable) {
+              const absorbed = aMW * (nnegf[i] / 225);
+              const stored = absorbed * e4 * etaLeg;
+              if (soc + stored > 0) cb = (cb * soc + Aneg * aMW * e4) / (soc + stored);
+              soc += stored;
+              cDnA -= aMW * e4 * Aneg;
+              dnAmw += absorbed;
+              if (bids) bids.push({ i, prod: "afrr", dir: -1, price: Aneg, mw: aMW, status: "cleared" });
+            } else if (bids) {
+              bids.push({ i, prod: "afrr", dir: -1, price: ceiling, mw: aMW, status: "resting" });
+            }
           }
-          // intraday fallback (full absorb)
+          // intraday (full absorb at the quoted snapshot — executable pre-gate)
           if (idMW > 0) {
             const stored = idMW * e4 * etaLeg;
             cb = (cb * soc + Vwap * idMW * e4) / (soc + stored);
@@ -500,7 +612,7 @@ const BessEngine = (() => {
             cChg -= idMW * e4 * Vwap;
             chgOtherMW += idMW;
           }
-          budgetMW -= mMW + aMW + idMW;
+          budgetMW -= mMW + aMW + idMW; // placed = reserved, cleared or not
         }
       }
 
@@ -522,6 +634,8 @@ const BessEngine = (() => {
         const dd = detail;
         dd.soc[k] = soc;
         dd.daSell[k] = daSellMW;
+        dd.daBuy[k] = daChargeCommitted ? 1 : 0;
+        dd.divFlag[k] = divFlag;
         dd.upM[k] = upMmw;
         dd.upA[k] = upAmw;
         dd.upAoff[k] = upAoffMW;
@@ -561,8 +675,8 @@ const BessEngine = (() => {
         nShort++;
         shortMWh += shortE;
       }
-      if (soc <= 1e-6) nAt0++;
-      if (soc >= cap - 1e-6) nAtFull++;
+      if (soc < pinLo) nLowRed++;
+      if (soc > pinHi) nUpRed++;
       if (ispDir === 1) nDis++;
       else if (ispDir === -1) nChg++;
       else nIdle++;
@@ -597,7 +711,7 @@ const BessEngine = (() => {
     detail.windowEnd = winEnd;
     detail.filteredRevenue = Float64Array.from(filteredRev);
     detail.breakdown = { DA: bDA, mFRR_up: bUpM, aFRR_up: bUpA, mFRR_dn: bDnM, aFRR_dn: bDnA, intraday: bID, charge: bChg, imb: bImb, flat: bFlat };
-    detail.counts = { discharge: nDis, charge: nChg, idle: nIdle, daCleared: nDAcleared, upMfrr: nUpM, upAfrr: nUpA, dnMfrr: nDnM, dnAfrr: nDnA, withdrawn: nWithdraw, short: nShort, unfulfilled: nUnfulfilled, at0: nAt0, atFull: nAtFull };
+    detail.counts = { discharge: nDis, charge: nChg, idle: nIdle, daCleared: nDAcleared, upMfrr: nUpM, upAfrr: nUpA, dnMfrr: nDnM, dnAfrr: nDnA, repriced: nRepriced, repClear: nRepClear, divMiss: nDivMiss, short: nShort, unfulfilled: nUnfulfilled, lowRed: nLowRed, upRed: nUpRed };
     detail.stats = { mwhDischarged, mwhCharged, shortMWh, cycles: mwhDischarged / usable, avgDisRun: cntDisRun ? sumDisRun / cntDisRun : 0, avgChgRun: cntChgRun ? sumChgRun / cntChgRun : 0, avgIdleGap: cntIdleGap ? sumIdleGap / cntIdleGap : 0 };
     detail.finalSoc = soc;
     return detail;
@@ -612,7 +726,7 @@ const BessEngine = (() => {
       soc: f32(), daSell: f32(), upM: f32(), upA: f32(), upAoff: f32(), dnM: f32(), dnA: f32(), dnAoff: f32(), chgOther: f32(),
       rev: f32(), revDA: f32(), revUp: f32(), revDn: f32(), revID: f32(), revChg: f32(),
       costImb: f32(), costFlat: f32(), short: f32(), effCost: f32(),
-      dayType: new Uint8Array(wLen), dir: new Int8Array(wLen), bids: [],
+      dayType: new Uint8Array(wLen), dir: new Int8Array(wLen), daBuy: new Uint8Array(wLen), divFlag: new Int8Array(wLen), bids: [],
     };
     return _run(params, detail);
   }

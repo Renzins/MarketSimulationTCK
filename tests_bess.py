@@ -7,10 +7,22 @@ stateful state-of-charge loop, exercised three ways:
   A. FORECAST     — lag-24h (96-ISP) DA forecast + per-day peak/trough ranks.
   B. CORE MECHANICS (synthetic, hand-computed) — whole-MW offers, round-trip
      efficiency, cost-basis + min-delta gate, power cap, SoC bounds, red zones,
-     dwell, must-fulfil, price-aware charging, day-ahead buy-low, opportunistic
-     divert (keeps DA revenue, closes on intraday only — no imbalance clairvoyance).
+     red-zone time audit (pinned counters), dwell, must-fulfil, price-aware
+     charging, day-ahead buy-low, opportunistic divert (keeps DA revenue, closes
+     on intraday only — no imbalance clairvoyance), reactive ask re-pricing
+     (rests on a stall, clears the FULL volume on continuation; per-leg ask gate).
   C. REAL DATA    — rev == Σ components, SoC ∈ [0,cap], whole-MW market volumes,
      day-type partition, strategy-off neutrality, frozen default revenue.
+
+DYNAMIC DISCHARGE PRICING (reactive ask): every discretionary balancing offer
+carries an ask = effCost + minDelta; a leg clears only when ITS price reaches
+the ask. On a gate-observable run-up (p_mfrr[i-1] - p_mfrr[i-1-lookback] >=
+dd_threshold) the whole offer is re-priced to p_mfrr[i-1] + dd_markup — full
+volume stays offered, nothing is withheld (the old dd_hold withholding is gone).
+
+RED-ZONE TIME AUDIT: counts.lowRed / counts.upRed = ISPs whose end-of-ISP SoC is
+pinned at/inside a red zone (soc < loRed + 0.25/etaLeg, soc > hiRed - 0.25*etaLeg
+— within one whole-MW step of the boundary, or beyond it).
 
 JS↔Python parity: the mirror produces a frozen number; the browser JS is checked
 to match it (see FROZEN_* / README). Mirror is float64; JS reads float32 winsor
@@ -38,14 +50,20 @@ DATA_JS = os.path.join(BASE, "data.js")
 AFRR_15MIN_JS = os.path.join(BASE, "data-afrr-15min.js")
 
 LAG = 96
+# Newest SETTLED ISP at decision time is i−3: the intraday gate (t0−30) is the
+# end of ISP i−3; the balancing gate (t0−25) falls inside ISP i−2. Decisions
+# read settled prices only; realised same-ISP prices decide only clearing.
+LAG_SETTLED = 3
 EPS = 1e-9
 E4 = 0.25  # hours per ISP
 
 # Cross-checked against the browser JS (BessEngine) at the default config over
 # the full dataset. Re-freeze after any engine change (the test prints the value).
-# Cross-checked against the browser JS (BessEngine) at the default config over
-# the full dataset. (Dwell is a cooldown/rest measured from the last action.)
-FROZEN_DEFAULT_REVENUE_EUR = 2896808.88
+# Current freeze: FAIR INFORMATION TIMING (all decisions on settled ≤ i−3
+# prices + the pre-gate intraday quote; realised prices only clear bids) +
+# reactive-ask dynamic discharge (lb=1/thr=20/markup=75; the old hard
+# mFRR→aFRR switch removed) + per-leg ask gate + red-zone time audit.
+FROZEN_DEFAULT_REVENUE_EUR = 2109994.41
 
 
 # =============================================================================
@@ -228,8 +246,8 @@ def resolve_params(params):
         da_n_periods=max(0, int(params.get("da_n_periods", 0) or 0)) if da_on else 0,
         da_mw=max(0, int(math.floor(num("da_mw", 20)))),
         chargeOn=charge_on, max_charge_price=num("max_charge_price", 20) if charge_on else -1e9,
-        ddOn=dd_on, dd_lookback=max(1, int(params.get("dd_lookback", 4) or 4)),
-        dd_threshold=max(0.0, num("dd_threshold", 20)), dd_hold=(c01(num("dd_hold", 0.5)) if dd_on else 0.0),
+        ddOn=dd_on, dd_lookback=max(1, int(params.get("dd_lookback", 1) or 1)),
+        dd_threshold=max(0.0, num("dd_threshold", 20)), dd_markup=(max(0.0, num("dd_markup", 75)) if dd_on else 0.0),
         oppOn=opp_on, opp_threshold=(max(0.0, num("opp_threshold", 100)) if opp_on else 1e9),
         dayTypeFilter=params.get("dayTypeFilter", "all"),
     )
@@ -244,7 +262,8 @@ def _split_blocks(start, win, step, wait, fxM, fxA, upto, n):
     blocks[0] = s
     for k in range(1, nB):
         if step > 0:
-            boundary = k * wt
+            # window ends at the last SETTLED ISP before the block boundary
+            boundary = max(0, k * wt - LAG_SETTLED + 1)
             lo, hi = max(0, boundary - lb), min(boundary, n)
             cnt = hi - lo
             if cnt > 0:
@@ -301,7 +320,11 @@ def bess_run(A, params):
     total = 0.0
     b = dict(DA=0.0, mFRR_up=0.0, aFRR_up=0.0, mFRR_dn=0.0, aFRR_dn=0.0, intraday=0.0, charge=0.0, imb=0.0, flat=0.0)
     c = dict(discharge=0, charge=0, idle=0, daCleared=0, upMfrr=0, upAfrr=0, dnMfrr=0, dnAfrr=0,
-             withdrawn=0, short=0, unfulfilled=0, at0=0, atFull=0)
+             repriced=0, repClear=0, divMiss=0, short=0, unfulfilled=0, lowRed=0, upRed=0)
+    # red-zone time audit: pinned at/inside a zone = within one whole-MW step
+    # of its boundary (or beyond it — committed DA legs may dig inside)
+    pinLo = loRed + E4 / eta
+    pinHi = hiRed - E4 * eta
     mwhDis = mwhChg = shortMWh = 0.0
     socs, revs, fr = [], [], []
     daSells, upMs, dnMs, chgOs = [], [], [], []
@@ -320,10 +343,23 @@ def bess_run(A, params):
         shortE = 0.0
         dir_ = 0
         da_charge_committed = False
+        div_refund_e = 0.0
 
+        # realised same-ISP favourability — clearing conditions ONLY
         mfrrUp = P_mfrr >= 1
         afrrUp = Apos > 0
-        bestUp = max(P_mfrr if mfrrUp else -math.inf, Apos if afrrUp else -math.inf)
+
+        # KNOWN info at the gates: settled ISP i−3 + live intraday quote
+        jl = i - LAG_SETTLED
+        lag_known = jl >= 0
+        pmfJ = pmf[jl] if lag_known else math.nan
+        aposJ = apos[jl] if lag_known else 0.0
+        anegJ = aneg[jl] if lag_known else 0.0
+        mfrrUpLag = pmfJ >= 1
+        afrrUpLag = aposJ > 0
+        bestUpLag = max(pmfJ if mfrrUpLag else -math.inf, aposJ if afrrUpLag else -math.inf)
+        mfrrChgLag = pmfJ <= -1 and pmfJ <= ceiling
+        afrrChgLag = anegJ < 0 and anegJ <= ceiling
 
         da_dis = p["daOn"] and rhi[i] < p["da_n_periods"] and fc[i] >= p["da_min_price"] and P_da >= p["da_min_price"]
         da_buy = (not da_dis) and p["daOn"] and rlo[i] < p["da_n_periods"] and fc[i] <= p["da_charge_price"] and P_da <= p["da_charge_price"]
@@ -357,19 +393,19 @@ def bess_run(A, params):
                 cChg -= chgMW * E4 * P_da
                 chgOtherMW += chgMW
 
-        mfrrDn = P_mfrr <= -1
-        afrrDn = Aneg < 0
-        mfrrChgU = mfrrDn and P_mfrr <= ceiling
-        afrrChgU = afrrDn and Aneg <= ceiling
-        idChgU = (not math.isnan(Vwap)) and Vwap <= ceiling
-        bestChg = math.inf
-        for ok, pr in ((mfrrChgU, P_mfrr), (afrrChgU, Aneg), (idChgU, Vwap)):
-            if ok and pr < bestChg:
-                bestChg = pr
-        anyChgU = mfrrChgU or afrrChgU or idChgU
+        # realised charge usability — clearing conditions only
+        mfrrChgU = P_mfrr <= -1 and P_mfrr <= ceiling
+        afrrChgU = Aneg < 0 and Aneg <= ceiling
+        idChgU = (not math.isnan(Vwap)) and Vwap <= ceiling  # executable quote
+        # best KNOWN charge source (settled balancing / live intraday quote)
+        bestChgKnown = math.inf
+        for ok, pr in ((mfrrChgLag, pmfJ), (afrrChgLag, anegJ), (idChgU, Vwap)):
+            if ok and pr < bestChgKnown:
+                bestChgKnown = pr
 
-        dischargeOK = soc > loRed + EPS and budgetMW >= 1 and bestUp > -math.inf and bestUp >= effCost + minDelta
-        chargeOK = soc < hiRed - EPS and budgetMW >= 1 and anyChgU
+        # placement is a posture: place whenever physically possible
+        canDis = soc > loRed + EPS and budgetMW >= 1
+        canChg = soc < hiRed - EPS and budgetMW >= 1
         # cooldown rest measured from the last action (block END), not flip start
         in_cooldown = (i - lastActISP) < dwell
         rest_ok = lambda want: actMode == 0 or actMode == want or not in_cooldown
@@ -378,94 +414,133 @@ def bess_run(A, params):
             pass
         elif dir_ == 1:
             pass
-        elif dischargeOK and chargeOK:
+        elif canDis and canChg:
             if actMode == -1 and in_cooldown:
                 dir_ = -1
             elif actMode == 1 and in_cooldown:
                 dir_ = 1
             else:
-                dir_ = 1 if (bestUp - effCost) >= (ceiling - bestChg) else -1
-        elif dischargeOK and rest_ok(1):
+                upScore = (bestUpLag - effCost) if bestUpLag > -math.inf else -math.inf
+                dnScore = (ceiling - bestChgKnown) if bestChgKnown < math.inf else -math.inf
+                dir_ = 1 if upScore >= dnScore else -1
+        elif canDis and rest_ok(1):
             dir_ = 1
-        elif chargeOK and rest_ok(-1):
+        elif canChg and rest_ok(-1):
             dir_ = -1
 
         # 3a. discharge leg (not budget-gated: opportunistic redirects already-
         # delivered DA energy; extra-discharge below is self-gated by availMW)
         if dir_ == 1 and not da_charge_committed:
-            # divert only into mFRR-up (binary/full); never aFRR (partial)
-            if p["oppOn"] and daSellMW > 0 and mfrrUp and not math.isnan(Vwap) and (P_mfrr - Vwap) >= p["opp_threshold"]:
+            # opportunistic divert — REACTIVE trigger (settled i−3 price vs the
+            # live intraday quote); intraday buy-back COMMITTED either way; the
+            # freed energy is offered to mFRR at ask = Vwap + threshold. Miss ⇒
+            # energy stays stored (deferred SoC refund), net (p_da − vwap)·E.
+            if p["oppOn"] and daSellMW > 0 and mfrrUpLag and not math.isnan(Vwap) and (pmfJ - Vwap) >= p["opp_threshold"]:
                 e = daSellMW * E4
+                askDiv = Vwap + p["opp_threshold"]
                 cID -= e * Vwap
-                cUpM += e * P_mfrr
-                upMmw += daSellMW
+                if mfrrUp and P_mfrr >= askDiv:
+                    cUpM += e * P_mfrr
+                    upMmw += daSellMW
+                    bids.append((i, "mfrr", 1, daSellMW, P_mfrr, "cleared"))
+                else:
+                    div_refund_e = e  # refund AFTER the extra offer (sizing is gate-time)
+                    if accept:
+                        c["divMiss"] += 1
+                    bids.append((i, "mfrr", 1, daSellMW, askDiv, "resting"))
                 daSellMW = 0.0
             availMW = math.floor(min(budgetMW, (max(0.0, soc - loRed) * eta) / E4))
-            if availMW > 0 and bestUp >= effCost + minDelta:
-                hold = 0.0
-                if p["ddOn"] and p["dd_hold"] > 0 and (i - p["dd_lookback"]) >= 0:
-                    past = pmf[i - p["dd_lookback"]]
-                    if not math.isnan(past) and (P_mfrr - past) >= p["dd_threshold"]:
-                        hold = p["dd_hold"]
-                offerMW = math.floor(availMW * (1 - hold))
-                heldMW = availMW - offerMW
-                if heldMW > 0:
-                    bids.append((i, "mfrr", 1, "withdrawn"))
-                    if accept:
-                        c["withdrawn"] += 1
-                if offerMW > 0:
-                    toMfrr = sUp
-                    if p["ddOn"] and afrrUp and mfrrUp and Apos > P_mfrr:
-                        toMfrr = 0.0
-                    routedMfrr = round(toMfrr * offerMW)
-                    routedAfrr = offerMW - routedMfrr
-                    budgetMW -= offerMW
-                    if routedMfrr > 0 and mfrrUp:
+            if availMW > 0:
+                # reactive ask: resting level = break-even + margin; on a
+                # run-up over SETTLED ISPs the WHOLE offer is re-priced to
+                # last-settled + markup (full volume offered, nothing withheld)
+                ask = effCost + minDelta
+                repriced = False
+                if p["ddOn"] and p["dd_markup"] > 0 and lag_known and (jl - p["dd_lookback"]) >= 0:
+                    past = pmf[jl - p["dd_lookback"]]
+                    if not math.isnan(pmfJ) and not math.isnan(past) and (pmfJ - past) >= p["dd_threshold"]:
+                        raised = pmfJ + p["dd_markup"]
+                        if raised > ask:
+                            ask = raised
+                            repriced = True
+                toMfrr = sUp  # mFRR<->aFRR routing is the adaptive split's job
+                routedMfrr = round(toMfrr * availMW)
+                routedAfrr = availMW - routedMfrr
+                budgetMW -= availMW  # offered capacity reserved whether or not it clears
+                any_clear = False
+                if routedMfrr > 0:
+                    if mfrrUp and P_mfrr >= ask:
                         soc -= routedMfrr * E4 / eta
                         cUpM += routedMfrr * E4 * P_mfrr
                         upMmw += routedMfrr
-                    if routedAfrr > 0 and afrrUp:
+                        any_clear = True
+                        bids.append((i, "mfrr", 1, routedMfrr, P_mfrr, "cleared-rep" if repriced else "cleared"))
+                    else:
+                        bids.append((i, "mfrr", 1, routedMfrr, ask, "repriced" if repriced else "resting"))
+                if routedAfrr > 0:
+                    if afrrUp and Apos >= ask:
                         disp = routedAfrr * (nposf[i] / 225)
                         soc -= disp * E4 / eta
                         cUpA += routedAfrr * E4 * Apos
                         upAmw += disp
+                        any_clear = True
+                        bids.append((i, "afrr", 1, routedAfrr, Apos, "cleared-rep" if repriced else "cleared"))
+                    else:
+                        bids.append((i, "afrr", 1, routedAfrr, ask, "repriced" if repriced else "resting"))
+                if repriced and accept:
+                    c["repriced"] += 1
+                    if any_clear:
+                        c["repClear"] += 1
+        # deferred failed-divert refund — energy returns for FUTURE ISPs
+        if div_refund_e > 0:
+            soc += div_refund_e / eta
 
-        # 3b. charge leg
-        if dir_ == -1 and not da_charge_committed and budgetMW >= 1 and chargeOK:
+        # 3b. charge leg — sizing/routing on KNOWN info only; realised prices
+        # decide clearing. Intraday only when settled balancing was dead.
+        if dir_ == -1 and not da_charge_committed and canChg:
             headMW = math.floor(min(budgetMW, (hiRed - soc) / (E4 * eta)))
             if headMW > 0:
-                mShare = round(sDn * headMW)
-                aShare = headMW - mShare
-                mMW = mShare if mfrrChgU else 0
-                aMW = aShare if afrrChgU else 0
-                if (not mfrrChgU) and afrrChgU:
-                    aMW += mShare
-                elif mfrrChgU and (not afrrChgU):
-                    mMW += aShare
-                idMW = headMW - mMW - aMW
-                if not idChgU:
-                    idMW = 0
+                mMW = aMW = idMW = 0
+                if lag_known and not mfrrChgLag and not afrrChgLag:
+                    idMW = headMW if idChgU else 0
+                else:
+                    mShare = round(sDn * headMW)
+                    aShare = headMW - mShare
+                    if lag_known and not mfrrChgLag and afrrChgLag:
+                        aMW = aShare + mShare
+                    elif lag_known and mfrrChgLag and not afrrChgLag:
+                        mMW = mShare + aShare
+                    else:
+                        mMW, aMW = mShare, aShare
                 if mMW > 0:
-                    stored = mMW * E4 * eta
-                    cb = (cb * soc + P_mfrr * mMW * E4) / (soc + stored)
-                    soc += stored
-                    cDnM -= mMW * E4 * P_mfrr
-                    dnMmw += mMW
+                    if mfrrChgU:
+                        stored = mMW * E4 * eta
+                        cb = (cb * soc + P_mfrr * mMW * E4) / (soc + stored)
+                        soc += stored
+                        cDnM -= mMW * E4 * P_mfrr
+                        dnMmw += mMW
+                        bids.append((i, "mfrr", -1, mMW, P_mfrr, "cleared"))
+                    else:
+                        bids.append((i, "mfrr", -1, mMW, ceiling, "resting"))
                 if aMW > 0:
-                    absorbed = aMW * (nnegf[i] / 225)
-                    stored = absorbed * E4 * eta
-                    if soc + stored > 0:
-                        cb = (cb * soc + Aneg * aMW * E4) / (soc + stored)
-                    soc += stored
-                    cDnA -= aMW * E4 * Aneg
-                    dnAmw += absorbed
+                    if afrrChgU:
+                        absorbed = aMW * (nnegf[i] / 225)
+                        stored = absorbed * E4 * eta
+                        if soc + stored > 0:
+                            cb = (cb * soc + Aneg * aMW * E4) / (soc + stored)
+                        soc += stored
+                        cDnA -= aMW * E4 * Aneg
+                        dnAmw += absorbed
+                        bids.append((i, "afrr", -1, aMW, Aneg, "cleared"))
+                    else:
+                        bids.append((i, "afrr", -1, aMW, ceiling, "resting"))
                 if idMW > 0:
                     stored = idMW * E4 * eta
                     cb = (cb * soc + Vwap * idMW * E4) / (soc + stored)
                     soc += stored
                     cChg -= idMW * E4 * Vwap
                     chgOtherMW += idMW
-                budgetMW -= mMW + aMW + idMW
+                budgetMW -= mMW + aMW + idMW  # placed = reserved
 
         if soc < -1e-6 or soc > cap + 1e-6:
             max_viol = max(max_viol, abs(soc - min(max(soc, 0), cap)))
@@ -498,14 +573,139 @@ def bess_run(A, params):
         if shortE > 1e-6:
             c["short"] += 1
             shortMWh += shortE
-        if soc <= 1e-6: c["at0"] += 1
-        if soc >= cap - 1e-6: c["atFull"] += 1
+        if soc < pinLo: c["lowRed"] += 1
+        if soc > pinHi: c["upRed"] += 1
         c["discharge" if ispDir == 1 else ("charge" if ispDir == -1 else "idle")] += 1
 
     return dict(total=total, breakdown=b, counts=c, mwhDischarged=mwhDis, mwhCharged=mwhChg,
                 shortMWh=shortMWh, finalSoc=soc, soc=np.asarray(socs), rev=np.asarray(revs),
                 filtered_rev=np.asarray(fr), daSell=np.asarray(daSells), upM=np.asarray(upMs),
                 dnM=np.asarray(dnMs), chgOther=np.asarray(chgOs), bids=bids, max_balancing_violation=max_viol)
+
+
+# =============================================================================
+#  Sensitivity math — Python mirror of optim-sens.js (OptimSens, shared by
+#  the BESS and wind-park pages)
+# =============================================================================
+def sens_ranks(a):
+    idx = sorted(range(len(a)), key=lambda i: a[i])
+    rk = [0.0] * len(a)
+    i = 0
+    while i < len(idx):
+        j = i
+        while j + 1 < len(idx) and a[idx[j + 1]] == a[idx[i]]:
+            j += 1
+        r = (i + j) / 2 + 1  # average rank across ties
+        for k in range(i, j + 1):
+            rk[idx[k]] = r
+        i = j + 1
+    return rk
+
+
+def sens_spearman(xs, ys):
+    rx, ry = sens_ranks(list(xs)), sens_ranks(list(ys))
+    n = len(rx)
+    if n < 2:
+        return 0.0
+    mx, my = sum(rx) / n, sum(ry) / n
+    sxy = sum((rx[i] - mx) * (ry[i] - my) for i in range(n))
+    sxx = sum((x - mx) ** 2 for x in rx)
+    syy = sum((y - my) ** 2 for y in ry)
+    return sxy / math.sqrt(sxx * syy) if sxx > 0 and syy > 0 else 0.0
+
+
+def sens_weight_and_band(curve, v_star, r_star, tol=0.01):
+    """curve = [(v, r)] sorted by v (must contain v_star or its nearest)."""
+    denom = max(1.0, abs(r_star))
+    loss = [(r_star - r) / denom for _, r in curve]
+    i_star = 0
+    for i in range(1, len(curve)):
+        if abs(curve[i][0] - v_star) < abs(curve[i_star][0] - v_star):
+            i_star = i
+    weight = 0.0
+    for L in loss:
+        if L > weight:
+            weight = L
+    lo, hi = i_star, i_star
+    while lo > 0 and loss[lo - 1] <= tol:
+        lo -= 1
+    while hi < len(curve) - 1 and loss[hi + 1] <= tol:
+        hi += 1
+    if weight <= tol:
+        shape = "flat"
+    else:
+        r_first, r_last = curve[0][1], curve[-1][1]
+        if r_star - max(r_first, r_last) <= tol * denom:
+            shape = "up" if r_last >= r_first else "down"
+        else:
+            shape = "peaked"
+    nb = max(loss[i_star - 1] if i_star > 0 else 0.0,
+             loss[i_star + 1] if i_star < len(curve) - 1 else 0.0)
+    return dict(weight=weight, band=[curve[lo][0], curve[hi][0]], shape=shape,
+                sharp=nb > 0.05, edge=(i_star == 0 or i_star == len(curve) - 1))
+
+
+def _sens_bins(vals):
+    uniq = sorted(set(vals))
+    if len(uniq) <= 3:
+        return [uniq.index(v) for v in vals]
+    s = sorted(vals)
+    q1, q2 = _percentile_value(s, 100 / 3), _percentile_value(s, 200 / 3)
+    return [0 if v <= q1 else (1 if v <= q2 else 2) for v in vals]
+
+
+def sens_interaction_scores(pop, keys, r_star, min_cell=20):
+    """pop = [{'sample': {...}, 'revenue': r}] — pairwise non-additivity of
+    tertile-binned cell means, RMS residual as a fraction of |r_star|."""
+    denom = max(1.0, abs(r_star))
+    ys = [p["revenue"] for p in pop]
+    bins_by = {k: _sens_bins([p["sample"][k] for p in pop]) for k in keys}
+    out = []
+    for a in range(len(keys)):
+        for b in range(a + 1, len(keys)):
+            ba, bb = bins_by[keys[a]], bins_by[keys[b]]
+            sm = [[0.0] * 3 for _ in range(3)]
+            ct = [[0] * 3 for _ in range(3)]
+            for i, yv in enumerate(ys):
+                sm[ba[i]][bb[i]] += yv
+                ct[ba[i]][bb[i]] += 1
+            g = gn = 0.0
+            valid = 0
+            for r in range(3):
+                for c in range(3):
+                    if ct[r][c] >= min_cell:
+                        g += sm[r][c]
+                        gn += ct[r][c]
+                        valid += 1
+            if valid < 6 or gn == 0:
+                continue
+            g /= gn
+            rowE, colE = [0.0] * 3, [0.0] * 3
+            for r in range(3):
+                s = n = 0.0
+                for c in range(3):
+                    if ct[r][c] >= min_cell:
+                        s += sm[r][c]
+                        n += ct[r][c]
+                rowE[r] = s / n - g if n > 0 else 0.0
+            for c in range(3):
+                s = n = 0.0
+                for r in range(3):
+                    if ct[r][c] >= min_cell:
+                        s += sm[r][c]
+                        n += ct[r][c]
+                colE[c] = s / n - g if n > 0 else 0.0
+            se = sw = 0.0
+            for r in range(3):
+                for c in range(3):
+                    if ct[r][c] < min_cell:
+                        continue
+                    e = sm[r][c] / ct[r][c] - (g + rowE[r] + colE[c])
+                    se += ct[r][c] * e * e
+                    sw += ct[r][c]
+            out.append(dict(a=keys[a], b=keys[b], score=math.sqrt(se / sw) / denom))
+    out.sort(key=lambda x: -x["score"])
+    return out
 
 
 # =============================================================================
@@ -549,7 +749,7 @@ DEFAULT_PARAMS = dict(
     upper_red_pct=80, lower_red_pct=20, min_delta=100, theta_flat=30,
     s_up_start=1, s_up_win=96, s_up_wait=1, s_up_step=0, s_dn_start=1, s_dn_win=96, s_dn_wait=1, s_dn_step=0,
     da_min_price=100, da_charge_price=0, da_n_periods=8, da_mw=20, max_charge_price=20,
-    dd_lookback=4, dd_threshold=20, dd_hold=0.5, opp_threshold=100,
+    dd_lookback=1, dd_threshold=20, dd_markup=75, opp_threshold=100,
     enabled=dict(split=True, daDischarge=True, charging=True, dynamicDischarge=True, opportunistic=True),
 )
 
@@ -580,24 +780,31 @@ def test_da_peak_and_trough_ranks():
 #  B. CORE MECHANICS
 # =============================================================================
 def test_charge_efficiency_and_costbasis():
-    A = synth(1, p_mfrr=np.array([-10.0]))
+    # 3 warm-up ISPs give the fair engine a SETTLED price to act on at i=3;
+    # the warm-up itself is inert (no-info posture rests a discharge offer,
+    # which cannot clear at −10 €/MWh).
+    A = synth(4, p_mfrr=np.full(4, -10.0))
     p = dict(DEFAULT_PARAMS, init_soc_pct=25, da_n_periods=0, max_charge_price=20,
              enabled=dict(split=False, daDischarge=False, charging=True, dynamicDischarge=False, opportunistic=False))
     r = bess_run(A, p)
     eta = math.sqrt(0.9)
     soc0 = 0.25 * 40
+    assert abs(r["soc"][2] - soc0) < 1e-9, "warm-up must be inert"
     headMW = min(20, math.floor((0.8 * 40 - soc0) / (E4 * eta)))  # 20
     stored = headMW * E4 * eta
-    assert abs(r["soc"][0] - (soc0 + stored)) < 1e-6
+    assert abs(r["soc"][3] - (soc0 + stored)) < 1e-6
     assert abs(r["total"] - (headMW * E4 * 10.0)) < 1e-6, "paid 10/MWh to absorb ⇒ +revenue"
     assert r["counts"]["dnMfrr"] == 1
 
 
 def test_power_cap_limits_throughput():
+    # init 10% is BELOW the red floor ⇒ canDis is false, so the charge side is
+    # placed from ISP 0 with no history needed (single-side, not a tie-break).
     A = synth(1, p_mfrr=np.array([-10.0]))
     p = dict(DEFAULT_PARAMS, power_mw=20, init_soc_pct=10, da_n_periods=0,
              enabled=dict(split=False, daDischarge=False, charging=True, dynamicDischarge=False, opportunistic=False))
     r = bess_run(A, p)
+    assert r["dnM"][0] > 0, "the charge bid must clear at −10 €/MWh"
     assert r["mwhCharged"] <= 20 * E4 + 1e-6
 
 
@@ -627,10 +834,16 @@ def test_red_zones_bound_discretionary():
 
 
 def test_dwell_blocks_fast_flip():
-    A = synth(2, p_mfrr=np.array([-50.0, 300.0]))
-    p = dict(DEFAULT_PARAMS, init_soc_pct=50, dwell_isps=4, min_delta=0, da_n_periods=0, max_charge_price=20,
+    # charge fires at i=3 (settled −50 seen), then the price flips high; with a
+    # long dwell the flip to discharge stays blocked, with dwell=0 it clears.
+    A = synth(8, p_mfrr=np.array([-50.0] * 4 + [300.0] * 4))
+    p = dict(DEFAULT_PARAMS, init_soc_pct=50, dwell_isps=8, min_delta=0, da_n_periods=0, max_charge_price=20,
              enabled=dict(split=False, daDischarge=False, charging=True, dynamicDischarge=False, opportunistic=False))
-    assert bess_run(A, p)["mwhDischarged"] == 0
+    r = bess_run(A, p)
+    assert r["counts"]["dnMfrr"] >= 1, "the settled cheap price must trigger a charge"
+    assert r["mwhDischarged"] == 0, "dwell must block the flip to discharge"
+    r0 = bess_run(A, dict(p, dwell_isps=0))
+    assert r0["mwhDischarged"] > 0, "without dwell the flip clears (dwell was binding)"
 
 
 def test_dwell_enforces_rest_between_opposite_phases():
@@ -671,14 +884,15 @@ def test_must_fulfil_no_soc_violation_random():
 
 def test_charge_price_aware_skips_above_ceiling():
     # mFRR-dn exists at −2 but ceiling −50 excludes it; aFRR-dn −80 is usable.
-    # Split off (sDn=1) routes to mFRR, but its share falls back to aFRR.
-    A = synth(1, p_mfrr=np.array([-2.0]), avg_p_neg=np.array([-80.0]))
+    # Split off (sDn=1) routes to mFRR, but the SETTLED (i−3) usability
+    # re-routes that share to aFRR — no same-ISP knowledge involved.
+    A = synth(4, p_mfrr=np.full(4, -2.0), avg_p_neg=np.full(4, -80.0))
     p = dict(DEFAULT_PARAMS, init_soc_pct=20, da_n_periods=0, max_charge_price=-50,
              enabled=dict(split=False, daDischarge=False, charging=True, dynamicDischarge=False, opportunistic=False))
     r = bess_run(A, p)
     eta = math.sqrt(0.9)
     headMW = min(20, math.floor((0.8 * 40 - 0.2 * 40) / (E4 * eta)))
-    assert r["counts"]["dnAfrr"] == 1 and r["counts"]["dnMfrr"] == 0, "must avoid the above-ceiling mFRR side"
+    assert r["counts"]["dnAfrr"] == 1 and r["counts"]["dnMfrr"] == 0, "must avoid the lag-unusable mFRR side"
     assert abs(r["total"] - headMW * E4 * 80.0) < 1e-6
 
 
@@ -693,19 +907,245 @@ def test_da_buy_low_committed_at_trough():
 
 
 def test_opportunistic_keeps_da_and_uses_intraday():
-    # DA-sold peak + balancing spike ⇒ divert: KEEP DA revenue, close on intraday.
-    A = synth(1, p_da=np.array([200.0]), p_mfrr=np.array([400.0]), vwap_1h=np.array([100.0]),
-              fc=np.array([200.0]), rank_hi=np.array([0], dtype=np.int64))
-    p = dict(DEFAULT_PARAMS, init_soc_pct=100, min_delta=0, da_min_price=100, da_n_periods=8, da_mw=20,
+    # DA-sold peak + a SETTLED spike signal (i−3 mFRR 300 above the intraday
+    # quote) ⇒ divert: buy the DA volume back on intraday, offer it to mFRR at
+    # ask = Vwap + threshold; the spike persists ⇒ clears. DA revenue KEPT.
+    big = 1 << 30
+    A = synth(4, p_da=np.full(4, 200.0), p_mfrr=np.full(4, 400.0), vwap_1h=np.full(4, 100.0),
+              fc=np.array([np.nan, np.nan, np.nan, 200.0]),
+              rank_hi=np.array([big, big, big, 0], dtype=np.int64))
+    p = dict(DEFAULT_PARAMS, init_soc_pct=20, min_delta=0, da_min_price=100, da_n_periods=8, da_mw=20,
              opp_threshold=100,
              enabled=dict(split=False, daDischarge=True, charging=False, dynamicDischarge=False, opportunistic=True))
     r = bess_run(A, p)
     bd = r["breakdown"]
-    # 20 MW × 0.25 h delivered: DA kept = 1000, balancing = 5×400 = 2000, intraday close = −5×100 = −500
+    # 20 MW × 0.25 h delivered at i=3: DA kept = 1000, balancing = 5×400 = 2000,
+    # intraday close = −5×100 = −500 (warm-up is inert: soc sits at the red floor)
     assert abs(bd["DA"] - 1000) < 1e-6, "DA revenue must be KEPT on divert"
     assert abs(bd["mFRR_up"] - 2000) < 1e-6
     assert abs(bd["intraday"] - (-500)) < 1e-6, "close on intraday only (imbalance never chosen)"
     assert abs(r["total"] - 2500) < 1e-6
+    assert r["counts"]["divMiss"] == 0
+
+
+def test_opportunistic_miss_pays_the_spread_and_keeps_energy():
+    """A divert is a committed BET now: the intraday buy-back happens at the
+    gate; if the spike then fizzles (realised mFRR below Vwap + threshold) the
+    mFRR offer rests, the energy stays in the battery and the net P&L of the
+    ISP is (p_da − vwap)·E — a real loss when the buy-back was dearer."""
+    big = 1 << 30
+    A = synth(4, p_da=np.full(4, 200.0), p_mfrr=np.array([400.0, 400.0, 400.0, 150.0]),
+              vwap_1h=np.full(4, 100.0), fc=np.array([np.nan, np.nan, np.nan, 200.0]),
+              rank_hi=np.array([big, big, big, 0], dtype=np.int64))
+    p = dict(DEFAULT_PARAMS, init_soc_pct=20, min_delta=0, da_min_price=100, da_n_periods=8, da_mw=20,
+             opp_threshold=100,
+             enabled=dict(split=False, daDischarge=True, charging=False, dynamicDischarge=False, opportunistic=True))
+    r = bess_run(A, p)
+    bd = r["breakdown"]
+    # trigger: settled pmf[0]=400 − Vwap 100 ≥ 100 ✓; realised 150 < ask 200 ⇒ miss
+    assert abs(bd["DA"] - 1000) < 1e-6, "DA revenue still earned (covered by intraday)"
+    assert abs(bd["mFRR_up"]) < 1e-6, "the diverted offer must NOT clear at 150 < ask 200"
+    assert abs(bd["intraday"] - (-500)) < 1e-6, "the intraday buy-back is committed either way"
+    assert abs(r["total"] - 500) < 1e-6, "net = (p_da − vwap)·E = (200−100)×5"
+    assert r["counts"]["divMiss"] == 1
+    assert abs(r["soc"][3] - 0.20 * 40) < 1e-6, "the energy never left the battery"
+    assert r["daSell"][3] == 0, "the battery did not deliver the DA leg itself"
+
+
+def test_reprice_rests_on_stall_and_clears_on_continuation():
+    """Reactive ask: a run-up over SETTLED ISPs (p_mfrr[i-3] vs lookback before
+    it) re-prices the whole offer to last-settled + markup. If the price
+    stalls below the ask the offer RESTS (no discharge, nothing sold cheap);
+    if the spike keeps running past the ask the FULL volume clears (nothing
+    is withheld — the old dd_hold behaviour is gone)."""
+    # target ISP i=9: settled base pmf[6]=100 vs pmf[2]=0 → rise 100 ≥ 50 ⇒ ask 200
+    base = [0.0] * 6 + [100.0, 0.0, 0.0]
+    p = dict(DEFAULT_PARAMS, init_soc_pct=100, min_delta=0, dwell_isps=0, da_n_periods=0,
+             dd_lookback=4, dd_threshold=50, dd_markup=100,
+             enabled=dict(split=False, daDischarge=False, charging=False, dynamicDischarge=True, opportunistic=False))
+    # stall: realised P = 150 < ask 200 → rests
+    r = bess_run(synth(10, p_mfrr=np.array(base + [150.0])), p)
+    assert r["upM"][9] == 0, "price below the raised ask must NOT clear"
+    assert r["counts"]["repriced"] == 1 and r["counts"]["repClear"] == 0
+    assert any(s == "repriced" for *_, s in r["bids"])
+    # continuation: realised P = 300 ≥ ask 200 → the FULL offer clears
+    r2 = bess_run(synth(10, p_mfrr=np.array(base + [300.0])), p)
+    assert r2["upM"][9] == 20, f"continuation must clear the FULL offer, got {r2['upM'][9]} MW"
+    assert r2["counts"]["repriced"] == 1 and r2["counts"]["repClear"] == 1
+    # an isolated spike out of a flat settled past is NOT held back: no run-up
+    # ⇒ baseline ask ⇒ the resting offer clears at full volume (the old
+    # hold-back used to withhold exactly here)
+    r3 = bess_run(synth(10, p_mfrr=np.array([0.0] * 9 + [400.0])), p)
+    assert r3["upM"][9] == 20, "the spike ISP itself must clear in full"
+    assert r3["counts"]["repriced"] == 0
+
+
+def test_no_future_leakage_perturbation():
+    """THE leakage regression: shocking the CURRENT ISP's realised balancing
+    prices (mFRR / aFRR up+down) must not change any DECISION taken for that
+    ISP — direction, which offers were placed (product / side / MW), the
+    intraday charge volume, the DA delivery, or the divert commitment. Only
+    CLEARING outcomes may change. The intraday quote is NOT perturbed (it is
+    a pre-gate snapshot, legitimately known)."""
+    rng = np.random.default_rng(777)
+    n = 60
+    mk = lambda: dict(
+        p_mfrr=np.round(rng.uniform(-150, 250, n), 1),
+        avg_p_pos=np.round(np.maximum(0, rng.uniform(-100, 250, n)), 1),
+        avg_p_neg=np.round(np.minimum(0, rng.uniform(-200, 60, n)), 1),
+        p_da=np.round(rng.uniform(-30, 220, n), 1),
+        vwap_1h=np.round(rng.uniform(-30, 220, n), 1),
+        p_imb=np.round(rng.uniform(-50, 300, n), 1),
+        fc=np.round(rng.uniform(-30, 220, n), 1),
+        rank_hi=rng.integers(0, 40, n).astype(np.int64),
+        rank_lo=rng.integers(0, 40, n).astype(np.int64),
+        n_pos_fav=rng.integers(0, 226, n).astype(float),
+        n_neg_fav=rng.integers(0, 226, n).astype(float),
+    )
+    arrays = mk()
+    p = dict(DEFAULT_PARAMS, dwell_isps=2, min_delta=50, max_charge_price=30, opp_threshold=80)
+    r0 = bess_run(synth(n, **{k: v.copy() for k, v in arrays.items()}), p)
+    placed0 = {}
+    for (isp, prod, dirn, mw, _price, _status) in r0["bids"]:
+        placed0.setdefault(isp, []).append((prod, dirn, round(float(mw), 6)))
+    for k in range(6, n):
+        for shock in (+400.0, -400.0):
+            pert = {key: v.copy() for key, v in arrays.items()}
+            pert["p_mfrr"][k] += shock
+            pert["avg_p_pos"][k] = max(0.0, pert["avg_p_pos"][k] + shock)
+            pert["avg_p_neg"][k] = min(0.0, pert["avg_p_neg"][k] - shock)
+            r2 = bess_run(synth(n, **pert), p)
+            placed2 = {}
+            for (isp, prod, dirn, mw, _price, _status) in r2["bids"]:
+                placed2.setdefault(isp, []).append((prod, dirn, round(float(mw), 6)))
+            assert sorted(placed0.get(k, [])) == sorted(placed2.get(k, [])), (
+                f"ISP {k} shock {shock:+}: PLACED offers changed with the realised price — leakage!"
+                f"\n  base: {sorted(placed0.get(k, []))}\n  pert: {sorted(placed2.get(k, []))}")
+            assert r0["chgOther"][k] == r2["chgOther"][k], (
+                f"ISP {k} shock {shock:+}: intraday/DA-buy charge volume depends on realised balancing prices!")
+            assert r0["daSell"][k] == r2["daSell"][k], (
+                f"ISP {k} shock {shock:+}: DA delivery / divert commitment depends on realised balancing prices!")
+            # per-ISP revenue BEFORE k must be identical (no backward influence)
+            assert np.array_equal(r0["rev"][:k], r2["rev"][:k]), f"ISP {k}: earlier ISPs changed!"
+
+
+def test_ask_gates_each_leg_no_below_margin_clears():
+    """A leg clears only if ITS OWN price reaches the ask — one market carrying
+    the bestUp gate must not let the other clear below break-even + minDelta."""
+    p = dict(DEFAULT_PARAMS, init_soc_pct=100, min_delta=100, dwell_isps=0, da_n_periods=0,
+             enabled=dict(split=False, daDischarge=False, charging=False, dynamicDischarge=False, opportunistic=False))
+    # aFRR (200) carries the gate; all volume routed to mFRR (split off ⇒ sUp=1,
+    # dd off ⇒ no switch); mFRR at 50 < ask 100 → the offer RESTS
+    r = bess_run(synth(1, p_mfrr=np.array([50.0]), avg_p_pos=np.array([200.0])), p)
+    assert r["mwhDischarged"] == 0, "mFRR share must not clear below the ask"
+    assert any(s == "resting" for *_, s in r["bids"])
+    # sanity: mFRR above the ask clears
+    r2 = bess_run(synth(1, p_mfrr=np.array([150.0]), avg_p_pos=np.array([200.0])), p)
+    assert r2["mwhDischarged"] > 0
+    # symmetric: mFRR (200) carries the gate, all volume routed to aFRR
+    # (split on, static 0) but aFRR avg 50 < ask 100 → rests
+    p3 = dict(p, s_up_start=0, s_up_step=0, enabled=dict(p["enabled"], split=True))
+    r3 = bess_run(synth(1, p_mfrr=np.array([200.0]), avg_p_pos=np.array([50.0])), p3)
+    assert r3["counts"]["upAfrr"] == 0 and r3["mwhDischarged"] == 0
+
+
+def test_redzone_time_counters():
+    """Red-zone time audit: ISPs whose end-of-ISP SoC is pinned at/inside a red
+    zone (within one whole-MW step of the boundary, or beyond it) are counted;
+    mid-band ISPs are not. Committed DA legs that dig inside the zone count."""
+    eta = math.sqrt(0.9)
+    n = 8
+    p = dict(DEFAULT_PARAMS, init_soc_pct=50, min_delta=0, dwell_isps=0, da_n_periods=0,
+             enabled=dict(split=False, daDischarge=False, charging=False, dynamicDischarge=False, opportunistic=False))
+    # lower: discharge to the floor, then park just above loRed (whole-MW leftovers)
+    r = bess_run(synth(n, p_mfrr=np.full(n, 300.0)), p)
+    pin_lo = 0.20 * 40 + E4 / eta
+    expect = int(np.sum(r["soc"] < pin_lo))
+    assert expect > 0, "battery should end parked at the lower boundary"
+    assert r["counts"]["lowRed"] == expect
+    assert r["counts"]["upRed"] == 0
+    assert r["soc"].min() >= 0.20 * 40 - 1e-9, "discretionary discharge never enters the zone"
+    # upper: charge to the ceiling, then park just below hiRed
+    p2 = dict(p, max_charge_price=20, enabled=dict(p["enabled"], charging=True))
+    r2 = bess_run(synth(n, p_mfrr=np.full(n, -50.0)), p2)
+    pin_hi = 0.80 * 40 - E4 * eta
+    expect2 = int(np.sum(r2["soc"] > pin_hi))
+    assert expect2 > 0 and r2["counts"]["upRed"] == expect2
+    assert r2["counts"]["lowRed"] == 0
+    # committed DA discharge digs INSIDE the lower zone → counted (strictly in-zone)
+    A3 = synth(1, p_da=np.array([200.0]), fc=np.array([200.0]), rank_hi=np.array([0], dtype=np.int64))
+    p3 = dict(DEFAULT_PARAMS, init_soc_pct=30, da_min_price=100, da_n_periods=8, da_mw=20,
+              enabled=dict(split=False, daDischarge=True, charging=False, dynamicDischarge=False, opportunistic=False))
+    r3 = bess_run(A3, p3)
+    assert r3["soc"][0] < 0.20 * 40 and r3["counts"]["lowRed"] == 1
+
+
+# =============================================================================
+#  B2. SENSITIVITY MATH (mirror of optim-sens.js)
+# =============================================================================
+def test_sens_weight_band_shape():
+    grid = list(range(7))
+    # peaked quadratic f(v) = 100 − (v−3)²: worst loss 9%, 1%-band [2..4]
+    m = sens_weight_and_band([(v, 100.0 - (v - 3) ** 2) for v in grid], 3, 100.0)
+    assert abs(m["weight"] - 0.09) < 1e-12
+    assert m["band"] == [2, 4]
+    assert m["shape"] == "peaked" and not m["edge"] and not m["sharp"]
+    # monotone up, optimum at the boundary
+    m2 = sens_weight_and_band([(v, float(v)) for v in grid], 6, 6.0)
+    assert m2["shape"] == "up" and m2["edge"]
+    assert abs(m2["weight"] - 1.0) < 1e-12  # v=0 loses everything: (6−0)/max(1,6)
+    # flat: nothing matters anywhere
+    m3 = sens_weight_and_band([(v, 50.0) for v in grid], 2, 50.0)
+    assert m3["shape"] == "flat" and m3["weight"] == 0.0 and m3["band"] == [0, 6]
+    # sharp cliff next to the optimum
+    m4 = sens_weight_and_band([(0, 100.0), (1, 40.0), (2, 30.0)], 0, 100.0)
+    assert m4["sharp"] and m4["edge"] and m4["shape"] in ("down", "peaked")
+
+
+def test_sens_spearman():
+    xs = [1, 2, 3, 4, 5]
+    assert abs(sens_spearman(xs, [2, 4, 6, 8, 10]) - 1) < 1e-12
+    assert abs(sens_spearman(xs, [10, 8, 6, 4, 2]) + 1) < 1e-12
+    # ties → average ranks; hand-computed: ranks x = [1.5,1.5,3.5,3.5] vs [1..4]
+    assert abs(sens_spearman([1, 1, 2, 2], [1, 2, 3, 4]) - 4 / math.sqrt(20)) < 1e-12
+
+
+def test_sens_interaction_detection():
+    """Multiplicative pairs must outrank additive ones: rev = 100x + 100y +
+    200·x·z ⇒ (x,z) is the interacting pair, (x,y) and (y,z) are additive."""
+    rng = np.random.default_rng(42)
+    n = 3000
+    x, y, z = rng.uniform(0, 1, n), rng.uniform(0, 1, n), rng.uniform(0, 1, n)
+    rev = 100 * x + 100 * y + 200 * x * z
+    pop = [dict(sample=dict(x=float(x[i]), y=float(y[i]), z=float(z[i])), revenue=float(rev[i])) for i in range(n)]
+    scores = sens_interaction_scores(pop, ["x", "y", "z"], r_star=300.0)
+    by = {(s["a"], s["b"]): s["score"] for s in scores}
+    assert (scores[0]["a"], scores[0]["b"]) == ("x", "z"), f"expected (x,z) strongest, got {scores}"
+    assert by[("x", "z")] > 2 * max(by[("x", "y")], by[("y", "z")])
+
+
+def test_sens_engine_oat_inert_vs_live_params():
+    """Anchor the sensitivity math to the engine — the user's observation,
+    distilled: with the default STATIC split (step 0) the down-split rebalance
+    wait is provably inert, so its OAT weight must be exactly 0 and its shape
+    flat, while da_mw genuinely carries weight."""
+    A = dict(real_ctx()["A"])
+    A["win_end"] = 5000  # short window keeps this test fast
+    base = bess_run(A, DEFAULT_PARAMS)["total"]
+    curve_wait = [(v, base if v == DEFAULT_PARAMS["s_dn_wait"]
+                   else bess_run(A, dict(DEFAULT_PARAMS, s_dn_wait=v))["total"])
+                  for v in (1, 24, 96, 672)]
+    m = sens_weight_and_band(curve_wait, DEFAULT_PARAMS["s_dn_wait"], base)
+    assert m["weight"] == 0.0 and m["shape"] == "flat", "static split ⇒ wait must be weightless"
+    assert m["band"] == [1, 672], "the 1%-band must span the whole sweep"
+    # a genuinely load-bearing lever: pushing the charge ceiling to −100
+    # (never pay to charge) starves the battery and loses heavily
+    curve_cc = [(v, base if v == 20 else bess_run(A, dict(DEFAULT_PARAMS, max_charge_price=v))["total"])
+                for v in (-100, 0, 20)]
+    m2 = sens_weight_and_band(curve_cc, 20, base)
+    assert m2["weight"] > 0.5, "max_charge_price must carry real weight"
+    # NB: weight is measured FROM AN OPTIMUM; from a non-optimal base a param
+    # whose sweep only finds improvements correctly reads ~0 (e.g. da_mw here).
 
 
 # =============================================================================
@@ -744,9 +1184,10 @@ def test_da_off_no_da_legs():
     assert r["counts"]["daCleared"] == 0 and abs(r["breakdown"]["DA"]) < 1e-6
 
 
-def test_dynamic_discharge_off_no_withdrawals():
+def test_dynamic_discharge_off_no_repricing():
     r = bess_run(real_ctx()["A"], dict(DEFAULT_PARAMS, enabled=dict(DEFAULT_PARAMS["enabled"], dynamicDischarge=False)))
-    assert r["counts"]["withdrawn"] == 0
+    assert r["counts"]["repriced"] == 0 and r["counts"]["repClear"] == 0
+    assert not any(s in ("repriced", "cleared-rep") for *_, s in r["bids"])
 
 
 def test_opportunistic_off_no_intraday_leg():
@@ -787,12 +1228,21 @@ R.add("must-fulfil: SoC never sized out of [0, cap] over random prices", test_mu
 R.add("price-aware charging skips an above-ceiling side, uses the usable one", test_charge_price_aware_skips_above_ceiling)
 R.add("day-ahead buy-low fires at a committed forecast trough", test_da_buy_low_committed_at_trough)
 R.add("opportunistic divert KEEPS DA revenue, closes on intraday (no imbalance)", test_opportunistic_keeps_da_and_uses_intraday)
+R.add("opportunistic MISS: buy-back committed, energy retained, spread paid", test_opportunistic_miss_pays_the_spread_and_keeps_energy)
+R.add("reactive ask: rests on a stall, clears FULL volume on continuation", test_reprice_rests_on_stall_and_clears_on_continuation)
+R.add("NO FUTURE LEAKAGE: same-ISP price shocks never change placed offers", test_no_future_leakage_perturbation)
+R.add("per-leg ask gate: no below-margin clears via the other market's gate", test_ask_gates_each_leg_no_below_margin_clears)
+R.add("red-zone time audit: pinned-at-boundary + in-zone ISPs counted", test_redzone_time_counters)
+R.add("sensitivity math: OAT weight / 1%-band / shape / edge / sharp", test_sens_weight_band_shape)
+R.add("sensitivity math: Spearman rho incl. tie handling", test_sens_spearman)
+R.add("sensitivity math: interaction score ranks multiplicative pairs first", test_sens_interaction_detection)
+R.add("sensitivity on engine: static-split wait is weightless, da_mw is not", test_sens_engine_oat_inert_vs_live_params)
 R.add("real data: rev == Σ decomposed components", test_rev_equals_component_sum)
 R.add("real data: SoC ∈ [0, cap]; no balancing over-sizing", test_soc_bounds_real)
 R.add("real data: day-type partition all == workday + weekend/holiday", test_daytype_partition_exact)
 R.add("strategy-off: charging off ⇒ 0 charged & discharge ≤ initial usable", test_charging_off_no_charge)
 R.add("strategy-off: DA off ⇒ no DA sell/buy legs", test_da_off_no_da_legs)
-R.add("strategy-off: dynamic discharge off ⇒ no withdrawn bids", test_dynamic_discharge_off_no_withdrawals)
+R.add("strategy-off: dynamic discharge off ⇒ no repriced bids", test_dynamic_discharge_off_no_repricing)
 R.add("strategy-off: opportunistic off ⇒ no intraday close leg", test_opportunistic_off_no_intraday_leg)
 R.add("both splits static (step=0) collapse to all-mFRR (=1)", test_both_splits_static_collapse_to_one)
 R.add("frozen default-config revenue + must-fulfil = 0 (prints value)", test_frozen_default_revenue)

@@ -11,9 +11,11 @@
 //     per-ISP P&L tooltip carried over from the wind-park page.
 //   drawBids(id, sim, startIdx, endIdx)
 //     balancing bid lifecycle (price × time), product-coloured, status by
-//     symbol (cleared / resting / withdrawn).
+//     symbol (cleared / rested / repriced ★ — reactive ask re-pricing; a
+//     rested offer is plotted at its ASK, a cleared one at the clearing price).
 //   drawOps(id, sim)            — cycling & duration bars.
-//   drawSocStats(id, sim)       — SoC safety bars.
+//   drawSocStats(id, sim, params) — SoC safety bars (time pinned in the
+//     lower/upper red zones, dynamic wrt the configured zone percentages).
 //   drawMonthly(id, monthly)    — decomposition stacks.
 //   drawHistogram(id, perISPRev)— per-ISP revenue distribution.
 
@@ -232,10 +234,12 @@ const BessCharts = (() => {
       const balUp = [];
       if (uM > 0.01) balUp.push(`<span style="color:${COL.pos}">▲ mFRR-up</span>: ${fmtMW(uM)} @ ${ttp(Pmf)}`);
       if (uAoff > 0.01) {
-        if (Apos > 0)
+        if (uA > 0.001)
           balUp.push(`<span style="color:#56d364">△ aFRR-up</span>: ${fmtMW(uAoff)} offered → dispatched ${fmtMW(uA)} (${posPct.toFixed(0)}% of ISP) @ avg ${ttp(Apos)}`);
+        else if (Apos > 0)
+          balUp.push(`<span style="color:${COL.dim}">△ aFRR-up: ${fmtMW(uAoff)} offered — rested (avg ${ttp(Apos)} below the ask)</span>`);
         else
-          balUp.push(`<span style="color:${COL.dim}">△ aFRR-up: ${fmtMW(uAoff)} offered but avg ${ttp(Apos)} ≤ 0 — not bid</span>`);
+          balUp.push(`<span style="color:${COL.dim}">△ aFRR-up: ${fmtMW(uAoff)} offered but avg ${ttp(Apos)} ≤ 0 — not dispatched</span>`);
       }
       if (balUp.length) {
         balUp.push(`Discharge rev: ${rev_(sim.revUp[k])}`);
@@ -247,7 +251,12 @@ const BessCharts = (() => {
       if (dM > 0.01) balDn.push(`<span style="color:${COL.neg}">▼ mFRR-dn</span>: ${fmtMW(dM)} @ ${ttp(Pmf)}`);
       if (dAoff > 0.01)
         balDn.push(`<span style="color:#fa7970">▽ aFRR-dn</span>: ${fmtMW(dAoff)} offered → dispatched ${fmtMW(dA)} (${negPct.toFixed(0)}% of ISP) @ avg ${ttp(Aneg)}`);
-      if (co > 0.01) balDn.push(`<span style="color:${COL.chg}">⤓ intraday / DA buy-low</span>: ${fmtMW(co)}`);
+      if (co > 0.01) {
+        const daB = sim.daBuy && sim.daBuy[k];
+        balDn.push(daB
+          ? `<span style="color:${COL.chg}">⤓ DA buy-low (committed D−1)</span>: ${fmtMW(co)} @ ${ttp(Pda)}`
+          : `<span style="color:${COL.chg}">⤓ intraday</span>: ${fmtMW(co)} @ ${ttp(Vw)}`);
+      }
       if (balDn.length) {
         const chgRev = sim.revDn[k] + sim.revChg[k];
         balDn.push(`Charge cashflow: ${rev_(chgRev)}`);
@@ -256,7 +265,12 @@ const BessCharts = (() => {
         s_ += section("Charge", balDn);
       }
       if (Math.abs(sim.revID[k]) > 0.5) {
-        s_ += section("Opportunistic", [`Diverted DA → mFRR-up, covered on intraday: ${rev_(sim.revID[k])}`]);
+        const df = sim.divFlag ? sim.divFlag[k] : 0;
+        s_ += section("Opportunistic", [
+          df === 2
+            ? `Divert MISS: DA bought back on intraday, but mFRR never reached the ask — energy retained: ${rev_(sim.revID[k])}`
+            : `Diverted DA → mFRR-up, covered on intraday: ${rev_(sim.revID[k])}`,
+        ]);
         terms.push(sim.revID[k]);
       }
       if (sim.short[k] > 0.01) {
@@ -351,16 +365,18 @@ const BessCharts = (() => {
       aUpC: { x: [], y: [], sz: [], name: "aFRR ↑ cleared", color: "#56d364", symbol: "diamond" },
       mDnC: { x: [], y: [], sz: [], name: "mFRR ↓ cleared", color: "#f85149", symbol: "circle" },
       aDnC: { x: [], y: [], sz: [], name: "aFRR ↓ cleared", color: "#fa7970", symbol: "diamond" },
-      rest: { x: [], y: [], sz: [], name: "rested (no clear)", color: "#7d8590", symbol: "circle-open" },
-      wdrw: { x: [], y: [], sz: [], name: "withdrawn (pre-gate)", color: "#e3b341", symbol: "x" },
+      rest: { x: [], y: [], sz: [], name: "rested @ ask (no clear)", color: "#7d8590", symbol: "circle-open" },
+      repC: { x: [], y: [], sz: [], name: "cleared @ raised ask", color: "#e3b341", symbol: "star" },
+      repR: { x: [], y: [], sz: [], name: "repriced, rested (ask not reached)", color: "#e3b341", symbol: "star-open" },
     };
     const sizeOf = (mw) => Math.max(5, Math.min(22, 5 + mw));
     for (const bid of sim.bids) {
       if (bid.i < s || bid.i >= e) continue;
       const t = Engine.tsAt(bid.i);
       let g;
-      if (bid.status === "withdrawn") g = groups.wdrw;
+      if (bid.status === "repriced") g = groups.repR;
       else if (bid.status === "resting") g = groups.rest;
+      else if (bid.rep) g = groups.repC;
       else if (bid.dir === 1) g = bid.prod === "mfrr" ? groups.mUpC : groups.aUpC;
       else g = bid.prod === "mfrr" ? groups.mDnC : groups.aDnC;
       g.x.push(t);
@@ -409,10 +425,12 @@ const BessCharts = (() => {
   // ----------------------------------------------------------------------
   //  5. SoC safety bars
   // ----------------------------------------------------------------------
-  function drawSocStats(targetId, sim) {
+  function drawSocStats(targetId, sim, params) {
     const c = sim.counts;
-    const cats = ["At 0% floor", "At 100% ceiling", "DA short (→ imbalance)", "Balancing UNFULFILLED"];
-    const vals = [c.at0, c.atFull, c.short, c.unfulfilled];
+    const loPct = params && isFinite(+params.lower_red_pct) ? +params.lower_red_pct : 20;
+    const hiPct = params && isFinite(+params.upper_red_pct) ? +params.upper_red_pct : 80;
+    const cats = [`In lower red zone (≤${loPct}%)`, `In upper red zone (≥${hiPct}%)`, "DA short (→ imbalance)", "Balancing UNFULFILLED"];
+    const vals = [c.lowRed, c.upRed, c.short, c.unfulfilled];
     const colors = ["#e3b341", "#e3b341", "#bc8cff", c.unfulfilled > 0 ? "#f85149" : "#3fb950"];
     const traces = [{ x: vals, y: cats, type: "bar", orientation: "h", marker: { color: colors }, hovertemplate: "%{x:,} ISPs<extra></extra>" }];
     const layout = Object.assign({}, LAYOUT, {
@@ -446,6 +464,10 @@ const BessCharts = (() => {
     });
     Plotly.react(targetId, traces, layout, CONFIG);
   }
+
+  // NB: the parameter-sensitivity renderers (weights / OAT curves / pair
+  // heatmap) live in the SHARED optim-sens.js (OptimSens) — used by both
+  // this page and the wind-park page.
 
   // ----------------------------------------------------------------------
   //  7. Per-ISP revenue histogram

@@ -134,22 +134,22 @@
       extremes: [["0 (default)", "only pre-buy on DA when the price is ≤ 0 (negative/free)"], ["30", "pre-buy at genuinely cheap troughs"], ["−100", "never pre-buy on DA"]] },
     // -------- dynamic charging (real-time only) --------
     max_charge_price: { group: "charging", label: "Max charge price", unit: "EUR/MWh", min: -100, max: 150, sliderStep: 1, numStep: 1, decimals: 0,
-      description: "Ceiling for REAL-TIME charging (mFRR-dn / aFRR-dn / intraday — decidable near delivery). The battery charges from whichever is cheapest; negative balancing-down (paid to absorb) is best, then intraday — but only up to this price. Day-ahead buy-low is the separate committed leg above. The mFRR↔aFRR routing follows the adaptive DOWN split, which shifts toward whichever pays more to absorb.",
+      description: "The BID PRICE of every real-time charge order (mFRR-dn / aFRR-dn / intraday): a balancing bid clears only when the realised price is at or below it; the intraday order fills at the pre-gate quote when that quote is at/below it. Routing uses KNOWN info only — the adaptive DOWN split, with a share re-routed when its side was unusable in the last settled ISP, and intraday taking the headroom only when settled balancing was dead entirely. Day-ahead buy-low is the separate committed leg above.",
       extremes: [["20 (default)", "charge when cheap or paid"], ["0", "only charge when paid (price ≤ 0)"], ["100", "buy real-time aggressively"]] },
-    // -------- dynamic discharge --------
-    dd_lookback: { group: "dynamic-discharge", label: "Trend lookback", unit: "ISPs", min: 1, max: 48, sliderStep: 1, numStep: 1, decimals: 0,
-      description: "How far back to measure the mFRR price trend before deciding to hold for a higher price.",
-      extremes: [["4 (default)", "last hour"], ["1", "vs the previous ISP"]] },
-    dd_threshold: { group: "dynamic-discharge", label: "Rising-trend threshold", unit: "EUR/MWh", min: 0, max: 200, sliderStep: 1, numStep: 1, decimals: 0,
-      description: "Hold back discharge only when the price has risen by at least this much over the lookback (signal that it may climb further).",
-      extremes: [["20 (default)", "moderate rise"], ["0", "hold on any rise"]] },
-    dd_hold: { group: "dynamic-discharge", label: "Max hold fraction", unit: "0–1", min: 0, max: 1, sliderStep: 0.05, numStep: 0.05, decimals: 2,
-      description: "Fraction of the discretionary discharge to withhold (re-offer later) when the trend is rising. The withheld MW shows as a 'withdrawn' bid.",
-      extremes: [["0.5 (default)", "hold half back"], ["0", "never hold (dump now)"]] },
+    // -------- dynamic discharge (reactive ask re-pricing) --------
+    dd_lookback: { group: "dynamic-discharge", label: "Run-up lookback", unit: "ISPs", min: 1, max: 48, sliderStep: 1, numStep: 1, decimals: 0,
+      description: "The run-up is measured on SETTLED prices only: the last settled mFRR price (ISP i−3 — the newest final price at both market gates) vs the price this many ISPs before it. Short lookbacks react to sharp steps; long ones also trigger on slow drifts.",
+      extremes: [["1 (default)", "react to a step over the previous settled ISP"], ["4", "an hour-long drift also triggers"]] },
+    dd_threshold: { group: "dynamic-discharge", label: "Run-up threshold", unit: "EUR/MWh", min: 0, max: 200, sliderStep: 1, numStep: 1, decimals: 0,
+      description: "Re-price only when the observed (settled) rise is at least this much. Below it the offer rests at its normal ask (break-even + min delta).",
+      extremes: [["20 (default)", "moderate step"], ["0", "re-price on any rise"]] },
+    dd_markup: { group: "dynamic-discharge", label: "Reactive ask mark-up", unit: "EUR/MWh", min: 0, max: 300, sliderStep: 5, numStep: 5, decimals: 0,
+      description: "How far ABOVE the last settled mFRR price the whole offer is re-priced when the run-up trigger fires. Full volume stays offered — it clears only if the realised price reaches the raised ask, and rests unfilled if the spike stalls. 0 disables re-pricing (pure price-taker).",
+      extremes: [["75 (default)", "sell only into a genuine continuation"], ["0", "never re-price (price-taker)"], ["300", "only extreme continuations clear"]] },
     // -------- opportunistic --------
-    opp_threshold: { group: "opportunistic", label: "Spike threshold over DA", unit: "EUR/MWh", min: 0, max: 500, sliderStep: 5, numStep: 5, decimals: 0,
-      description: "If a balancing price beats the already-sold DA price by at least this much, divert the energy to balancing and close the DA leg the cheaper way (intraday or imbalance).",
-      extremes: [["100 (default)", "divert on a clear spike"], ["0", "divert on any improvement"]] },
+    opp_threshold: { group: "opportunistic", label: "Spike threshold over intraday", unit: "EUR/MWh", min: 0, max: 500, sliderStep: 5, numStep: 5, decimals: 0,
+      description: "Trigger AND ask of the divert bet, on known prices only: when the last SETTLED mFRR price is at least this far above the live intraday quote, the DA-sold volume is bought back on intraday (committed cost) and re-offered to mFRR at ask = quote + threshold. If the spike persists the offer clears (gain ≈ mFRR − intraday); if it fizzles the offer rests, the energy stays stored and the ISP nets (DA − intraday) — a real loss when the buy-back was dearer. 'Divert misses' counts those.",
+      extremes: [["100 (default)", "bet only on strong settled spikes"], ["50", "more bets, more misses"], ["400", "practically never divert"]] },
   };
 
   const DEFAULTS = {
@@ -161,7 +161,7 @@
       w_afrr_pos_lo: 5, w_afrr_pos_hi: 95, w_afrr_neg_lo: 5, w_afrr_neg_hi: 95,
       s_up_start: 1, s_up_win: 96, s_up_wait: 1, s_up_step: 0, s_dn_start: 1, s_dn_win: 96, s_dn_wait: 1, s_dn_step: 0,
       da_min_price: 100, da_charge_price: 0, da_n_periods: 8, da_mw: 20, max_charge_price: 20,
-      dd_lookback: 4, dd_threshold: 20, dd_hold: 0.5, opp_threshold: 100,
+      dd_lookback: 1, dd_threshold: 20, dd_markup: 75, opp_threshold: 100,
     },
   };
 
@@ -196,7 +196,9 @@
     { key: "upAfrr", label: "aFRR-up ISPs" },
     { key: "dnMfrr", label: "mFRR-dn ISPs" },
     { key: "dnAfrr", label: "aFRR-dn ISPs" },
-    { key: "withdrawn", label: "Withdrawn bids" },
+    { key: "repriced", label: "Repriced bids" },
+    { key: "repClear", label: "Repriced & cleared" },
+    { key: "divMiss", label: "Divert misses" },
     { key: "short", label: "DA-short ISPs" },
   ];
 
@@ -232,6 +234,7 @@
     dayType: "all",
     tsRange: { from: null, to: null },
     lastSim: null,
+    lastSens: null,
     optimRuns: [],
   };
 
@@ -398,9 +401,16 @@
         <tr><th>MWh discharged</th><td>${Math.round(st.mwhDischarged).toLocaleString()}</td><th>MWh charged</th><td>${Math.round(st.mwhCharged).toLocaleString()}</td></tr>
       </tbody>`;
     const okBad = c.unfulfilled > 0 ? "down" : "up";
+    // Red-zone time: ISPs whose end-of-ISP SoC is pinned at/inside a zone
+    // (within one whole-MW step of the boundary, or beyond it). Dynamic wrt
+    // the configured red-zone percentages, NOT a static 0%/100% check.
+    const zoneIsps = Math.max(1, c.discharge + c.charge + c.idle);
+    const zoneCell = (n) => `${fmtInt(n)} (${((n / zoneIsps) * 100).toFixed(1)}%)`;
+    const zoneTitle = "ISPs whose end-of-ISP SoC is pinned at or inside the zone — within one whole-MW step of the boundary, or beyond it (committed DA legs may dig inside).";
     document.getElementById("soc-stats-table").innerHTML =
       `<tbody>
-        <tr><th>ISPs at 0% floor</th><td>${fmtInt(c.at0)}</td><th>ISPs at 100% ceiling</th><td>${fmtInt(c.atFull)}</td></tr>
+        <tr><th title="${zoneTitle}">In lower red zone (≤${p.lower_red_pct}%)</th><td>${zoneCell(c.lowRed)}</td>
+            <th title="${zoneTitle}">In upper red zone (≥${p.upper_red_pct}%)</th><td>${zoneCell(c.upRed)}</td></tr>
         <tr><th>DA-short ISPs (→ imbalance)</th><td>${fmtInt(c.short)}</td><th>DA shortfall</th><td>${Math.round(st.shortMWh).toLocaleString()} MWh</td></tr>
         <tr><th>Balancing UNFULFILLED</th><td class="value ${okBad}">${fmtInt(c.unfulfilled)} ${c.unfulfilled > 0 ? "⚠" : "✓"}</td><th></th><td></td></tr>
       </tbody>`;
@@ -427,7 +437,7 @@
     BessCharts.drawTimeSeries("ts-chart", sim, callParams, chartIdx.start, chartIdx.end);
     BessCharts.drawBids("bids-chart", sim, chartIdx.start, chartIdx.end);
     BessCharts.drawOps("ops-chart", sim);
-    BessCharts.drawSocStats("soc-stats-chart", sim);
+    BessCharts.drawSocStats("soc-stats-chart", sim, callParams);
     BessCharts.drawMonthly("monthly-chart", BessEngine.monthlyAggregation(callParams));
     BessCharts.drawHistogram("hist-chart", sim.filteredRevenue);
   }
@@ -550,7 +560,9 @@
   // =====================================================================
   const RANDOM_N = 3000;
   const REFINE_STARTS = 5;
-  const RAND_PROGRESS = 0.35;
+  const RAND_PROGRESS = 0.35; // progress fraction consumed by the random phase
+  const REFINE_END = 0.8; // refine ends here; sensitivity analysis takes the rest
+  const SENS_TOL = 0.01; // "as good as the optimum" band = within 1% of it
   const _yieldChannel = typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
   let _yieldResolve = null;
   if (_yieldChannel) _yieldChannel.port1.onmessage = () => { const r = _yieldResolve; _yieldResolve = null; if (r) r(); };
@@ -594,7 +606,7 @@
     if (state.enabled.dynamicDischarge) {
       dims.push({ key: "dd_lookback", sample: (rng) => 1 + Math.floor(rng() * 48), refineValues: rangeArr(1, 48, 2) });
       dims.push({ key: "dd_threshold", sample: (rng) => Math.floor(rng() * 201), refineValues: rangeArr(0, 200, 5) });
-      dims.push({ key: "dd_hold", sample: (rng) => Math.round(rng() * 20) / 20, refineValues: range01(0.05) });
+      dims.push({ key: "dd_markup", sample: (rng) => 5 * Math.floor(rng() * 61), refineValues: rangeArr(0, 300, 10) });
     }
     if (state.enabled.opportunistic) {
       dims.push({ key: "opp_threshold", sample: (rng) => Math.floor(rng() * 101) * 5, refineValues: rangeArr(0, 500, 10) });
@@ -643,9 +655,11 @@
     renderProgressBar(progEl, 0, "optimising 0%");
     await yieldToBrowser();
     const topK = [];
+    const pop = []; // full random population — reused by the sensitivity analysis
     let lastYield = performance.now();
     for (let i = 0; i < N; i++) {
       const s = randomSampleByDims(dims, rng), r = evaluateSample(s);
+      pop.push({ sample: s, revenue: r });
       if (topK.length < K) { topK.push({ sample: s, revenue: r }); topK.sort((a, b) => b.revenue - a.revenue); }
       else if (r > topK[K - 1].revenue) { topK[K - 1] = { sample: s, revenue: r }; topK.sort((a, b) => b.revenue - a.revenue); }
       if (performance.now() - lastYield > 200) { const f = ((i + 1) / N) * RAND_PROGRESS; renderProgressBar(progEl, f, `optimising ${Math.round(f * 100)}%`); await yieldToBrowser(); lastYield = performance.now(); }
@@ -656,27 +670,150 @@
     for (let k = 0; k < topK.length; k++) {
       const refined = await coordRefine(topK[k].sample, dims);
       if (!best || refined.revenue > best.revenue) best = refined;
-      const f = RAND_PROGRESS + ((k + 1) / K) * (1 - RAND_PROGRESS);
-      renderProgressBar(progEl, f, k + 1 < topK.length ? `refining ${k + 2}/${K}…` : "finalising…");
+      const f = RAND_PROGRESS + ((k + 1) / K) * (REFINE_END - RAND_PROGRESS);
+      renderProgressBar(progEl, f, k + 1 < topK.length ? `refining ${k + 2}/${K}…` : "analysing sensitivity…");
       await yieldToBrowser();
     }
+    const sens = await analyseSensitivity(best, dims, pop, progEl);
+    state.lastSens = sens;
     const ms = Math.round(performance.now() - t0);
     applyOptimisedSample(best.sample);
     update();
-    recordOptimRun(best, ms);
+    recordOptimRun(best, ms, sens);
+    renderSensitivity(sens);
     renderProgressBar(progEl, 1, `done in ${(ms / 1000).toFixed(1)}s — ${fmtEUR(best.revenue)}`);
     optimiseBtn.disabled = false; resetBtn.disabled = false;
+  }
+
+  // =====================================================================
+  //  SENSITIVITY ANALYSIS — what actually drives the found optimum.
+  //  One-at-a-time sweeps around the optimum (local weight / tolerance
+  //  band / shape / edge saturation), global stats over the random
+  //  population (Spearman rho, top-decile clustering), pairwise
+  //  interaction scores, and a 2-D sweep of the strongest pair.
+  //  All math lives in optim-sens.js (OptimSens — shared with the wind-park
+  //  page, mirrored in tests_bess.py).
+  // =====================================================================
+  function _heatGrid(refineValues, vStar, maxN = 9) {
+    const vals = [...new Set([...refineValues, vStar])].sort((x, y) => x - y);
+    if (vals.length <= maxN) return vals;
+    const step = (vals.length - 1) / (maxN - 1);
+    const out = [];
+    for (let i = 0; i < maxN; i++) out.push(vals[Math.round(i * step)]);
+    if (!out.includes(vStar)) out.push(vStar);
+    return [...new Set(out)].sort((x, y) => x - y);
+  }
+
+  async function analyseSensitivity(best, dims, pop, progEl) {
+    const denom = Math.max(1, Math.abs(best.revenue));
+    const perParam = {}, curves = {};
+    const totalEvals = Math.max(1, dims.reduce((s, d) => s + d.refineValues.length, 0));
+    let done = 0, lastYield = performance.now();
+    for (const dim of dims) {
+      const vStar = best.sample[dim.key];
+      const values = [...new Set([...dim.refineValues, vStar])].sort((a, b) => a - b);
+      const curve = [];
+      for (const v of values) {
+        const r = v === vStar ? best.revenue : evaluateSample({ ...best.sample, [dim.key]: v });
+        curve.push({ v, r });
+        done++;
+        if (performance.now() - lastYield > 200) {
+          renderProgressBar(progEl, REFINE_END + 0.17 * (done / totalEvals), "analysing sensitivity…");
+          await yieldToBrowser();
+          lastYield = performance.now();
+        }
+      }
+      perParam[dim.key] = Object.assign(
+        { vStar },
+        OptimSens.weightAndBand(curve, vStar, best.revenue, SENS_TOL),
+        OptimSens.globalStats(pop, dim.key),
+      );
+      curves[dim.key] = curve;
+    }
+    const keys = dims.map((d) => d.key);
+    const pairs = keys.length >= 2 ? OptimSens.interactionScores(pop, keys, best.revenue).slice(0, 5) : [];
+    let heat = null;
+    if (pairs.length) {
+      const { a, b } = pairs[0];
+      const ga = _heatGrid(dims.find((d) => d.key === a).refineValues, best.sample[a]);
+      const gb = _heatGrid(dims.find((d) => d.key === b).refineValues, best.sample[b]);
+      const z = [];
+      for (const va of ga) {
+        const row = [];
+        for (const vb of gb) {
+          const r = va === best.sample[a] && vb === best.sample[b]
+            ? best.revenue
+            : evaluateSample({ ...best.sample, [a]: va, [b]: vb });
+          row.push(((r - best.revenue) / denom) * 100); // Δ% vs the optimum
+          if (performance.now() - lastYield > 200) {
+            renderProgressBar(progEl, 0.98, "mapping interaction…");
+            await yieldToBrowser();
+            lastYield = performance.now();
+          }
+        }
+        z.push(row);
+      }
+      heat = { a, b, va: ga, vb: gb, z, aStar: best.sample[a], bStar: best.sample[b] };
+    }
+    return { revenue: best.revenue, perParam, curves, pairs, heat };
+  }
+
+  const SHAPE_LABEL = { flat: "— flat", up: "↑ higher is better", down: "↓ lower is better", peaked: "▲ interior peak" };
+  function renderSensitivity(sens) {
+    const table = document.getElementById("sens-table");
+    if (!table) return;
+    if (!sens) {
+      table.innerHTML = '<tbody><tr><td class="optim-empty">No analysis yet — click ⚡ Optimise. The report is per session (not persisted).</td></tr></tbody>';
+      const list = document.getElementById("sens-pairs-list");
+      if (list) list.textContent = "";
+      return;
+    }
+    const keys = Object.keys(sens.perParam).sort((a, b) => sens.perParam[b].weight - sens.perParam[a].weight);
+    const num = (v, d = 0) => (v == null || isNaN(v) ? "—" : (+v).toFixed(d));
+    const rows = keys.map((k) => {
+      const s = sens.perParam[k];
+      const dec = /_(start|step)$/.test(k) ? 2 : 0;
+      return `<tr>
+        <td>${k}${s.edge ? ' <span title="optimum sits on the sweep boundary — saturated lever">⚠</span>' : ""}</td>
+        <td><b>${num(s.vStar, dec)}</b></td>
+        <td>${(s.weight * 100).toFixed(1)}%${s.sharp ? ' <span title="one grid step next to the optimum already loses >5%">✶</span>' : ""}</td>
+        <td>${num(s.band[0], dec)} … ${num(s.band[1], dec)}</td>
+        <td>${SHAPE_LABEL[s.shape] || s.shape}</td>
+        <td>${s.rho >= 0 ? "+" : ""}${s.rho.toFixed(2)}</td>
+        <td>${num(s.topBand[0], dec)} … ${num(s.topBand[1], dec)}</td>
+      </tr>`;
+    }).join("");
+    table.innerHTML =
+      `<thead><tr><th>Parameter</th><th>Optimum</th><th>Weight (max loss)</th><th>1%-band</th><th>Shape (local)</th><th>Global ρ</th><th>Top-10% cluster</th></tr></thead>` +
+      `<tbody>${rows}</tbody>`;
+    const list = document.getElementById("sens-pairs-list");
+    if (list) {
+      list.innerHTML = sens.pairs.length
+        ? "Ranking: " + sens.pairs.map((p, i) => `${i + 1}. ${p.a} × ${p.b} (${(p.score * 100).toFixed(1)}%)`).join(" · ")
+        : "fewer than two optimised parameters — no pairs to rank.";
+    }
+    OptimSens.drawWeights("sens-weights", sens.perParam);
+    OptimSens.drawCurves("sens-curves", sens.curves, sens.perParam, sens.revenue);
+    OptimSens.drawHeatmap("sens-heatmap", sens.heat);
   }
 
   // =====================================================================
   //  OPTIMISED RUNS LOG (per-tab sessionStorage)
   // =====================================================================
   const DAYTYPE_LABEL = { all: "All", "weekend-holiday": "Wknd+Hol", workday: "Workday" };
-  const OPTIM_RUNS_KEY = "tck.bessOptimRuns.v2";
+  const OPTIM_RUNS_KEY = "tck.bessOptimRuns.v3"; // v3: dd_hold → dd_markup (reactive ask)
   function nowClock() { const d = new Date(); const p2 = (x) => String(x).padStart(2, "0"); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; }
 
-  function recordOptimRun(best, ms) {
+  function recordOptimRun(best, ms, sens) {
     const p = state.params;
+    // compact per-run sensitivity summary (full curves stay in-memory only)
+    let sensTop = null;
+    if (sens) {
+      sensTop = Object.keys(sens.perParam)
+        .sort((a, b) => sens.perParam[b].weight - sens.perParam[a].weight)
+        .slice(0, 3)
+        .map((k) => ({ k, w: sens.perParam[k].weight, edge: sens.perParam[k].edge }));
+    }
     state.optimRuns.push({
       n: state.optimRuns.length + 1, when: nowClock(), ms,
       from: state.simRange.from, to: state.simRange.to, dayType: state.dayType,
@@ -685,6 +822,7 @@
       revenue: best.revenue,
       perMWh: state.lastSim && state.lastSim.stats.mwhDischarged > 0 ? best.revenue / state.lastSim.stats.mwhDischarged : 0,
       cycles: state.lastSim ? state.lastSim.stats.cycles : 0,
+      sensTop,
     });
     saveOptimRuns(); renderOptimRuns();
   }
@@ -694,7 +832,7 @@
     if (!raw) return;
     try { const arr = JSON.parse(raw); if (Array.isArray(arr)) state.optimRuns = arr; } catch (_) {}
   }
-  const OPTIM_HEADER = ["#", "Time", "Range", "Days", "Strategies", "Split↑ x/y/w/z", "Split↓ x/y/w/z", "DA sell/buy/n/MW", "Max chg €", "DynDis lb/thr/hold", "Opp €", "Revenue", "€/MWh", "Cycles"];
+  const OPTIM_HEADER = ["#", "Time", "Range", "Days", "Strategies", "Split↑ x/y/w/z", "Split↓ x/y/w/z", "DA sell/buy/n/MW", "Max chg €", "DynDis lb/thr/mkup", "Opp €", "Top drivers (weight)", "Revenue", "€/MWh", "Cycles"];
   function renderOptimRuns() {
     const table = document.getElementById("optim-runs-table");
     if (!table) return;
@@ -712,8 +850,11 @@
         en.split ? `${num(p.s_dn_start, 2)}/${num(p.s_dn_win)}/${num(p.s_dn_wait)}/${num(p.s_dn_step, 2)}` : dash,
         en.daDischarge ? `${num(p.da_min_price)}/${num(p.da_charge_price)}/${num(p.da_n_periods)}/${num(p.da_mw)}` : dash,
         en.charging ? num(p.max_charge_price) : dash,
-        en.dynamicDischarge ? `${num(p.dd_lookback)}/${num(p.dd_threshold)}/${num(p.dd_hold, 2)}` : dash,
+        en.dynamicDischarge ? `${num(p.dd_lookback)}/${num(p.dd_threshold)}/${num(p.dd_markup)}` : dash,
         en.opportunistic ? num(p.opp_threshold) : dash,
+        r.sensTop && r.sensTop.length
+          ? r.sensTop.map((t) => `${t.edge ? "⚠" : ""}${t.k} ${(t.w * 100).toFixed(0)}%`).join("<br>")
+          : dash,
         `<b>${fmtEUR(r.revenue)}</b>`, num(r.perMWh, 1), num(r.cycles, 1),
       ];
       return `<tr>${cells.map((c) => `<td>${c}</td>`).join("")}</tr>`;
@@ -798,5 +939,6 @@
   if (clearBtn) clearBtn.addEventListener("click", () => { state.optimRuns = []; saveOptimRuns(); renderOptimRuns(); });
   loadOptimRuns();
   renderOptimRuns();
+  renderSensitivity(null); // empty state until the first ⚡ Optimise
   update();
 })();

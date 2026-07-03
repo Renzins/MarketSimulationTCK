@@ -2527,6 +2527,33 @@ def test_split_adaptive_actually_adapts():
     assert abs(base - adap) > 1000, "step>0 should change the result"
 
 
+def test_sens_oat_inert_vs_live_param_windpark():
+    """Sensitivity math anchored to the WIND-PARK engine (the shared
+    optim-sens.js is mirrored in tests_bess — imported here): with the
+    adaptive split at step=0 the down-split rebalance wait is provably inert,
+    so its OAT weight must be exactly 0 with a full-width 1%-band, while the
+    DA-withhold threshold X genuinely carries weight (X=300 withholds nearly
+    every ISP's DA volume)."""
+    from tests_bess import sens_weight_and_band
+
+    F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw = _l3_inputs()
+    ap_w, an_w, npf, nnf = _afrr_feeds()
+    common = dict(Y=1, Z=1, theta=30, avg_p_pos_w=ap_w, avg_p_neg_w=an_w,
+                  n_pos_fav=npf, n_neg_fav=nnf, s3_X_cap=5, split_adaptive=True,
+                  s_up_start=0.6, s_dn_start=0.3, s_up_step=0.0, s_dn_step=0.0,
+                  s_up_win=96, s_dn_win=96)
+    call = lambda **kw: simulate_total_l3(
+        F, ID, P_da, p_mfrr, Q_pot, p_imb, vwap_1h, p_mfrr_raw, **common, **kw)["total"]
+    base = call(X=30, s_dn_wait=1)
+    curve_wait = [(v, base if v == 1 else call(X=30, s_dn_wait=v)) for v in (1, 24, 96, 672)]
+    m = sens_weight_and_band(curve_wait, 1, base)
+    assert m["weight"] == 0.0 and m["shape"] == "flat", "static split ⇒ wait must be weightless"
+    assert m["band"] == [1, 672], "the 1%-band must span the whole sweep"
+    curve_x = [(v, base if v == 30 else call(X=v, s_dn_wait=1)) for v in (-100, 30, 300)]
+    m2 = sens_weight_and_band(curve_x, 30, base)
+    assert m2["weight"] > 0.05, "the DA-withhold threshold must carry real weight"
+
+
 def test_reserve_respects_adaptive_split():
     """INTERACTION: obligatory (reserve) vs free balancing volume. Reserve down
     MW are an unconditional per-direction floor on the down offer; the adaptive
@@ -2608,6 +2635,7 @@ R.add("Split wait/cadence decoupled from lookback (wait=win≡old; wait=1 per-IS
 if os.path.exists(DATA_AFRR_15MIN_PATH):
     R.add("Adaptive split step=0 ≡ static scalar (LOAD-BEARING)", test_split_adaptive_step0_equals_static)
     R.add("Adaptive split with step>0 actually adapts (differs from static)", test_split_adaptive_actually_adapts)
+    R.add("Sensitivity anchor: static-split wait weightless, X carries weight", test_sens_oat_inert_vs_live_param_windpark)
 if HAVE_RESERVE_JS and os.path.exists(DATA_AFRR_15MIN_PATH):
     R.add("Reserve obligation is a floor; adaptive split routes only free volume", test_reserve_respects_adaptive_split)
 R.add("Window-vectorised total == per-ISP sum", test_window_consistency)

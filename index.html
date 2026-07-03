@@ -326,6 +326,68 @@
         </div>
 
         <!-- =================================================================
+             PARAMETER SENSITIVITY — populated by each ⚡ Optimise run.
+             OAT weights / tolerance bands / shapes around the found optimum,
+             global stats over the seeded random population, and the
+             strongest pairwise interaction mapped as a 2-D sweep. Math +
+             renderers in the shared optim-sens.js (same card as the BESS
+             page); orchestrated by app.js analyseSensitivity().
+             ================================================================= -->
+        <div class="card" id="sens-card">
+          <div class="card-head">
+            <h2>Parameter sensitivity — what actually drives the optimum</h2>
+          </div>
+          <p class="card-desc">
+            Populated by <b>⚡ Optimise</b> (adds ~20% to its runtime; per
+            session, not persisted). <b>Weight</b> = the worst revenue loss
+            from moving <em>one</em> parameter across its whole sweep range
+            while the rest stay at the optimum — a parameter can be optimised
+            to a dramatic-looking value (say, a rebalance wait of 660) yet
+            carry almost no weight. The <b>1%-band</b> is the contiguous range
+            of values staying within 1% of the optimum: a wide band means the
+            exact value is noise, not signal. <b>Shape</b> gives the safe
+            direction (↑ / ↓ / interior peak); <b>⚠</b> marks an optimum
+            sitting on the sweep boundary — usually the no-price-impact
+            liquidity levers such as the reserve coefficients (treat as
+            constraints, not free money); ✶ marks a sharp peak (one grid step
+            already loses &gt;5%). The <b>global</b> columns read the 4,000
+            seeded random samples instead: Spearman ρ (direction over the
+            whole space) and where the top-10% of samples cluster — a cluster
+            spanning the whole range means the parameter does not decide
+            success. The <b>interaction ranking</b> scores parameter pairs by
+            how non-additive their joint effect is over that population
+            (parameters that only work in tandem), and the strongest pair is
+            swept as a 2-D map around the optimum.
+          </p>
+          <div id="sens-weights" class="chart small"></div>
+          <div class="optim-runs-wrap">
+            <table class="decomposition" id="sens-table"></table>
+          </div>
+          <div class="two-col">
+            <div>
+              <h3>One-at-a-time curves (top 6 by weight)</h3>
+              <p class="chart-desc">
+                Δ revenue vs the optimum when one parameter moves across its
+                sweep range (x normalized min → max); dots mark the optimised
+                values. Flat lines = the optimiser's exact choice is
+                interchangeable; cliffs = handle with care.
+              </p>
+              <div id="sens-curves" class="chart small"></div>
+            </div>
+            <div>
+              <h3>Strongest interaction — 2-D sweep</h3>
+              <p class="chart-desc">
+                Joint sweep of the most non-additive pair (others held at the
+                optimum); ★ = the found optimum. A diagonal ridge means the
+                two parameters must move together — exactly the "only works in
+                tandem" case. <span id="sens-pairs-list"></span>
+              </p>
+              <div id="sens-heatmap" class="chart small"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- =================================================================
              OPTIMISED RUNS (#4) — a running log of every Optimise click.
              Each row summarises the setup (sim window, day-type filter,
              sources, winsor/θ), which strategies were enabled, and the
@@ -342,10 +404,14 @@
           <p class="card-desc">
             Every time you press <b>⚡ Optimise</b>, this table gains a row:
             the experiment setup, which strategies were on/off, and the
-            optimal parameters found — plus the resulting revenue and how it
-            compares to the naïve baseline. Use it to compare, for example,
+            optimal parameters found — plus the resulting revenue, how it
+            compares to the naïve baseline, and the run's <b>top drivers</b>
+            (the three heaviest parameters from the sensitivity analysis,
+            ⚠ = saturated at a sweep edge). Use it to compare, for example,
             whether summer and winter (or workdays vs weekends) prefer
-            different parameters. The list is in-memory and clears on reload.
+            different parameters — and to spot when a "different" optimum only
+            differs in parameters that carry no weight. The list is in-memory
+            and clears on reload.
           </p>
           <div class="optim-runs-wrap">
             <table class="optim-runs" id="optim-runs-table"></table>
@@ -396,7 +462,8 @@
     -->
     <script src="data-reserve.js?v=43"></script>
     <script src="engine.js?v=48"></script>
+    <script src="optim-sens.js?v=1"></script>
     <script src="charts.js?v=46"></script>
-    <script src="app.js?v=46"></script>
+    <script src="app.js?v=47"></script>
   </body>
 </html>
