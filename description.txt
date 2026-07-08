@@ -172,7 +172,12 @@ Source: price-procured-reserves-legacy (hourly, 2025, expanded 4x to 15-min)
         for 2026. FCR = Frequency Containment Reserve (symmetric product).
         aFRR = automatic Frequency Restoration Reserve.
         mFRR = manual Frequency Restoration Reserve.
-        Units: MW (volume of reserve procured).
+        Units: EUR/MW·h — the PRICE of the procured reserve capacity.
+        [CORRECTION 2026-07-03: an earlier revision of this document said
+         "MW (volume of reserve procured)". The columns carry the capacity
+         PRICE from the TSO "price of procured reserves" export (see
+         scratch/patch_reserves.py, which backfilled Oct–Dec 2025 from the
+         same export); procured MW volumes are NOT in this dataset.]
         Imputation: forward-fill then back-fill (limit 1 hour).
 
 Note: the structural gap before 2025-02-05 was eliminated by trimming.

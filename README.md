@@ -31,7 +31,7 @@ The tool is split into four pages, navigable from a top navbar:
 │                               S3 strategy cards + parameter-sensitivity card +
 │                               Optimised-runs log)
 ├── graphs.html                 Graphs page (tabs: mFRR / aFRR / mFRR vs aFRR /
-│                               mFRR vs aFRR reserves)
+│                               mFRR vs aFRR reserves / Drivers & timing)
 ├── forecast.html               Forecast page (Baltic imbalance regime forecast;
 │                               reads forecast.json from a private model repo)
 ├── bess.html                   Backtester - BESS page (battery; Setup + 5 strategy
@@ -49,6 +49,14 @@ The tool is split into four pages, navigable from a top navbar:
 ├── data-reserve.js             ~0.8 MB per-ISP LV mFRR / aFRR up+down reserve
 │                               (capacity) prices, from preprocess-reserve.py.
 │                               Drives the reserve strategy + Graphs reserves tab.
+├── data-fund.js                ~3.5 MB market fundamentals aligned to data.js
+│                               indices (EE+LV+LT wind/solar/load ACTUALS + load
+│                               forecast → forecast errors, LV+LT wind DA→ID
+│                               revision, 3-h intraday VWAP, EE/LT mFRR prices,
+│                               LV SA-mFRR bid bands), from
+│                               preprocess-fundamentals.py. Drives the Graphs
+│                               "Drivers & timing" tab (optional — the page
+│                               degrades gracefully without it).
 ├── data-afrr-prices-meta.js    Tiny meta for the chunked per-4 s spread file
 ├── data-afrr-prices-001.js …   Chunked per-4 s spread payload (lazy-loaded by Graphs aFRR tab)
 │
@@ -84,6 +92,10 @@ The tool is split into four pages, navigable from a top navbar:
 │
 ├── graphs-engine.js            Graphs data layer (regime split, quantile bins,
 │                               day-type filter, box-plot stats)
+├── graphs-fund-engine.js       Pure analytics for the Drivers & timing tab
+│                               (grouped stats, lead–lag correlogram, conditional
+│                               probabilities, daily aggregation) — mirrored in
+│                               tests.py
 ├── graphs-charts.js            Graphs Plotly renderers (1-D box, 2-D heatmap, matched panels)
 ├── graphs-app.js               Graphs UI controller (mFRR + aFRR + mFRR-vs-aFRR +
 │                               mFRR-vs-aFRR-reserves sub-tabs, day-type toggles,
@@ -109,11 +121,14 @@ The tool is split into four pages, navigable from a top navbar:
 │                               favourable-only filter, n_*_fav counts)
 ├── preprocess-reserve.py       Build data-reserve.js (LV mFRR/aFRR up+down reserve
 │                               prices), aligned to data.js ISP indices by timestamp
-├── tests.py                    81-test wind-park audit suite (data integrity, engine
+├── preprocess-fundamentals.py  Build data-fund.js (fundamentals for the Drivers &
+│                               timing tab), timestamp-aligned like data-reserve.js
+├── tests.py                    85-test wind-park audit suite (data integrity, engine
 │                               invariants, day-type filter, reserve market, adaptive
 │                               split, reserve↔split interaction, aFRR, sensitivity
-│                               anchor — static-split wait weightless — frozen
-│                               regressions; some registrations conditional on data files)
+│                               anchor, FundEngine mirrors + data-fund.js alignment,
+│                               frozen regressions; some registrations conditional on
+│                               data files)
 ├── tests_bess.py               31-test BESS suite (Python mirror of bess-engine.js):
 │                               forecast/peak+trough ranks, core mechanics (efficiency,
 │                               cost-basis, min-delta, whole-MW, red zones + red-zone
@@ -1141,9 +1156,10 @@ refresh.
 
 ## Graphs — what they show
 
-The Graphs page has four sub-tabs: **mFRR**, **aFRR**, **mFRR vs aFRR**
-(balancing-energy comparison), and **mFRR vs aFRR reserves**
-(capacity-price analysis, documented at the end of this section).
+The Graphs page has five sub-tabs: **mFRR**, **aFRR**, **mFRR vs aFRR**
+(balancing-energy comparison), **mFRR vs aFRR reserves** (capacity-price
+analysis), and **Drivers & timing** (surprise/timing structure — the newest
+tab, documented at the end of this section).
 
 ### mFRR sub-tab (default)
 
@@ -1306,6 +1322,87 @@ in the Jan–May 2026 default window the two reserve prices actually **co-move**
 imbalance (both r ≈ −0.09) — so the full-range mFRR-imbalance signal and the
 aFRR "stability" pattern both lean heavily on 2025 (the latter on the Feb–Apr
 aFRR-market startup specifically). Use the date filter to test robustness.
+
+Two later additions to this subtab:
+
+- **Capacity premium vs realized activation value** — the option-value lens.
+  Each day: x = the DOWN capacity premium (daily mean price × 24,
+  EUR/MW·day), y = a realized activation-payoff **proxy** for 1 MW offered
+  all day (mFRR-dn: `0.25·Σ max(0, −p_mfrr)`; aFRR-dn: the same with the
+  dispatched fraction `n_neg_fav/225` on `avg_p_neg`). The proxy ignores
+  award probability and positive-price buy-backs — relative value, not P&L.
+  Full-dataset reading: the premium runs several times the negative-price
+  activation proxy (≈ 371 vs 84 €/MW·day for mFRR-dn; ≈ 276 vs 44 for
+  aFRR-dn) and is nearly uncorrelated with it day-to-day (r ≈ 0.1 / −0.1) —
+  capacity is priced as insurance, not as expected activation margin.
+- **Structural-break markers** on every reserves time axis (and the daily
+  charts of the Drivers tab): dotted red = **Baltic desynchronization from
+  BRELL (8 Feb 2025** — three days after the dataset starts); shaded band =
+  the **aFRR market ramp-up (Feb–Apr 2025)**. Pooled statistics blend these
+  regimes; the markers keep that visible. They are drawn only when the
+  plotted window overlaps them — Plotly does NOT clip out-of-range shapes,
+  it *expands* a date axis to include them, which would graft an empty 2025
+  region onto the default 2026 window.
+- The option card's payoff proxy has its own **activation energy price
+  winsor pair** in Setup (the raw mFRR series has ±10 000 €/MWh outliers —
+  a single ISP could add 2 500 €/MW·day to one day's proxy); the premium
+  axis respects the capacity winsor pairs.
+
+### Drivers & timing sub-tab
+
+The trader's complaint about the original tabs: they condition on forecast
+*levels* and contemporaneous regimes, while balancing prices are driven by
+**surprises and timing**. This tab (data: the optional `data-fund.js` from
+`preprocess-fundamentals.py`, aligned to data.js indices by timestamp exactly
+like data-reserve.js; math: `graphs-fund-engine.js` / `FundEngine`, mirrored
+and locked in tests.py) adds six cards:
+
+1. **Spread by forecast ERROR** — mFRR spread box-plotted by quantile bins
+   of Baltic **wind error** (actual − DA forecast; the export prints mean
+   ≈ −70 MW, σ ≈ 200 MW — Baltic wind is systematically over-forecast),
+   Baltic **load error**, and the **pre-gate-knowable LV+LT wind DA→ID
+   forecast revision** (Estonia publishes no intraday wind forecast, so the
+   revision is defined on the LV+LT footprint and labelled as such).
+2. **Hour-of-day & slot-in-hour** — the daily rhythm (median + IQR by UTC
+   hour) and the **within-hour sawtooth**: hourly DA blocks vs continuous
+   ramps make the :00/:15/:30/:45 ISPs systematically different (median
+   spread and mean |imbalance| per slot).
+3. **Monthly spike monitor** — share of ISPs beyond the up/down thresholds
+   per calendar month + mean up-exceedance size, on **raw** prices. The
+   non-stationarity monitor: drifting bars ⇒ pooled stats blend regimes.
+4. **Lead–lag correlogram** — `r(series[i], spread[i+lag])` for aFRR-up avg,
+   aFRR-dn depth and Baltic imbalance at lags −8…+8, with the **settled-
+   information gate (lag ≥ 3)** shaded: bars there are *tradeable* under the
+   backtesters' timing rules. Full-dataset reading: **aFRR-up leads the mFRR
+   spread with r ≈ 0.27 at lag +3 — stronger than contemporaneous (≈ 0.14)**;
+   Baltic imbalance leads with r ≈ −0.53 at lag +3 (deficit → high spread
+   45 min later). The fast market moves first; the slow market follows.
+   (NB: the aFRR series use the RAW averages — the graphs page never calls
+   `Engine.maybeWinsorize`, so the winsorised working copies are zeroed
+   there; raw is also the analytically right choice.)
+5. **Conditional spike probability** — P(raw p_mfrr beyond X) by Baltic
+   imbalance regime × wind-error tercile × UTC hour block, with counts and
+   heat shading. Full-dataset reading at X = 200: **≈ 53% in
+   deficit + wind-under-delivery cells vs ≈ 39% in deficit + over-delivery**
+   — the surprise separates spike odds even within the same imbalance
+   regime. (Regime and error are contemporaneous — the table explains; the
+   revision chart is the knowable counterpart.)
+6. **Merit-order scarcity & cross-zone divergence** — the LV accepted
+   SA-mFRR **bid band** (daily width + where the clearing price sits inside
+   it; the band widened from ≈ 26 to ≈ 155 €/MWh over the dataset) and the
+   daily share of ISPs where LV decouples from EE / LT by more than a
+   threshold — congestion episodes where LV-specific scarcity pricing
+   appears.
+
+Setup mirrors the other tabs (window / day-type / spread winsor pair) plus
+error-bin count, up/down spike thresholds and the divergence threshold. Every
+chart degrades to an in-chart notice if `data-fund.js` is absent; the timing
+charts (2–5, regime-only table rows) work from the core dataset alone.
+
+One item from the same review is **not** implementable in this repo:
+archiving the bids-page `bids.json` snapshots into a growing merit-order
+history requires a small append step in the private RetrievalTCK workflow
+(this repo only *reads* that file).
 
 ### Day-type filter (Backtester and Graphs)
 

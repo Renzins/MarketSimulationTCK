@@ -1958,6 +1958,8 @@
         scheduleCmpUpdate();
       } else if (section === "reserves") {
         scheduleResUpdate();
+      } else if (section === "fund") {
+        scheduleFundUpdate();
       } else {
         scheduleUpdate();
       }
@@ -2005,6 +2007,10 @@
     winsorMfrrHi: 100,
     winsorAfrrLo: 0,
     winsorAfrrHi: 100,
+    // activation ENERGY prices feeding the option-card payoff proxy (raw
+    // p_mfrr has ±10 000 outliers — one ISP can add 2 500 €/MW·day to a day)
+    winsorActLo: 0,
+    winsorActHi: 100,
   };
 
   function resSetupHTML() {
@@ -2049,6 +2055,15 @@
           <span class="winsor-input"><input type="number" id="g-res-winsor-afrr-hi" value="${resState.winsorAfrrHi}" min="50" max="100" step="1"><span class="winsor-cap" id="g-res-winsor-afrr-cap-hi">(…)</span></span>
         </div>
         <div class="param-desc"><p>Same for the aFRR reserve price. aFRR capacity has a very fat upper tail, so winsorisation matters even more here.</p></div>
+      </div>
+      <div class="control winsor">
+        <label>Winsorize activation energy prices (payoff proxy)</label>
+        <div class="slider-row two winsor-row">
+          <span class="winsor-input"><input type="number" id="g-res-winsor-act-lo" value="${resState.winsorActLo}" min="0" max="50" step="1"><span class="winsor-cap" id="g-res-winsor-act-cap-lo">(…)</span></span>
+          <span>/</span>
+          <span class="winsor-input"><input type="number" id="g-res-winsor-act-hi" value="${resState.winsorActHi}" min="50" max="100" step="1"><span class="winsor-cap" id="g-res-winsor-act-cap-hi">(…)</span></span>
+        </div>
+        <div class="param-desc"><p>Clips the mFRR energy price and the aFRR-dn average (each at its own within-window percentiles) before they enter the option card's activation-payoff proxy — the raw mFRR series has ±10&nbsp;000&nbsp;€/MWh outliers that can dominate a day's proxy. The caps shown are the mFRR energy clip values.</p></div>
       </div>
     `;
   }
@@ -2140,8 +2155,104 @@
       yaxis: { ...CMP_LAYOUT.yaxis, title: "EUR/MW·h" },
       showlegend: true,
       legend: { orientation: "h", x: 0, y: 1.12, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+      // structural-break markers (desync + aFRR ramp-up), clipped to the
+      // plotted span — eventDecor() is defined in the Drivers & timing section
+      ...eventDecor(d.date),
     });
     Plotly.react("g-res-ts", traces, layout, CMP_CFG);
+  }
+
+  // Option-value view: daily DOWN capacity premium (daily mean hourly price
+  // × 24 → EUR/MW·day) vs a realized activation-payoff PROXY for 1 MW
+  // offered all day: mFRR-dn 0.25·Σ max(0, −p_mfrr); aFRR-dn the same with
+  // the dispatched fraction n_neg_fav/225 and avg_p_neg. Ignores award
+  // probability and positive-price buy-backs — relative value, not P&L.
+  function computeResOption() {
+    if (typeof RESERVE_DATA === "undefined" || !RESERVE_DATA) return null;
+    const W = WIND_DATA, R = RESERVE_DATA;
+    const { start, end } = rangeToIdx(resState.sim.from, resState.sim.to);
+    const mask = D.dayTypeMask, dtf = resState.dayType;
+    const idxs = [];
+    for (let i = start; i < end; i++) {
+      if (dtf === "workday" && mask[i] !== 0) continue;
+      if (dtf === "weekend-holiday" && mask[i] === 0) continue;
+      idxs.push(i);
+    }
+    if (idxs.length < 96) return null;
+    const startMs = new Date(W.start_iso).getTime(), stepMs = W.step_min * 60000;
+    const dayKey = (i) => Math.floor((startMs + W.offsets[i] * stepMs) / 86400000);
+    const pmf = W.p_mfrr;
+    const nv = (arr, i) => { const v = arr[i]; return v == null ? NaN : v; };
+    // raw aFRR-dn average — the winsorised copy is zeroed on this page
+    // (Engine.maybeWinsorize is never called here)
+    const anRaw = D.avg_p_neg_raw || D.avg_p_neg;
+    // within-window percentile bounds (same nearest-rank convention as
+    // computeReservesDaily). Premiums respect the tab's CAPACITY winsor
+    // pairs; the payoff proxy gets its own ACTIVATION-price pair.
+    const boundsOf = (fn, lo, hi) => {
+      const buf = [];
+      for (const i of idxs) { const v = fn(i); if (isFinite(v)) buf.push(v); }
+      if (!buf.length) return [-Infinity, Infinity];
+      buf.sort((p, q) => p - q);
+      const at = (P) => buf[Math.min(buf.length - 1, Math.max(0, Math.round((P / 100) * (buf.length - 1))))];
+      return [at(lo), at(hi)];
+    };
+    const clip = (v, lo, hi) => (isNaN(v) ? NaN : v < lo ? lo : v > hi ? hi : v);
+    const [cmLo, cmHi] = boundsOf((i) => nv(R.reserve_mfrr_dn, i), resState.winsorMfrrLo, resState.winsorMfrrHi);
+    const [caLo, caHi] = boundsOf((i) => nv(R.reserve_afrr_dn, i), resState.winsorAfrrLo, resState.winsorAfrrHi);
+    const [pmLo, pmHi] = boundsOf((i) => pmf[i], resState.winsorActLo, resState.winsorActHi);
+    const [anLo, anHi] = boundsOf((i) => (anRaw ? anRaw[i] : NaN), resState.winsorActLo, resState.winsorActHi);
+    const agg = FundEngine.dailyAgg(idxs, dayKey, {
+      mPrice: { fn: (i) => clip(nv(R.reserve_mfrr_dn, i), cmLo, cmHi), agg: "mean" },
+      aPrice: { fn: (i) => clip(nv(R.reserve_afrr_dn, i), caLo, caHi), agg: "mean" },
+      mPay: { fn: (i) => { const p = clip(pmf[i], pmLo, pmHi); return isFinite(p) && p < 0 ? -p * 0.25 : 0; }, agg: "sum" },
+      aPay: { fn: (i) => {
+        const a = clip(anRaw ? anRaw[i] : NaN, anLo, anHi);
+        const f = D.afrr_n_neg_fav ? D.afrr_n_neg_fav[i] : 0;
+        return isFinite(a) && a < 0 ? -a * (f / 225) * 0.25 : 0;
+      }, agg: "sum" },
+    });
+    return {
+      date: agg.dayKeys.map((k) => new Date(k * 86400000)),
+      mPrem: agg.series.mPrice.map((v) => v * 24),
+      aPrem: agg.series.aPrice.map((v) => v * 24),
+      mPay: agg.series.mPay,
+      aPay: agg.series.aPay,
+      actCaps: { pmLo, pmHi },
+    };
+  }
+
+  function drawResOptionPanel(targetId, prem, pay, date, label, color) {
+    const r = _pearson(prem, pay);
+    const finite = [];
+    for (let i = 0; i < prem.length; i++) if (isFinite(prem[i]) && isFinite(pay[i])) finite.push(i);
+    if (finite.length < 3) {
+      Plotly.react(targetId, [], Object.assign({}, CMP_LAYOUT, {
+        annotations: [{ text: "not enough reserve data in this window", showarrow: false, font: { color: "#9aa5b1" }, xref: "paper", yref: "paper", x: 0.5, y: 0.5 }],
+      }), CMP_CFG);
+      return;
+    }
+    const mean = (a) => a.reduce((s, x) => s + x, 0) / a.length;
+    const meanPrem = mean(finite.map((i) => prem[i]));
+    const meanPay = mean(finite.map((i) => pay[i]));
+    const mx = Math.max(...finite.map((i) => Math.max(prem[i], pay[i])), 1);
+    const traces = [
+      {
+        type: "scattergl", mode: "markers",
+        x: finite.map((i) => prem[i]), y: finite.map((i) => pay[i]),
+        marker: { color: finite.map((_, k) => k), colorscale: "Viridis", size: 6, opacity: 0.75 },
+        text: finite.map((i) => date[i].toISOString().slice(0, 10)),
+        hovertemplate: "%{text}<br>premium %{x:.1f} · payoff proxy %{y:.1f} €/MW·day<extra></extra>", name: "",
+      },
+      { type: "scatter", mode: "lines", x: [0, mx], y: [0, mx], line: { color: "#5a6470", dash: "dot", width: 1 }, hoverinfo: "skip", name: "" },
+    ];
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: { text: `${label}-down: premium vs realized payoff proxy<br><span style='font-size:11px;color:#9aa5b1'>r = ${isFinite(r) ? r.toFixed(3) : "—"} · mean premium ${meanPrem.toFixed(0)} vs mean payoff ${meanPay.toFixed(0)} €/MW·day · dotted = parity</span>`, font: { size: 13, color: "#e6edf3" } },
+      xaxis: { ...CMP_LAYOUT.xaxis, title: `${label}-dn capacity premium (EUR/MW·day)`, rangemode: "tozero" },
+      yaxis: { ...CMP_LAYOUT.yaxis, title: "activation payoff proxy (EUR/MW·day)", rangemode: "tozero" },
+      showlegend: false,
+    });
+    Plotly.react(targetId, traces, layout, CMP_CFG);
   }
 
   function drawResScatter(d) {
@@ -2174,6 +2285,7 @@
       xaxis: { ...CMP_LAYOUT.xaxis, type: "date" },
       yaxis: { ...CMP_LAYOUT.yaxis, title: "aFRR − mFRR (EUR/MW·h)", zeroline: true, zerolinecolor: "#5a6470" },
       showlegend: false,
+      ...eventDecor(d.date),
     });
     Plotly.react("g-res-spread", traces, layout, CMP_CFG);
   }
@@ -2244,6 +2356,14 @@
       drawResSpread(d);
       drawResImbBox("g-res-imb-mfrr", d.mfrr, d.imb, "mFRR");
       drawResImbBox("g-res-imb-afrr", d.afrr, d.imb, "aFRR");
+      const opt = computeResOption();
+      if (opt) {
+        drawResOptionPanel("g-res-opt-mfrr", opt.mPrem, opt.mPay, opt.date, "mFRR");
+        drawResOptionPanel("g-res-opt-afrr", opt.aPrem, opt.aPay, opt.date, "aFRR");
+        const setCap = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = `(≈ ${isFinite(v) ? v.toFixed(0) : "—"})`; };
+        setCap("g-res-winsor-act-cap-lo", opt.actCaps.pmLo);
+        setCap("g-res-winsor-act-cap-hi", opt.actCaps.pmHi);
+      }
       updateResWinsorCaps(d.winsor);
       progEl.textContent = `done in ${Math.round(performance.now() - t0)} ms · ${d.mfrr.length} days`;
     }, 30);
@@ -2287,7 +2407,496 @@
     };
     bindWinsor("g-res-winsor-mfrr-lo", "g-res-winsor-mfrr-hi", "winsorMfrrLo", "winsorMfrrHi");
     bindWinsor("g-res-winsor-afrr-lo", "g-res-winsor-afrr-hi", "winsorAfrrLo", "winsorAfrrHi");
+    bindWinsor("g-res-winsor-act-lo", "g-res-winsor-act-hi", "winsorActLo", "winsorActHi");
     document.getElementById("g-res-recompute").addEventListener("click", updateRes);
+  }
+
+  // =====================================================================
+  //  DRIVERS & TIMING SECTION (panel-fund)
+  //  What moves mFRR pricing, and when. Fundamentals come from the OPTIONAL
+  //  data-fund.js (FUND_DATA): renewables/load ACTUALS → forecast errors,
+  //  the knowable LV+LT DA→ID wind revision, EE/LT mFRR prices and the LV
+  //  SA-mFRR accepted bid bands. Timing charts (hour/slot profiles, monthly
+  //  spikes, lead–lag) need only the core dataset. Pure math lives in
+  //  graphs-fund-engine.js (FundEngine, mirrored in tests.py); this section
+  //  only filters, composes and draws. Charts degrade gracefully (an
+  //  in-chart notice) when FUND_DATA is absent.
+  // =====================================================================
+  const FD = typeof FUND_DATA !== "undefined" && FUND_DATA ? FUND_DATA : null;
+  const fundState = {
+    sim: { from: dataMinDate, to: dataMaxDate },
+    dayType: "all",
+    winsorLo: 5,
+    winsorHi: 95,
+    errBins: 5,
+    spikeUp: 200, // raw p_mfrr ≥ this = up-spike (also the exceedance-table event; negative ⇒ table counts ≤ X)
+    spikeDn: -50, // raw p_mfrr ≤ this = down-spike (monthly monitor)
+    zoneThr: 50, // €/MWh cross-zone divergence threshold
+    maxLag: 8,
+  };
+  const fnum = (arr, i) => {
+    const v = arr[i];
+    return v == null ? NaN : v;
+  };
+  // Surprise variables (NaN when inputs missing) — see data-fund.js docstring.
+  const fundWindErr = (i) => (FD ? fnum(FD.wind_act, i) - WIND_DATA.baltic_wind_da[i] : NaN);
+  const fundLoadErr = (i) => (FD ? fnum(FD.load_act, i) - fnum(FD.load_fc, i) : NaN);
+  const fundWindRev = (i) => (FD ? fnum(FD.wind_id_lvlt, i) - fnum(FD.wind_da_lvlt, i) : NaN);
+
+  function fundSetupHTML() {
+    return `
+      <div class="control sim-range">
+        <label>Simulation date range<span class="unit">DD/MM/YYYY</span></label>
+        <div class="slider-row two">
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-fund-sim-from" value="${isoToEU(fundState.sim.from)}">
+          <span>→</span>
+          <input type="text" inputmode="numeric" placeholder="DD/MM/YYYY"
+                 pattern="\\d{2}/\\d{2}/\\d{4}" maxlength="10"
+                 id="g-fund-sim-to" value="${isoToEU(fundState.sim.to)}">
+          <button type="button" class="btn small" id="g-fund-sim-reset" title="Reset to full dataset">↻</button>
+        </div>
+        <div class="param-desc"><p>Restricts every chart on this tab to ISPs in this window; error-bin edges, winsor caps and daily aggregates are derived within it.</p></div>
+      </div>
+      <div class="control">
+        <label>Day type filter</label>
+        <div class="day-type-toggle g-fund-day-type-toggle">
+          <button type="button" class="btn small preset${fundState.dayType === "all" ? " active" : ""}" data-day-type="all">All days</button>
+          <button type="button" class="btn small preset${fundState.dayType === "weekend-holiday" ? " active" : ""}" data-day-type="weekend-holiday">Weekends + holidays</button>
+          <button type="button" class="btn small preset${fundState.dayType === "workday" ? " active" : ""}" data-day-type="workday">Workdays only</button>
+        </div>
+        <div class="param-desc"><p>Filters the ISPs fed into every chart (LV/EE/LT public holidays count as weekend).</p></div>
+      </div>
+      <div class="control winsor">
+        <label>Winsorize spread (percentiles)</label>
+        <div class="slider-row two winsor-row">
+          <span class="winsor-input"><input type="number" id="g-fund-winsor-lo" value="${fundState.winsorLo}" min="0" max="50" step="1"><span class="winsor-cap" id="g-fund-winsor-cap-lo">(…)</span></span>
+          <span>/</span>
+          <span class="winsor-input"><input type="number" id="g-fund-winsor-hi" value="${fundState.winsorHi}" min="50" max="100" step="1"><span class="winsor-cap" id="g-fund-winsor-cap-hi">(…)</span></span>
+        </div>
+        <div class="param-desc"><p>Applied to the mFRR spread in the error-bin, hour/slot and lead–lag charts. The spike monitor and the exceedance table deliberately use RAW prices — the tails are the subject there.</p></div>
+      </div>
+      <div class="control">
+        <label>Error bins<span class="unit">quantile buckets</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-fund-bins" min="3" max="8" step="1" value="${fundState.errBins}">
+          <input type="number" id="g-fund-bins-num" value="${fundState.errBins}" min="3" max="8" step="1">
+        </div>
+        <div class="param-desc"><p>Buckets per surprise variable in the error box plots (quantile-derived, evenly populated).</p></div>
+      </div>
+      <div class="control">
+        <label>Spike threshold — up<span class="unit">EUR/MWh (raw)</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-fund-x-up" min="-500" max="1000" step="10" value="${fundState.spikeUp}">
+          <input type="number" id="g-fund-x-up-num" value="${fundState.spikeUp}" min="-2000" max="5000" step="10">
+        </div>
+        <div class="param-desc"><p>Monthly up-spike share and the exceedance-table event: P(p ≥ X); set it negative and the table counts P(p ≤ X) instead.</p></div>
+      </div>
+      <div class="control">
+        <label>Spike threshold — down<span class="unit">EUR/MWh (raw)</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-fund-x-dn" min="-1000" max="100" step="10" value="${fundState.spikeDn}">
+          <input type="number" id="g-fund-x-dn-num" value="${fundState.spikeDn}" min="-5000" max="1000" step="10">
+        </div>
+        <div class="param-desc"><p>Monthly down-spike share: share of ISPs with raw p ≤ this.</p></div>
+      </div>
+      <div class="control">
+        <label>Cross-zone divergence<span class="unit">EUR/MWh</span></label>
+        <div class="slider-row">
+          <input type="range" id="g-fund-zone-thr" min="5" max="500" step="5" value="${fundState.zoneThr}">
+          <input type="number" id="g-fund-zone-thr-num" value="${fundState.zoneThr}" min="1" max="2000" step="5">
+        </div>
+        <div class="param-desc"><p>|LV − EE| or |LV − LT| mFRR price gaps beyond this count as a divergence (congestion) ISP.</p></div>
+      </div>
+    `;
+  }
+  function renderFundCards() {
+    document.getElementById("g-fund-setup-params").innerHTML = fundSetupHTML();
+  }
+
+  let fundUpdateTimer = null;
+  function scheduleFundUpdate() {
+    clearTimeout(fundUpdateTimer);
+    fundUpdateTimer = setTimeout(updateFund, 60);
+  }
+
+  function fundIdxs() {
+    const { start, end } = rangeToIdx(fundState.sim.from, fundState.sim.to);
+    const mask = D.dayTypeMask, dtf = fundState.dayType;
+    const idxs = [];
+    for (let i = start; i < end; i++) {
+      if (dtf === "workday" && mask[i] !== 0) continue;
+      if (dtf === "weekend-holiday" && mask[i] === 0) continue;
+      idxs.push(i);
+    }
+    return idxs;
+  }
+
+  function fundNotice(targetId, msg) {
+    Plotly.react(targetId, [], Object.assign({}, CMP_LAYOUT, {
+      annotations: [{ text: msg, showarrow: false, font: { color: "#9aa5b1", size: 12 }, xref: "paper", yref: "paper", x: 0.5, y: 0.5 }],
+    }), CMP_CFG);
+  }
+
+  // Precomputed-quartile box chart from FundEngine.groupStats results.
+  function drawFundBoxes(targetId, stats, labels, title, subtitle, xTitle) {
+    const keep = stats.map((s, k) => (s ? k : -1)).filter((k) => k >= 0);
+    if (!keep.length) { fundNotice(targetId, "no data in this window"); return; }
+    const trace = {
+      type: "box",
+      x: keep.map((k) => labels[k]),
+      q1: keep.map((k) => stats[k].q1),
+      median: keep.map((k) => stats[k].median),
+      q3: keep.map((k) => stats[k].q3),
+      lowerfence: keep.map((k) => stats[k].q1),
+      upperfence: keep.map((k) => stats[k].q3),
+      mean: keep.map((k) => stats[k].mean),
+      text: keep.map((k) => `n=${stats[k].n.toLocaleString()}`),
+      hovertemplate: "%{x}<br>median %{median:.1f} · IQR %{q1:.1f}…%{q3:.1f} €/MWh<br>%{text}<extra></extra>",
+      marker: { color: "#58a6ff" },
+      name: "",
+    };
+    const layout = Object.assign({}, CMP_LAYOUT, {
+      title: { text: `${title}<br><span style='font-size:11px;color:#9aa5b1'>${subtitle}</span>`, font: { size: 13, color: "#e6edf3" } },
+      xaxis: { ...CMP_LAYOUT.xaxis, type: "category", title: xTitle, automargin: true },
+      yaxis: { ...CMP_LAYOUT.yaxis, title: "mFRR spread (€/MWh)", zeroline: true, zerolinecolor: "#5a6470" },
+      showlegend: false,
+    });
+    Plotly.react(targetId, [trace], layout, CMP_CFG);
+  }
+
+  function drawFundErr(targetId, errFn, title, idxs, clipSpread, unit) {
+    if (!FD) { fundNotice(targetId, "requires data-fund.js (run preprocess-fundamentals.py)"); return; }
+    const keep = [], vals = [];
+    for (const i of idxs) {
+      const e = errFn(i);
+      if (isFinite(e)) { keep.push(i); vals.push(e); }
+    }
+    if (keep.length < 100) { fundNotice(targetId, "not enough data in this window"); return; }
+    const { edges, labels } = GraphsEngine.quantileEdges(vals, fundState.errBins, unit);
+    const stats = FundEngine.groupStats(keep, (i) => clipSpread(i), (i) => FundEngine.binIndex(errFn(i), edges), labels.length);
+    drawFundBoxes(targetId, stats, labels, title, `${keep.length.toLocaleString()} ISPs · quantile bins · winsorized spread`, "");
+  }
+
+  // Structural-break markers — the dataset starts 3 days before the Baltic
+  // desynchronization from BRELL/IPS (8 Feb 2025); the aFRR energy market
+  // ramped up over Feb–Apr 2025 (near-zero prices while it started).
+  // NB: Plotly does NOT clip shapes/annotations outside the plotted data —
+  // it EXPANDS a date axis to include them (a 2026-only window would grow a
+  // huge empty 2025 region). eventDecor() therefore returns only the
+  // decorations that overlap the plotted date span.
+  const EV_DESYNC = new Date("2025-02-08T00:00:00Z").getTime();
+  const EV_RAMP0 = new Date("2025-02-05T00:00:00Z").getTime();
+  const EV_RAMP1 = new Date("2025-04-30T00:00:00Z").getTime();
+  function eventDecor(dates) {
+    const out = { shapes: [], annotations: [] };
+    if (!dates || !dates.length) return out;
+    const t = (d) => (d instanceof Date ? d.getTime() : new Date(d).getTime());
+    const lo = t(dates[0]), hi = t(dates[dates.length - 1]);
+    if (EV_RAMP1 >= lo && EV_RAMP0 <= hi) {
+      out.shapes.push({
+        type: "rect", xref: "x", yref: "paper",
+        x0: new Date(Math.max(EV_RAMP0, lo)), x1: new Date(Math.min(EV_RAMP1, hi)),
+        y0: 0, y1: 1, fillcolor: "rgba(240,136,62,0.08)", line: { width: 0 }, layer: "below",
+      });
+      const mid = (Math.max(EV_RAMP0, lo) + Math.min(EV_RAMP1, hi)) / 2;
+      out.annotations.push({ x: new Date(mid), xref: "x", y: 0.02, yref: "paper", yanchor: "bottom", text: "aFRR ramp-up", showarrow: false, font: { size: 9, color: "#f0883e" } });
+    }
+    if (EV_DESYNC >= lo && EV_DESYNC <= hi) {
+      out.shapes.push({ type: "line", xref: "x", yref: "paper", x0: "2025-02-08", x1: "2025-02-08", y0: 0, y1: 1, line: { color: "#f85149", width: 1, dash: "dot" } });
+      out.annotations.push({ x: "2025-02-08", xref: "x", y: 0.98, yref: "paper", yanchor: "top", text: "desync", showarrow: false, font: { size: 9, color: "#f85149" } });
+    }
+    return out;
+  }
+
+  function updateFund() {
+    const progEl = document.getElementById("g-fund-progress");
+    if (!progEl) return;
+    progEl.textContent = "computing…";
+    setTimeout(() => {
+      const t0 = performance.now();
+      const idxs = fundIdxs();
+      if (idxs.length < 200) { progEl.textContent = "not enough ISPs in this window"; return; }
+      const W = WIND_DATA;
+      const pmf = W.p_mfrr, pda = W.p_da, imb = W.baltic_imb_vol;
+      // fund-tab winsor bounds on the spread (independent of other tabs)
+      const spreads = [];
+      for (const i of idxs) {
+        const s = pmf[i] - pda[i];
+        if (isFinite(s)) spreads.push(s);
+      }
+      spreads.sort((a, b) => a - b);
+      const wLo = FundEngine.percentile(spreads, fundState.winsorLo);
+      const wHi = FundEngine.percentile(spreads, fundState.winsorHi);
+      const capLo = document.getElementById("g-fund-winsor-cap-lo"), capHi = document.getElementById("g-fund-winsor-cap-hi");
+      if (capLo) capLo.textContent = `(≈ ${isFinite(wLo) ? wLo.toFixed(0) : "—"})`;
+      if (capHi) capHi.textContent = `(≈ ${isFinite(wHi) ? wHi.toFixed(0) : "—"})`;
+      const clipSpread = (i) => {
+        const s = pmf[i] - pda[i];
+        return !isFinite(s) ? NaN : s < wLo ? wLo : s > wHi ? wHi : s;
+      };
+
+      // --- F1: spread by forecast ERROR / knowable revision ---------------
+      drawFundErr("g-fund-err-wind", fundWindErr, "Spread by Baltic wind ERROR (actual − DA forecast)", idxs, clipSpread, "MW");
+      drawFundErr("g-fund-err-load", fundLoadErr, "Spread by Baltic load ERROR (actual − DA forecast)", idxs, clipSpread, "MW");
+      drawFundErr("g-fund-err-rev", fundWindRev, "Spread by LV+LT wind DA→ID forecast REVISION (knowable pre-gate)", idxs, clipSpread, "MW");
+
+      // --- F2: hour-of-day + slot-in-hour ---------------------------------
+      // start_iso is 00:00 UTC, so ISP-of-day falls out of the offsets directly.
+      const hourOf = (i) => ((D.offsets[i] % 96) / 4) | 0;
+      const slotOf = (i) => D.offsets[i] % 4;
+      const hs = FundEngine.groupStats(idxs, clipSpread, hourOf, 24);
+      const hx = [], hMed = [], hQ1 = [], hQ3 = [];
+      for (let h = 0; h < 24; h++) {
+        if (!hs[h]) continue;
+        hx.push(h); hMed.push(hs[h].median); hQ1.push(hs[h].q1); hQ3.push(hs[h].q3);
+      }
+      Plotly.react("g-fund-hour", [
+        { x: hx, y: hQ3, type: "scatter", mode: "lines", line: { width: 0 }, showlegend: false, hoverinfo: "skip" },
+        { x: hx, y: hQ1, type: "scatter", mode: "lines", line: { width: 0 }, fill: "tonexty", fillcolor: "rgba(88,166,255,0.15)", name: "IQR", hoverinfo: "skip" },
+        { x: hx, y: hMed, type: "scatter", mode: "lines+markers", name: "median", line: { color: "#58a6ff", width: 2 }, marker: { size: 5 }, hovertemplate: "%{x}:00 UTC<br>median %{y:.1f} €/MWh<extra></extra>" },
+      ], Object.assign({}, CMP_LAYOUT, {
+        title: { text: "mFRR spread by UTC hour<br><span style='font-size:11px;color:#9aa5b1'>median + interquartile band · winsorized</span>", font: { size: 13, color: "#e6edf3" } },
+        xaxis: { ...CMP_LAYOUT.xaxis, title: "UTC hour", dtick: 2 },
+        yaxis: { ...CMP_LAYOUT.yaxis, title: "spread (€/MWh)", zeroline: true, zerolinecolor: "#5a6470" },
+        showlegend: false,
+      }), CMP_CFG);
+
+      const ss = FundEngine.groupStats(idxs, clipSpread, slotOf, 4);
+      const si = FundEngine.groupStats(idxs, (i) => Math.abs(imb[i]), slotOf, 4);
+      const slotLabels = [":00", ":15", ":30", ":45"];
+      Plotly.react("g-fund-slot", [
+        { x: slotLabels, y: ss.map((s) => (s ? s.median : null)), type: "bar", name: "median spread", marker: { color: "#58a6ff" }, hovertemplate: "%{x}<br>median spread %{y:.1f} €/MWh<extra></extra>" },
+        { x: slotLabels, y: si.map((s) => (s ? s.mean : null)), type: "scatter", mode: "lines+markers", name: "mean |imbalance|", yaxis: "y2", line: { color: "#f0883e", width: 2 }, hovertemplate: "%{x}<br>mean |imb| %{y:.1f} MW<extra></extra>" },
+      ], Object.assign({}, CMP_LAYOUT, {
+        title: { text: "Within-hour sawtooth — slot of the hour<br><span style='font-size:11px;color:#9aa5b1'>hourly DA blocks vs continuous ramps</span>", font: { size: 13, color: "#e6edf3" } },
+        xaxis: { ...CMP_LAYOUT.xaxis, type: "category", title: "ISP within the hour" },
+        yaxis: { ...CMP_LAYOUT.yaxis, title: "median spread (€/MWh)", zeroline: true, zerolinecolor: "#5a6470" },
+        yaxis2: { title: "mean |Baltic imbalance| (MW)", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", color: "#f0883e" },
+        showlegend: true,
+        legend: { orientation: "h", x: 0, y: 1.15, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+      }), CMP_CFG);
+
+      // --- F3: monthly spike monitor (RAW prices) -------------------------
+      const startMs = new Date(W.start_iso).getTime(), stepMs = W.step_min * 60000;
+      const monthKey = (i) => {
+        const t = new Date(startMs + D.offsets[i] * stepMs);
+        return t.getUTCFullYear() * 12 + t.getUTCMonth();
+      };
+      const XU = fundState.spikeUp, XD = fundState.spikeDn;
+      const mAgg = FundEngine.dailyAgg(idxs, monthKey, {
+        up: { fn: (i) => (isFinite(pmf[i]) ? (pmf[i] >= XU ? 1 : 0) : NaN), agg: "mean" },
+        dn: { fn: (i) => (isFinite(pmf[i]) ? (pmf[i] <= XD ? 1 : 0) : NaN), agg: "mean" },
+        mag: { fn: (i) => (isFinite(pmf[i]) && pmf[i] >= XU ? pmf[i] - XU : NaN), agg: "mean" },
+      });
+      const mLab = mAgg.dayKeys.map((k) => `${Math.floor(k / 12)}-${String((k % 12) + 1).padStart(2, "0")}`);
+      Plotly.react("g-fund-monthly", [
+        { x: mLab, y: mAgg.series.up.map((v) => v * 100), type: "bar", name: `share p ≥ ${XU}`, marker: { color: "#3fb950" }, hovertemplate: "%{x}<br>up-spikes: %{y:.2f}% of ISPs<extra></extra>" },
+        { x: mLab, y: mAgg.series.dn.map((v) => v * 100), type: "bar", name: `share p ≤ ${XD}`, marker: { color: "#f85149" }, hovertemplate: "%{x}<br>down-spikes: %{y:.2f}% of ISPs<extra></extra>" },
+        { x: mLab, y: mAgg.series.mag, type: "scatter", mode: "lines+markers", name: "mean up-exceedance", yaxis: "y2", line: { color: "#e3b341", width: 2 }, hovertemplate: "%{x}<br>mean size above threshold: %{y:.0f} €/MWh<extra></extra>" },
+      ], Object.assign({}, CMP_LAYOUT, {
+        title: { text: "Monthly spike frequency & severity (raw prices)<br><span style='font-size:11px;color:#9aa5b1'>drifting bars ⇒ non-stationary market — split your analyses</span>", font: { size: 13, color: "#e6edf3" } },
+        xaxis: { ...CMP_LAYOUT.xaxis, type: "category", title: "month" },
+        yaxis: { ...CMP_LAYOUT.yaxis, title: "% of ISPs" },
+        yaxis2: { title: "mean exceedance (€/MWh)", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", color: "#e3b341" },
+        barmode: "group",
+        showlegend: true,
+        legend: { orientation: "h", x: 0, y: 1.15, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+      }), CMP_CFG);
+
+      // --- F4: lead–lag correlogram ---------------------------------------
+      const inWin = new Uint8Array(D.n);
+      for (const i of idxs) inWin[i] = 1;
+      const accept = (i) => inWin[i] === 1;
+      const spreadFn = (i) => clipSpread(i);
+      // NB: use the RAW aFRR averages — the graphs page never calls
+      // Engine.maybeWinsorize, so the winsorised working copies stay zeroed;
+      // raw is also what we want analytically here.
+      const apRaw = D.avg_p_pos_raw || D.avg_p_pos;
+      const anRaw = D.avg_p_neg_raw || D.avg_p_neg;
+      const pairs = [
+        { name: "aFRR-up avg leads →", fn: (i) => apRaw[i], color: "#3fb950" },
+        { name: "aFRR-dn depth leads →", fn: (i) => -anRaw[i], color: "#f85149" },
+        { name: "Baltic imbalance leads →", fn: (i) => imb[i], color: "#bc8cff" },
+      ];
+      const llTraces = pairs.map((p) => {
+        const res = FundEngine.leadLagCorr(D.n, p.fn, spreadFn, fundState.maxLag, accept);
+        return {
+          x: res.map((d) => d.lag), y: res.map((d) => d.r), type: "bar", name: p.name,
+          marker: { color: p.color },
+          hovertemplate: `${p.name}<br>lag %{x} ISPs · r = %{y:.3f}<extra></extra>`,
+        };
+      });
+      Plotly.react("g-fund-leadlag", llTraces, Object.assign({}, CMP_LAYOUT, {
+        title: { text: "Lead–lag vs the mFRR spread<br><span style='font-size:11px;color:#9aa5b1'>r(series[i], spread[i+lag]) — positive-lag peaks are LEADING (tradeable at lag ≥ 3)</span>", font: { size: 13, color: "#e6edf3" } },
+        xaxis: { ...CMP_LAYOUT.xaxis, title: "lag (ISPs) — settled-information gate at +3", dtick: 1 },
+        yaxis: { ...CMP_LAYOUT.yaxis, title: "Pearson r", zeroline: true, zerolinecolor: "#5a6470" },
+        barmode: "group",
+        showlegend: true,
+        legend: { orientation: "h", x: 0, y: 1.15, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+        shapes: [{ type: "rect", xref: "x", yref: "paper", x0: 2.5, x1: fundState.maxLag + 0.5, y0: 0, y1: 1, fillcolor: "rgba(63,185,80,0.06)", line: { width: 0 }, layer: "below" }],
+        annotations: [{ x: fundState.maxLag - 0.5, xref: "x", y: 0.97, yref: "paper", yanchor: "top", text: "tradeable", showarrow: false, font: { size: 9, color: "#3fb950" } }],
+      }), CMP_CFG);
+
+      // --- F5: conditional exceedance table (RAW prices) ------------------
+      drawFundExceed(idxs, pmf, imb);
+
+      // --- F6: bid-band scarcity + cross-zone divergence -------------------
+      const dayKey = (i) => Math.floor((startMs + D.offsets[i] * stepMs) / 86400000);
+      if (FD) {
+        const bandAgg = FundEngine.dailyAgg(idxs, dayKey, {
+          width: { fn: (i) => { const w = fnum(FD.mfrr_maxbid_up, i) - fnum(FD.mfrr_minbid_up, i); return isFinite(w) && w >= 0 ? w : NaN; }, agg: "mean" },
+          pos: { fn: (i) => {
+            const mn = fnum(FD.mfrr_minbid_up, i), mx = fnum(FD.mfrr_maxbid_up, i), p = pmf[i];
+            if (!isFinite(mn) || !isFinite(mx) || mx - mn <= 0 || !isFinite(p) || p < 1) return NaN;
+            const r = (p - mn) / (mx - mn);
+            return r < 0 ? 0 : r > 1 ? 1 : r;
+          }, agg: "mean" },
+        });
+        const bx = bandAgg.dayKeys.map((k) => new Date(k * 86400000));
+        Plotly.react("g-fund-band", [
+          { x: bx, y: bandAgg.series.width, type: "scatter", mode: "lines", name: "accepted band width (up)", line: { color: "#58a6ff", width: 1.3 }, hovertemplate: "%{x|%Y-%m-%d}<br>band width %{y:.0f} €/MWh<extra></extra>" },
+          { x: bx, y: bandAgg.series.pos, type: "scatter", mode: "lines", name: "clearing position in band", yaxis: "y2", line: { color: "#e3b341", width: 1.3 }, hovertemplate: "%{x|%Y-%m-%d}<br>position %{y:.2f} (1 = at ceiling)<extra></extra>" },
+        ], Object.assign({}, CMP_LAYOUT, {
+          title: { text: "LV SA-mFRR accepted bid band — width & clearing position (up)<br><span style='font-size:11px;color:#9aa5b1'>narrow band + clearing at the ceiling = thinning stack</span>", font: { size: 13, color: "#e6edf3" } },
+          xaxis: { ...CMP_LAYOUT.xaxis, type: "date" },
+          yaxis: { ...CMP_LAYOUT.yaxis, title: "band width (€/MWh)" },
+          yaxis2: { title: "clearing position (0…1)", overlaying: "y", side: "right", range: [0, 1], gridcolor: "rgba(0,0,0,0)", color: "#e3b341" },
+          showlegend: true,
+          legend: { orientation: "h", x: 0, y: 1.15, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+          ...eventDecor(bx),
+        }), CMP_CFG);
+
+        const thr = fundState.zoneThr;
+        const zoneAgg = FundEngine.dailyAgg(idxs, dayKey, {
+          ee: { fn: (i) => { const d = Math.abs(pmf[i] - fnum(FD.p_mfrr_ee, i)); return isFinite(d) ? (d > thr ? 1 : 0) : NaN; }, agg: "mean" },
+          lt: { fn: (i) => { const d = Math.abs(pmf[i] - fnum(FD.p_mfrr_lt, i)); return isFinite(d) ? (d > thr ? 1 : 0) : NaN; }, agg: "mean" },
+        });
+        const zx = zoneAgg.dayKeys.map((k) => new Date(k * 86400000));
+        Plotly.react("g-fund-zone", [
+          { x: zx, y: zoneAgg.series.ee.map((v) => v * 100), type: "scatter", mode: "lines", name: "|LV − EE| > thr", line: { color: "#3fb950", width: 1.3 }, hovertemplate: "%{x|%Y-%m-%d}<br>LV↔EE divergent: %{y:.1f}% of ISPs<extra></extra>" },
+          { x: zx, y: zoneAgg.series.lt.map((v) => v * 100), type: "scatter", mode: "lines", name: "|LV − LT| > thr", line: { color: "#bc8cff", width: 1.3 }, hovertemplate: "%{x|%Y-%m-%d}<br>LV↔LT divergent: %{y:.1f}% of ISPs<extra></extra>" },
+        ], Object.assign({}, CMP_LAYOUT, {
+          title: { text: `Cross-zone mFRR price divergence (> ${thr} €/MWh)<br><span style='font-size:11px;color:#9aa5b1'>share of the day's ISPs where LV decouples — congestion episodes</span>`, font: { size: 13, color: "#e6edf3" } },
+          xaxis: { ...CMP_LAYOUT.xaxis, type: "date" },
+          yaxis: { ...CMP_LAYOUT.yaxis, title: "% of ISPs", rangemode: "tozero" },
+          showlegend: true,
+          legend: { orientation: "h", x: 0, y: 1.15, bgcolor: "rgba(0,0,0,0)", font: { color: "#e6edf3", size: 11 } },
+          ...eventDecor(zx),
+        }), CMP_CFG);
+      } else {
+        fundNotice("g-fund-band", "requires data-fund.js (run preprocess-fundamentals.py)");
+        fundNotice("g-fund-zone", "requires data-fund.js (run preprocess-fundamentals.py)");
+      }
+
+      progEl.textContent = `done in ${Math.round(performance.now() - t0)} ms · ${idxs.length.toLocaleString()} ISPs · fundamentals ${FD ? "loaded" : "MISSING"}`;
+    }, 30);
+  }
+
+  function drawFundExceed(idxs, pmf, imb) {
+    const el = document.getElementById("g-fund-exceed");
+    if (!el) return;
+    const X = fundState.spikeUp;
+    const eventFn = (i) => (X >= 0 ? pmf[i] >= X : pmf[i] <= X);
+    const hourBlock = (i) => Math.floor(((D.offsets[i] % 96) / 4) / 6); // 0..3
+    const regime = (i) => (imb[i] <= -30 ? 0 : imb[i] >= 30 ? 2 : 1);
+    const regimeLab = ["Deficit (≤ −30 MW)", "Neutral", "Surplus (≥ +30 MW)"];
+    let rowFn, rowLabs;
+    if (FD) {
+      const errVals = [];
+      for (const i of idxs) { const e = fundWindErr(i); if (isFinite(e)) errVals.push(e); }
+      if (errVals.length > 100) {
+        const { edges } = GraphsEngine.quantileEdges(errVals, 3, "MW");
+        const terLab = [`err ≤ ${edges[1].toFixed(0)} (under-delivery)`, "err mid", `err > ${edges[2].toFixed(0)} (over-delivery)`];
+        rowFn = (i) => {
+          const e = fundWindErr(i);
+          if (!isFinite(e)) return -1;
+          return regime(i) * 3 + FundEngine.binIndex(e, edges);
+        };
+        rowLabs = [];
+        for (let r = 0; r < 3; r++) for (let t = 0; t < 3; t++) rowLabs.push(`${regimeLab[r]} · wind ${terLab[t]}`);
+      }
+    }
+    if (!rowFn) {
+      rowFn = regime;
+      rowLabs = regimeLab.map((l) => `${l} (wind-error terciles need data-fund.js)`);
+    }
+    const cp = FundEngine.condProb(idxs, eventFn, rowFn, rowLabs.length, hourBlock, 4);
+    const colLabs = ["00–06", "06–12", "12–18", "18–24", "All"];
+    let maxP = 0;
+    for (const row of cp.p) for (const v of row) if (isFinite(v) && v > maxP) maxP = v;
+    const cell = (p, n) => {
+      if (!n) return `<td style="color:#5a6470">—</td>`;
+      const a = maxP > 0 ? Math.min(0.85, (p / maxP) * 0.85) : 0;
+      return `<td style="background:rgba(248,81,73,${a.toFixed(3)})" title="${n.toLocaleString()} ISPs">${(p * 100).toFixed(1)}%<span style="color:#9aa5b1;font-size:10px"> (${n >= 1000 ? Math.round(n / 1000) + "k" : n})</span></td>`;
+    };
+    const rows = rowLabs.map((lab, r) => {
+      const tot = cp.cnt[r].reduce((s, v) => s + v, 0);
+      const hitTot = cp.hit[r].reduce((s, v) => s + v, 0);
+      const cells = cp.p[r].map((p, c) => cell(p, cp.cnt[r][c])).join("");
+      return `<tr><th style="text-align:left">${lab}</th>${cells}${cell(tot ? hitTot / tot : NaN, tot)}</tr>`;
+    }).join("");
+    el.innerHTML =
+      `<thead><tr><th style="text-align:left">P(p ${X >= 0 ? "≥" : "≤"} ${X} €/MWh) · UTC hours →</th>${colLabs.map((c) => `<th>${c}</th>`).join("")}</tr></thead>` +
+      `<tbody>${rows}</tbody>`;
+  }
+
+  function bindFundControls() {
+    const fromEl = document.getElementById("g-fund-sim-from");
+    const toEl = document.getElementById("g-fund-sim-to");
+    if (!fromEl) return;
+    const onSim = () => {
+      let f = clampDate(parseEU(fromEl.value) || dataMinDate, dataMinDate, dataMaxDate);
+      let t = clampDate(parseEU(toEl.value) || dataMaxDate, dataMinDate, dataMaxDate);
+      if (f > t) [f, t] = [t, f];
+      fromEl.value = isoToEU(f); toEl.value = isoToEU(t);
+      fundState.sim = { from: f, to: t };
+      scheduleFundUpdate();
+    };
+    fromEl.addEventListener("change", onSim);
+    toEl.addEventListener("change", onSim);
+    document.getElementById("g-fund-sim-reset").addEventListener("click", () => {
+      fromEl.value = isoToEU(dataMinDate); toEl.value = isoToEU(dataMaxDate); onSim();
+    });
+    document.querySelectorAll(".g-fund-day-type-toggle .preset[data-day-type]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const t = btn.dataset.dayType;
+        if (fundState.dayType === t) return;
+        fundState.dayType = t;
+        document.querySelectorAll(".g-fund-day-type-toggle .preset[data-day-type]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        scheduleFundUpdate();
+      });
+    });
+    const bindPair = (id, key, lo, hi) => {
+      const slider = document.getElementById(id), num = document.getElementById(`${id}-num`);
+      const on = (raw) => {
+        let v = parseFloat(raw);
+        if (isNaN(v)) return;
+        v = Math.max(lo, Math.min(hi, v));
+        if (slider) slider.value = v;
+        if (num) num.value = v;
+        fundState[key] = v;
+        scheduleFundUpdate();
+      };
+      if (slider) slider.addEventListener("input", (e) => on(e.target.value));
+      if (num) num.addEventListener("change", (e) => on(e.target.value));
+    };
+    bindPair("g-fund-bins", "errBins", 3, 8);
+    bindPair("g-fund-x-up", "spikeUp", -2000, 5000);
+    bindPair("g-fund-x-dn", "spikeDn", -5000, 1000);
+    bindPair("g-fund-zone-thr", "zoneThr", 1, 2000);
+    const wLo = document.getElementById("g-fund-winsor-lo"), wHi = document.getElementById("g-fund-winsor-hi");
+    const onW = () => {
+      fundState.winsorLo = Math.max(0, Math.min(50, parseFloat(wLo.value) || 0));
+      fundState.winsorHi = Math.max(50, Math.min(100, parseFloat(wHi.value) || 100));
+      wLo.value = fundState.winsorLo; wHi.value = fundState.winsorHi;
+      scheduleFundUpdate();
+    };
+    wLo.addEventListener("change", onW);
+    wHi.addEventListener("change", onW);
+    document.getElementById("g-fund-recompute").addEventListener("click", updateFund);
   }
 
   // ---------- init -------------------------------------------------------
@@ -2299,9 +2908,12 @@
   bindCmpControls();
   renderResCards();
   bindResControls();
+  renderFundCards();
+  bindFundControls();
   updateAll();
-  // Pre-compute aFRR + compare + reserves so switching tabs is instant
+  // Pre-compute aFRR + compare + reserves + drivers so switching tabs is instant
   setTimeout(updateAfrr, 200);
   setTimeout(updateCmp, 400);
   setTimeout(updateRes, 600);
+  setTimeout(updateFund, 800);
 })();

@@ -31,6 +31,7 @@
       <button class="tab" data-section="afrr">aFRR</button>
       <button class="tab" data-section="compare">mFRR vs aFRR</button>
       <button class="tab" data-section="reserves">mFRR vs aFRR reserves</button>
+      <button class="tab" data-section="fund">Drivers &amp; timing</button>
     </nav>
 
     <main>
@@ -567,6 +568,34 @@
         </div>
 
         <div class="card">
+          <div class="card-head"><h2>Capacity premium vs realized activation value</h2></div>
+          <p class="card-desc">
+            The capacity price is an <b>option premium</b>; the activation
+            energy is its payoff. Each point is a day: x = that day's DOWN
+            capacity premium (daily mean price × 24 h, EUR/MW·day), y = a
+            <b>realized activation-payoff proxy</b> for 1 MW offered all day —
+            mFRR-dn: 0.25 h × Σ max(0, −p<sub>mFRR</sub>) over the day's ISPs
+            (energy earned absorbing at negative prices); aFRR-dn: the same
+            with the dispatched fraction, 0.25 × Σ (n<sub>neg</sub>/225) ×
+            max(0, −avg p<sub>neg</sub>). The proxy ignores award probability
+            and positive-price buy-backs — read it as relative option value,
+            not P&amp;L. Points far below the diagonal = premium paid richly
+            vs what activations returned; far above = capacity was cheap
+            insurance. The premium axis respects the capacity winsor pairs
+            above; the payoff proxy uses the <b>activation energy price</b>
+            winsor pair (raw mFRR has ±10&nbsp;000&nbsp;€/MWh outliers — one
+            ISP can add 2&nbsp;500&nbsp;€/MW·day to a day's proxy). Event
+            markers (when the window reaches them): dotted red = Baltic
+            desynchronization (8 Feb 2025); shaded = aFRR market ramp-up
+            (Feb–Apr 2025).
+          </p>
+          <div class="two-col">
+            <div id="g-res-opt-mfrr" class="chart"></div>
+            <div id="g-res-opt-afrr" class="chart"></div>
+          </div>
+        </div>
+
+        <div class="card">
           <div class="card-head">
             <h2>Baltic imbalance magnitude by reserve-price quartile</h2>
           </div>
@@ -581,6 +610,144 @@
           <div class="two-col">
             <div id="g-res-imb-mfrr" class="chart"></div>
             <div id="g-res-imb-afrr" class="chart"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =================================================================
+           DRIVERS & TIMING SECTION — what moves mFRR pricing, and when.
+           Fundamentals from the optional data-fund.js (forecast ERRORS, the
+           knowable DA→ID wind revision, EE/LT prices, LV bid bands) plus
+           within-hour / lead-lag / conditional-probability structure that
+           needs no extra data. Pure math in graphs-fund-engine.js
+           (FundEngine, mirrored in tests.py); drawn by graphs-app.js.
+           ================================================================= -->
+      <section id="panel-fund" class="panel">
+        <div class="controls-card">
+          <div class="param-group setup">
+            <div class="group-head">
+              <h3>Setup</h3>
+              <p class="group-desc">
+                Balancing prices are driven by <b>surprises and timing</b>, not
+                by forecast levels. This tab conditions the mFRR spread on
+                forecast <em>errors</em> (actual − forecast) and forecast
+                <em>revisions</em> (knowable before the gate), exposes the
+                within-hour and hour-of-day structure, measures which signals
+                lead which, and turns it all into conditional spike
+                probabilities. Charts that need fundamentals require
+                <code>data-fund.js</code> (preprocess-fundamentals.py); the
+                timing charts work from the core dataset alone.
+              </p>
+            </div>
+            <div class="controls-grid" id="g-fund-setup-params"></div>
+          </div>
+          <div class="actions">
+            <button id="g-fund-recompute" class="btn primary">↻ Recompute</button>
+            <span id="g-fund-progress" class="progress"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Spread by forecast ERROR — the surprise, not the level</h2></div>
+          <p class="card-desc">
+            mFRR spread (P<sub>mFRR</sub> − P<sub>DA</sub>, winsorized)
+            box-plotted by quantile bins of three <b>surprise</b> variables:
+            Baltic wind error (actual − DA forecast; negative = wind
+            under-delivered), Baltic load error (actual − DA forecast;
+            positive = more demand than planned), and the <b>pre-gate
+            knowable</b> LV+LT wind forecast revision (intraday − day-ahead;
+            Estonia publishes no intraday wind forecast, so the revision is
+            defined on the LV+LT footprint). If the error charts slope and
+            the level charts on the mFRR tab don't, the market prices
+            surprises — and the revision chart tells you how much of that is
+            knowable in time to bid on it.
+          </p>
+          <div class="two-col">
+            <div id="g-fund-err-wind" class="chart"></div>
+            <div id="g-fund-err-load" class="chart"></div>
+          </div>
+          <div id="g-fund-err-rev" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Hour-of-day &amp; slot-in-hour structure</h2></div>
+          <p class="card-desc">
+            Left: median mFRR spread by UTC hour with the interquartile band —
+            the daily rhythm (morning/evening ramps). Right: the
+            <b>within-hour sawtooth</b> — day-ahead trades hourly blocks while
+            physics ramps continuously, so the :00/:15/:30/:45 ISPs of the
+            hour carry systematically different imbalance and spread. Bars =
+            median spread per slot; line = mean |Baltic imbalance| per slot.
+            A visible slot pattern is deterministic, knowable structure.
+          </p>
+          <div class="two-col">
+            <div id="g-fund-hour" class="chart"></div>
+            <div id="g-fund-slot" class="chart"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Monthly spike monitor — is the market stationary?</h2></div>
+          <p class="card-desc">
+            Per calendar month: the share of ISPs where the RAW mFRR price
+            (no winsorisation) exceeds the up-spike threshold, the share below
+            the down-spike threshold, and the mean size of the up-exceedance
+            (line, right axis). The dataset spans the Baltic
+            desynchronization (markers) — if spike frequency drifts month to
+            month, pooled statistics and backtest optima are blending
+            different regimes.
+          </p>
+          <div id="g-fund-monthly" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Lead–lag — which signals move first?</h2></div>
+          <p class="card-desc">
+            Cross-correlation of three candidate leaders against the
+            (winsorized) mFRR spread at ISP lags −8…+8. <b>A peak at a
+            positive lag means that series LEADS the mFRR spread</b> by that
+            many ISPs. The backtesters may only bid on prices settled ≥ 3
+            ISPs before delivery — bars at lag ≥ 3 are exploitable signal;
+            a peak at lag 0 that dies by lag 3 is contemporaneous
+            correlation you can see but not trade.
+          </p>
+          <div id="g-fund-leadlag" class="chart"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Conditional spike probability</h2></div>
+          <p class="card-desc">
+            P(RAW mFRR price beyond the threshold) conditioned on the Baltic
+            imbalance regime (±30 MW dead band), the Baltic wind-error
+            tercile, and the UTC hour block — the bidding aid: "given what
+            kind of period this is, how often does the market spike?" A
+            positive threshold counts up-spikes (≥ X); a negative threshold
+            counts down-spikes (≤ X). Cells show probability and sample
+            count; deeper red = more frequent. NB: the imbalance regime and
+            the error are contemporaneous — this table explains; the
+            revision chart above is the knowable counterpart.
+          </p>
+          <div class="optim-runs-wrap">
+            <table class="decomposition" id="g-fund-exceed"></table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Merit-order scarcity &amp; cross-zone divergence</h2></div>
+          <p class="card-desc">
+            Left: the LV accepted SA-mFRR <b>bid band</b> (daily mean of
+            max-bid − min-bid, upward direction) and where the clearing price
+            sits inside it (0 = at the floor, 1 = at the ceiling; daily mean
+            over up-clearing ISPs). A narrowing band with the clearing price
+            riding its ceiling = a thinning stack — scarcity pricing before
+            it shows in averages. Right: the share of ISPs per day where the
+            LV mFRR price decouples from Estonia / Lithuania by more than the
+            threshold — cross-zone divergence marks congestion episodes where
+            LV-specific scarcity (and LV-specific opportunity) appears.
+          </p>
+          <div class="two-col">
+            <div id="g-fund-band" class="chart"></div>
+            <div id="g-fund-zone" class="chart"></div>
           </div>
         </div>
       </section>
@@ -620,13 +787,22 @@
       from preprocess-reserve.py. Drives the "mFRR vs aFRR reserves" subtab.
     -->
     <script src="data-reserve.js?v=43"></script>
-    <script src="engine.js?v=46"></script>
+    <!--
+      data-fund.js: market fundamentals aligned to data.js indices
+      (renewables/load actuals for forecast ERRORS, LV+LT wind DA→ID
+      revision, 3-h intraday VWAP snapshot, EE/LT mFRR prices, LV SA-mFRR
+      bid bands), from preprocess-fundamentals.py. Drives the "Drivers &
+      timing" subtab; the page degrades gracefully if it is missing.
+    -->
+    <script src="data-fund.js?v=1"></script>
+    <script src="engine.js?v=48"></script>
     <script src="graphs-engine.js?v=29"></script>
+    <script src="graphs-fund-engine.js?v=1"></script>
     <script src="graphs-charts.js?v=29"></script>
     <script src="afrr-engine.js?v=29"></script>
     <script src="afrr-charts.js?v=29"></script>
     <script src="afrr-spread-engine.js?v=29"></script>
     <script src="mfrr-vs-afrr-engine.js?v=29"></script>
-    <script src="graphs-app.js?v=44"></script>
+    <script src="graphs-app.js?v=46"></script>
   </body>
 </html>

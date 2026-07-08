@@ -2527,6 +2527,213 @@ def test_split_adaptive_actually_adapts():
     assert abs(base - adap) > 1000, "step>0 should change the result"
 
 
+# ============================================================================
+#  FUNDAMENTALS DATA (data-fund.js) + DRIVERS-TAB ANALYTICS
+#  Python mirror of graphs-fund-engine.js (FundEngine) — pure functions, no
+#  hidden state, exercised on hand-computed synthetic cases; plus a schema /
+#  timestamp-alignment audit of data-fund.js (same pattern as data-reserve.js).
+# ============================================================================
+FUND_JS_PATH = os.path.join(BASE, "data-fund.js")
+HAVE_FUND_JS = os.path.exists(FUND_JS_PATH)
+
+
+def _load_fund_js():
+    with open(FUND_JS_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    return json.loads(text[text.index("{") : text.rindex("}") + 1])
+
+
+def fund_percentile(sorted_vals, p):
+    N = len(sorted_vals)
+    if N == 0:
+        return float("nan")
+    idx = (p / 100) * (N - 1)
+    lo, hi = math.floor(idx), math.ceil(idx)
+    if lo == hi:
+        return sorted_vals[lo]
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+
+def fund_pearson(a, b):
+    n = sa = sb = saa = sbb = sab = 0.0
+    for x, y in zip(a, b):
+        if x is None or y is None or not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        n += 1; sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y
+    if n < 3:
+        return float("nan")
+    cov = sab - sa * sb / n
+    va, vb = saa - sa * sa / n, sbb - sb * sb / n
+    return float("nan") if va <= 0 or vb <= 0 else cov / math.sqrt(va * vb)
+
+
+def fund_group_stats(idxs, val_fn, key_fn, n_groups):
+    buf = [[] for _ in range(n_groups)]
+    for i in idxs:
+        g = key_fn(i)
+        if g < 0 or g >= n_groups:
+            continue
+        v = val_fn(i)
+        if v is None or not math.isfinite(v):
+            continue
+        buf[g].append(v)
+    out = []
+    for vals in buf:
+        if not vals:
+            out.append(None)
+            continue
+        vals.sort()
+        out.append(dict(n=len(vals), mean=sum(vals) / len(vals),
+                        q1=fund_percentile(vals, 25), median=fund_percentile(vals, 50),
+                        q3=fund_percentile(vals, 75)))
+    return out
+
+
+def fund_leadlag(n, a_fn, b_fn, max_lag, accept=None):
+    out = []
+    for lag in range(-max_lag, max_lag + 1):
+        xs, ys = [], []
+        for i in range(max(0, -lag), min(n, n - lag)):
+            if accept is not None and (not accept(i) or not accept(i + lag)):
+                continue
+            x, y = a_fn(i), b_fn(i + lag)
+            if x is None or y is None or not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            xs.append(x); ys.append(y)
+        out.append(dict(lag=lag, r=fund_pearson(xs, ys), n=len(xs)))
+    return out
+
+
+def fund_condprob(idxs, event_fn, row_fn, n_rows, col_fn, n_cols):
+    cnt = [[0] * n_cols for _ in range(n_rows)]
+    hit = [[0] * n_cols for _ in range(n_rows)]
+    for i in idxs:
+        r, c = row_fn(i), col_fn(i)
+        if r < 0 or r >= n_rows or c < 0 or c >= n_cols:
+            continue
+        cnt[r][c] += 1
+        if event_fn(i):
+            hit[r][c] += 1
+    p = [[(hit[r][c] / cnt[r][c]) if cnt[r][c] > 0 else float("nan") for c in range(n_cols)]
+         for r in range(n_rows)]
+    return dict(cnt=cnt, hit=hit, p=p)
+
+
+def fund_dailyagg(idxs, daykey_fn, spec):
+    acc = {}
+    for i in idxs:
+        k = daykey_fn(i)
+        o = acc.setdefault(k, {nm: [0.0, 0] for nm in spec} | {"_isps": 0})
+        o["_isps"] += 1
+        for nm, (fn, agg) in spec.items():
+            v = fn(i)
+            if agg == "share":
+                if v:
+                    o[nm][0] += 1
+                o[nm][1] += 1
+            elif v is not None and math.isfinite(v):
+                o[nm][0] += v
+                o[nm][1] += 1
+    keys = sorted(acc)
+    series = {}
+    for nm, (_fn, agg) in spec.items():
+        series[nm] = [acc[k][nm][0] if agg == "sum"
+                      else (acc[k][nm][0] / acc[k][nm][1] if acc[k][nm][1] > 0 else float("nan"))
+                      for k in keys]
+    return dict(dayKeys=keys, isps=[acc[k]["_isps"] for k in keys], series=series)
+
+
+def test_fund_data_schema_alignment():
+    """data-fund.js: n matches data.js, every array is full-length, and sampled
+    ISPs match the CSV at the same timestamp (wind_act = EE+LV+LT actual sum;
+    p_mfrr_ee = upward SA price; vwap_3h = averagePriceLast3H)."""
+    fd = _load_fund_js()
+    assert fd["n"] == DATA["n"], f"fund n {fd['n']} != data.js n {DATA['n']}"
+    keys = ["wind_act", "solar_act", "load_act", "load_fc", "wind_da_lvlt", "wind_id_lvlt",
+            "vwap_3h", "p_mfrr_ee", "p_mfrr_lt",
+            "mfrr_maxbid_up", "mfrr_minbid_up", "mfrr_maxbid_dn", "mfrr_minbid_dn"]
+    for k in keys:
+        assert k in fd and len(fd[k]) == DATA["n"], f"{k} missing or wrong length"
+    cols = ["ee_wind_onshore_actual_mw", "lv_wind_onshore_actual_mw", "lt_wind_onshore_actual_mw",
+            "mfrr_sa_upward_ee", "averagePriceLast3H"]
+    fcsv = pd.read_csv(CSV_PATH, usecols=["datetime_utc", *cols])
+    fcsv["datetime_utc"] = pd.to_datetime(fcsv["datetime_utc"])
+    fcsv = fcsv.set_index("datetime_utc")
+    fcsv = fcsv[~fcsv.index.duplicated(keep="first")]
+    rng = np.random.default_rng(11)
+    for i in rng.choice(DATA["n"], size=30, replace=False):
+        ts = DATA_TS[int(i)]
+        if ts not in fcsv.index:
+            continue
+        row = fcsv.loc[ts]
+        want_wind = row["ee_wind_onshore_actual_mw"] + row["lv_wind_onshore_actual_mw"] + row["lt_wind_onshore_actual_mw"]
+        got = fd["wind_act"][int(i)]
+        if pd.isna(want_wind):
+            assert got is None, f"ISP {i}: wind_act should be null (partial CSV sum)"
+        else:
+            assert got is not None and abs(got - float(want_wind)) < 0.02, (
+                f"ISP {i} @ {ts}: wind_act {got} != CSV {want_wind}")
+        for key, col in (("p_mfrr_ee", "mfrr_sa_upward_ee"), ("vwap_3h", "averagePriceLast3H")):
+            want = row[col]
+            got2 = fd[key][int(i)]
+            if pd.isna(want):
+                assert got2 is None
+            else:
+                assert got2 is not None and abs(got2 - float(want)) < 0.02, (
+                    f"ISP {i} @ {ts}: {key} {got2} != CSV {want}")
+
+
+def test_fund_leadlag_synthetic():
+    """b[i] = a[i−2] ⇒ corr(a[i], b[i+lag]) peaks (=1) at lag +2 — i.e. a
+    LEADS b by 2 ISPs under the documented sign convention."""
+    rng = np.random.default_rng(3)
+    n = 500
+    a = rng.normal(0, 1, n)
+    b = np.empty(n)
+    b[:2] = rng.normal(0, 1, 2)
+    b[2:] = a[:-2]
+    res = fund_leadlag(n, lambda i: float(a[i]), lambda i: float(b[i]), 4)
+    by = {d["lag"]: d for d in res}
+    assert abs(by[2]["r"] - 1.0) < 1e-9, f"expected r=1 at lag +2, got {by[2]['r']}"
+    assert by[2]["n"] == n - 2
+    for lag in (-2, -1, 0, 1, 3, 4):
+        assert abs(by[lag]["r"]) < 0.2, f"lag {lag} should be ~0, got {by[lag]['r']}"
+
+
+def test_fund_condprob_hand():
+    """2×2 grid, hand-counted: cell (0,0) has 3 ISPs / 2 events → p = 2/3;
+    out-of-grid coordinates are skipped; empty cells are NaN."""
+    rows = [0, 0, 0, 1, 1, -1]
+    cols = [0, 0, 0, 0, 1, 0]
+    events = [True, True, False, False, True, True]
+    r = fund_condprob(range(6), lambda i: events[i], lambda i: rows[i], 2, lambda i: cols[i], 2)
+    assert r["cnt"][0][0] == 3 and r["hit"][0][0] == 2 and abs(r["p"][0][0] - 2 / 3) < 1e-12
+    assert r["cnt"][1][0] == 1 and r["hit"][1][0] == 0 and r["p"][1][0] == 0.0
+    assert r["cnt"][1][1] == 1 and abs(r["p"][1][1] - 1.0) < 1e-12
+    assert r["cnt"][0][1] == 0 and math.isnan(r["p"][0][1])
+
+
+def test_fund_groupstats_and_dailyagg_hand():
+    """groupStats: hand quartiles on [1..5] (q1=2, med=3, q3=4), NaN skipped,
+    empty group → None. dailyAgg: mean / sum / share on a 2-day toy series."""
+    vals = [1, 2, 3, 4, 5, float("nan"), 10]
+    keys = [0, 0, 0, 0, 0, 0, 2]
+    g = fund_group_stats(range(7), lambda i: vals[i], lambda i: keys[i], 3)
+    assert g[0]["n"] == 5 and g[0]["median"] == 3 and g[0]["q1"] == 2 and g[0]["q3"] == 4
+    assert g[1] is None and g[2]["n"] == 1 and g[2]["mean"] == 10
+    day = [0, 0, 1, 1]
+    price = [10.0, 20.0, 30.0, float("nan")]
+    spike = [True, False, True, True]
+    r = fund_dailyagg(range(4), lambda i: day[i],
+                      {"p": (lambda i: price[i], "mean"),
+                       "s": (lambda i: price[i], "sum"),
+                       "sh": (lambda i: spike[i], "share")})
+    assert r["dayKeys"] == [0, 1] and r["isps"] == [2, 2]
+    assert r["series"]["p"] == [15.0, 30.0]
+    assert r["series"]["s"] == [30.0, 30.0]
+    assert r["series"]["sh"] == [0.5, 1.0]
+
+
 def test_sens_oat_inert_vs_live_param_windpark():
     """Sensitivity math anchored to the WIND-PARK engine (the shared
     optim-sens.js is mirrored in tests_bess — imported here): with the
@@ -2630,6 +2837,11 @@ if HAVE_RESERVE_JS:
     R.add("Reserve OFF ≡ frozen L3 default (LOAD-BEARING)", test_reserve_off_equals_l3_default)
     R.add("Reserve re-routes but total down offer == da_sold", test_reserve_total_down_offer_unchanged)
     R.add("data-reserve.js aligns with data.js (timestamp spot-check)", test_reserve_data_js_alignment)
+if HAVE_FUND_JS:
+    R.add("data-fund.js schema + timestamp alignment (wind_act/p_mfrr_ee/vwap_3h)", test_fund_data_schema_alignment)
+R.add("FundEngine lead-lag: shifted series peaks at the documented lag", test_fund_leadlag_synthetic)
+R.add("FundEngine condProb: hand-counted 2×2 grid incl. NaN cells", test_fund_condprob_hand)
+R.add("FundEngine groupStats quartiles + dailyAgg mean/sum/share (hand)", test_fund_groupstats_and_dailyagg_hand)
 R.add("Adaptive split block logic (synthetic step toward winner)", test_split_block_logic_synthetic)
 R.add("Split wait/cadence decoupled from lookback (wait=win≡old; wait=1 per-ISP)", test_split_wait_decouples_cadence_from_lookback)
 if os.path.exists(DATA_AFRR_15MIN_PATH):
