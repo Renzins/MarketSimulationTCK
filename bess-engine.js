@@ -46,16 +46,22 @@
 //   ISP's balancing prices must not change what was placed, only what clears.
 //
 // SIGN CONVENTIONS  (energy MWh = MW × 0.25 h; price €/MWh; + = money in)
-//   DA discharge    +E · p_da                           (sell stored energy to DA)
+//   DA discharge    +E_committed · p_da                  (DA settles FINANCIALLY: the D−1
+//                   sale is paid in full whether or not the battery can deliver)
 //   mFRR-up         +E · p_mfrr      (p_mfrr ≥ +1)       (discharge into balancing)
 //   aFRR-up         +E · avg_p_pos   (avg_p_pos > 0)     (partial dispatch n_pos_fav/225)
 //   mFRR-dn charge  −E · p_mfrr      (p_mfrr ≤ −1)       (charge; p<0 ⇒ PAID to absorb ⇒ +)
 //   aFRR-dn charge  −E · avg_p_neg   (avg_p_neg < 0)     (partial dispatch n_neg_fav/225)
 //   intraday charge −E · vwap                            (charge cost; vwap<0 ⇒ income)
-//   DA buy-low      −E · p_da                            (day-ahead committed trough buy)
+//   DA buy-low      −E_committed · p_da                  (financial, mirror of the sale:
+//                   the D−1 buy is paid in full whether or not it can be absorbed)
 //   opportunistic   close a diverted DA leg on intraday: −E · vwap (DA revenue kept;
 //                   a divert MISS keeps the energy stored — net (p_da − vwap)·E)
-//   DA shortfall    −E_short · (p_imb + θ)               (unmet DA settles at imbalance)
+//   DA mismatch     the physical gap vs the DA commitment settles at imbalance:
+//                   short (undelivered sell)  −E_short · (p_imb + θ)
+//                   surplus (unabsorbed buy)  +E_surp · p_imb − E_surp · θ
+//                   NaN p_imb ⇒ settlement (incl. θ) skipped for that ISP — same
+//                   convention as the wind-park engine's NaN-imbalance handling.
 //
 // EFFICIENCY  (round-trip η, default 0.90): etaLeg = √η per leg, grid-side.
 //   charge   : grid g MWh in  → SoC += g·etaLeg
@@ -327,9 +333,10 @@ const BessEngine = (() => {
     let cb = 0;
     // Dwell COOLDOWN state: actMode = direction of the most recent action
     // (+1 discharge / −1 charge / 0 none yet); lastActISP = the ISP it happened.
-    // A discretionary flip to the opposite direction needs `dwell` idle ISPs
-    // since the last action — i.e. a genuine rest/break between opposite phases
-    // (measured from the END of a block, not its start).
+    // A discretionary flip to the opposite direction is allowed once
+    // i − lastActISP ≥ dwell, i.e. dwell−1 fully idle ISPs sit between the
+    // last action and the flip (dwell 4 ⇒ opposite actions at least an hour
+    // apart, start to start; measured from the END of a block, not its start).
     let actMode = 0;
     let lastActISP = -1 << 20;
 
@@ -390,10 +397,12 @@ const BessEngine = (() => {
         const commitMW = Math.min(p.da_mw, eMaxMW);
         const maxDelivMW = Math.floor(Math.min(budgetMW, (soc * etaLeg) / e4));
         const delivMW = Math.min(commitMW, maxDelivMW);
+        // DA settles financially: the committed sale is paid in full at P_da;
+        // the undelivered remainder is bought back at the imbalance price.
+        cDA += commitMW * e4 * P_da;
         if (delivMW > 0) {
           soc -= (delivMW * e4) / etaLeg;
           budgetMW -= delivMW;
-          cDA += delivMW * e4 * P_da;
           daSellMW = delivMW;
         }
         const shortMW = commitMW - delivMW;
@@ -408,13 +417,22 @@ const BessEngine = (() => {
         const commitMW = Math.min(p.da_mw, eMaxMW);
         const maxChgMW = Math.floor(Math.min(budgetMW, (cap - soc) / (e4 * etaLeg)));
         const chgMW = Math.min(commitMW, maxChgMW);
+        // Financial mirror of the sale: the committed buy is paid in full;
+        // energy the battery cannot absorb is sold back at the imbalance
+        // price (long imbalance), with the same flat penalty on the gap.
+        cChg -= commitMW * e4 * P_da;
         if (chgMW > 0) {
           const stored = chgMW * e4 * etaLeg;
           cb = (cb * soc + P_da * chgMW * e4) / (soc + stored);
           soc += stored;
           budgetMW -= chgMW;
-          cChg -= chgMW * e4 * P_da;
           chgOtherMW += chgMW;
+        }
+        const surplusMW = commitMW - chgMW;
+        if (surplusMW > 0 && !isNaN(P_imb)) {
+          shortE = surplusMW * e4;
+          cImb -= shortE * P_imb;
+          cFlat += shortE * theta;
         }
       }
 
@@ -434,9 +452,10 @@ const BessEngine = (() => {
       // physically possible and simply rest if the market never reaches them.
       const canDis = soc > loRed + EPS && budgetMW >= 1;
       const canChg = soc < hiRed - EPS && budgetMW >= 1;
-      // Cooldown: a flip to the opposite of the LAST action's direction needs
-      // `dwell` idle ISPs since that action. Same direction (or none yet) is
-      // always allowed; the rest is measured from the last action (block END).
+      // Cooldown: a flip to the opposite of the LAST action's direction is
+      // allowed once ≥ `dwell` ISPs have passed since that action (dwell−1
+      // fully idle ISPs in between). Same direction (or none yet) is always
+      // allowed; the rest is measured from the last action (block END).
       const inCooldown = i - lastActISP < dwell;
       const restOK = (want) => actMode === 0 || actMode === want || !inCooldown;
 
@@ -616,6 +635,12 @@ const BessEngine = (() => {
         }
       }
 
+      // Must-fulfil audit: offer sizing is supposed to keep SoC inside
+      // [0, cap]; an excursion means a cleared obligation could not be
+      // honoured physically. Counted per ISP — this is the number the UI's
+      // "unfulfilled" tile reports, so a future sizing regression shows up
+      // on the page, not just in the Python test suite.
+      if (soc < -1e-6 || soc > cap + 1e-6) nUnfulfilled++;
       if (soc < 0) soc = 0;
       else if (soc > cap) soc = cap;
 

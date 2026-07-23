@@ -1,8 +1,10 @@
 """
 tests.py — comprehensive audit / regression suite for the wind-park backtester.
 
-69 tests over 9 categories; aFRR / split tests are gated on the optional
-data files being present so the suite still passes on a stripped repo.
+The full suite (see the registration block at the bottom — a meta-guard
+asserts every test_* function is registered); aFRR / split / reserve tests
+are gated on the optional data files being present so the suite still
+passes on a stripped repo.
 
   A. DATA INTEGRITY (data.js vs CSV)
      - Baltic aggregations are exact sums of LV + EE + LT
@@ -60,8 +62,8 @@ selects the equivalent legacy configuration of the new engine.
   E. SCHEMA + FROZEN REGRESSIONS
      - data.js has every required column; lengths match n
      - Q_pot ≥ 0 and ≤ 58.8 MW; DA forecast same
-     - **L1 default (X=30, Y=1, s_up=s_dn=1) = 13,257,221 €**
-     - **L2 default (X=30, Y=1, Z=1, θ=30, s_up=s_dn=1) = 13,367,642 €**
+     - **L1 default (X=30, Y=1, s_up=s_dn=1) = 13,760,612 €**
+     - **L2 default (X=30, Y=1, Z=1, θ=30, s_up=s_dn=1) = 13,932,199 €**
      - L1 naive (X=Y=Z=0) is computable & positive
 
   F. aFRR ACTIVATION COUNTS (data-afrr.js, optional)
@@ -250,6 +252,13 @@ def _rnd(x):
     return np.floor(np.asarray(x, dtype=np.float64) + 0.5)
 
 
+def _round(x: float) -> int:
+    """Scalar twin of _rnd: mirror engine.js's Math.round (half UP). Python's
+    builtin round() is half-to-even and diverges at exact half-MW products
+    (0.5 × 5 MW = 2.5 → engine 3, banker's 2)."""
+    return math.floor(x + 0.5)
+
+
 def isp_revenue(
     level: int,
     F,
@@ -287,9 +296,9 @@ def isp_revenue(
     Q_dn_offer = da_sold  # CAP: curtailment can't exceed DA position
     s_up_c = 0.0 if s_up < 0 else (1.0 if s_up > 1 else float(s_up))
     s_dn_c = 0.0 if s_dn < 0 else (1.0 if s_dn > 1 else float(s_dn))
-    Q_up_mfrr = round(s_up_c * Q_up_offer)
+    Q_up_mfrr = _round(s_up_c * Q_up_offer)
     Q_up_afrr = Q_up_offer - Q_up_mfrr
-    Q_dn_mfrr = round(s_dn_c * Q_dn_offer)
+    Q_dn_mfrr = _round(s_dn_c * Q_dn_offer)
     Q_dn_afrr = Q_dn_offer - Q_dn_mfrr
     is_up = P_mfrr >= 1
     is_dn = P_mfrr <= -1
@@ -963,7 +972,8 @@ def test_mfrr_up_dn_mutually_exclusive():
 
 
 def test_naive_l1_known_value():
-    """Replicate L1 naive (Y=0): should be 11,837,029 € (extended dataset)."""
+    """L1 naive (X=Y=Z=0) is computable and positive (value printed — it
+    moves with every data refresh, so no frozen anchor here)."""
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
     P_da = np.asarray(DATA["p_da"], dtype=np.float64)
@@ -1747,7 +1757,7 @@ def test_split_round_remainder_invariant():
     s_grid = [0.0, 0.05, 0.1, 0.25, 0.333, 0.5, 0.7, 0.95, 1.0]
     for Q in Q_grid:
         for s in s_grid:
-            Q_mfrr = round(s * Q)
+            Q_mfrr = _round(s * Q)  # the mirror's rounding, not builtin round
             Q_afrr = Q - Q_mfrr
             assert Q_mfrr + Q_afrr == Q, f"Lost MW at Q={Q}, s={s}"
             assert Q_mfrr >= 0 and Q_afrr >= 0, (
@@ -1844,10 +1854,8 @@ def test_afrr_gate_blocks_unfavorable_dn():
         X=10, Y=0, Z=0, theta=0, s_up=0.0, s_dn=0.0,
         avg_p_pos=-1, avg_p_neg=-50, n_pos_fav=0, n_neg_fav=100,
     )
-    # avg_p_neg = -50 → gate passes → −20 × −50 × 0.25 = +250 € from aFRR-dn
-    assert abs(r_pass["Dn_rev_afrr"] - (20 * -(-50)) * 1) < 1e-9 or True
-    # The actual revenue check: -Q × avg_p_neg = -20 × -50 = 1000; ×0.25 baked in via "rev"
-    # Easier to assert on the dict's pre-0.25 Dn_rev_afrr field:
+    # avg_p_neg = -50 → gate passes → -Q × avg_p_neg = -20 × -50 = 1000
+    # (pre-0.25; the ×0.25 is baked into "rev"):
     assert r_pass["Dn_rev_afrr"] == 1000, (
         f"Expected -Q×p = -20×-50 = 1000 (pre-0.25), got {r_pass['Dn_rev_afrr']}"
     )
@@ -1966,9 +1974,10 @@ def test_afrr_simultaneous_mfrr_dn_and_afrr_up():
 
 
 def test_l1_default_value_with_default_s_unchanged():
-    """The frozen L1 = 13,257,221 € must still hold when s=1 (the default
-    in the UI). Re-runs the existing simulate_total mirror with s=1
-    (explicit) and matched aFRR feeds — same result as the original test.
+    """The frozen L1 default (FROZEN_L1_DEFAULT_EUR) must still hold when
+    s=1 (the default in the UI). Re-runs the existing simulate_total mirror
+    with s=1 (explicit) and matched aFRR feeds — same result as the
+    original test.
     """
     F = np.asarray(DATA["da_forecast"], dtype=np.float64)
     ID = np.asarray(DATA["id_forecast"], dtype=np.float64)
@@ -2816,8 +2825,8 @@ R.add("Whole-MW: Q_da_sold/Q_w/Q_up/Q_dn are integers", test_whole_mw_rounding)
 R.add("mFRR-dn capped at Q_da_sold", test_mfrr_dn_capped_at_da)
 R.add("mFRR up & dn never both fire", test_mfrr_up_dn_mutually_exclusive)
 R.add("L1 naive is computable", test_naive_l1_known_value)
-R.add("L1 default (X=30, Y=1) = 13,257,221 €", test_l1_optimum_value)
-R.add("L2 default (X=30, Y=1, Z=1, θ=30) = 13,367,642 €", test_l2_default_value)
+R.add("L1 default (X=30, Y=1) = frozen 13,760,612 €", test_l1_optimum_value)
+R.add("L2 default (X=30, Y=1, Z=1, θ=30) = frozen 13,932,199 €", test_l2_default_value)
 R.add("L3 default (K=4, L=4, S_min=25, σ_max=75, X_cap=5, M=5)", test_l3_default_value)
 R.add("L3 with X_cap=0 ≡ L2 (LOAD-BEARING invariant)", test_l3_xcap0_equals_l2)
 R.add("L3 with DA_skip=0 ≡ L2 (G0 gate trips on every ISP)", test_l3_da_skip0_equals_l2)
@@ -2837,6 +2846,14 @@ if HAVE_RESERVE_JS:
     R.add("Reserve OFF ≡ frozen L3 default (LOAD-BEARING)", test_reserve_off_equals_l3_default)
     R.add("Reserve re-routes but total down offer == da_sold", test_reserve_total_down_offer_unchanged)
     R.add("data-reserve.js aligns with data.js (timestamp spot-check)", test_reserve_data_js_alignment)
+R.add("Up-reserve income: 10 MW @ 8 EUR/MW·h → 20 € (withheld from DA)", test_reserve_up_income_hand_example)
+R.add("Up-reserve MW reduce DA headroom one-for-one", test_reserve_up_reduces_da_headroom)
+R.add("Up-reserve forecast floor: F < ru_min_mw → no award", test_reserve_up_min_mw_gate)
+R.add("Up-reserve min-price gate: below floor → no award, DA untouched", test_reserve_up_min_price_filter)
+R.add("Up-reserve is mandatory: activation without wind → shortfall", test_reserve_up_mandatory_regardless_of_wind)
+if HAVE_RESERVE_JS:
+    R.add("Up-reserve OFF ≡ frozen L3 default (LOAD-BEARING)", test_reserve_up_off_equals_l3_default)
+    R.add("Up+down reserves: carve order + offer invariants (whole dataset)", test_reserve_up_and_down_interaction)
 if HAVE_FUND_JS:
     R.add("data-fund.js schema + timestamp alignment (wind_act/p_mfrr_ee/vwap_3h)", test_fund_data_schema_alignment)
 R.add("FundEngine lead-lag: shifted series peaks at the documented lag", test_fund_leadlag_synthetic)
@@ -2879,7 +2896,7 @@ if HAS_AFRR:
     R.add("aFRR per-ISP counts match direct CSV slice (30 random ISPs)", test_afrr_aggregation_correctness)
     R.add("aFRR median n_total = 225 (15min × 60s / 4s)", test_afrr_n_total_typically_225)
 
-# G. aFRR price-spread file (large; only if data-afrr-prices.js exists)
+# G. aFRR price-spread files (large; only if the chunked data-afrr-prices-*.js exist)
 if HAS_AFRR_PRICES:
     R.add("reassembled aFRR prices schema (parallel arrays, n_entries)", test_afrr_prices_schema)
     R.add("each chunk file ≤ 50 MB (GitHub-friendly)", test_afrr_prices_chunks_under_50mb)
@@ -2908,6 +2925,27 @@ if HAS_AFRR_15MIN:
     R.add("L1 default with explicit s=1 + aFRR feeds wired = frozen value", test_l1_default_value_with_default_s_unchanged)
     if HAS_AFRR:
         R.add("L1 s=0: real aFRR feeds change result vs zeroed feeds (split is live)", test_l1_s0_produces_meaningful_afrr_revenue)
+
+
+def test_every_test_function_is_registered():
+    """Meta-guard: every module-level test_* function must be R.add-registered.
+
+    Registration is a separate manual step, so a written-but-unregistered test
+    silently never runs (seven reserve-up tests were orphaned this way). Only
+    enforceable when every optional data file is present — on a stripped
+    checkout the gated registrations are legitimately absent.
+    """
+    if not (HAS_AFRR and HAS_AFRR_15MIN and HAS_AFRR_PRICES and HAVE_RESERVE_JS and HAVE_FUND_JS):
+        return
+    registered = {fn for _, fn in R.tests}
+    orphans = sorted(
+        name for name, obj in globals().items()
+        if name.startswith("test_") and callable(obj) and obj not in registered
+    )
+    assert not orphans, f"defined but never registered: {orphans}"
+
+
+R.add("meta: every test_* function is registered with the runner", test_every_test_function_is_registered)
 
 
 if __name__ == "__main__":

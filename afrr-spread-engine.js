@@ -1,8 +1,9 @@
 // afrr-spread-engine.js — pure data layer for the aFRR PRICE / SPREAD charts.
 //
 // Distinct from afrr-engine.js (which only deals with activation COUNTS) —
-// this module operates on the per-4-second spread file (data-afrr-prices.js,
-// ~86 MB, lazy-loaded). The mFRR-spread chart drawers (drawSpreadByBucket /
+// this module operates on the per-4-second spread data (data-afrr-prices-001
+// … -003.js + meta, ~90 MB total, lazy-loaded on aFRR-tab activation). The
+// mFRR-spread chart drawers (drawSpreadByBucket /
 // drawWindSolarHeatmap / drawAbsSpreadMatchedPanels in graphs-charts.js) are
 // reused as-is — this module just produces the same `result` shape they
 // already accept.
@@ -37,10 +38,11 @@
 // EXPORTS
 //   isLoaded()                                 — true if AFRR_PRICES global exists
 //   init()                                     — wrap the global into typed arrays
-//   maybeWinsorize(pLo, pHi)                   — winsorize spreads within window
+//   maybeWinsorize(pLo, pHi, dir)              — winsorize spreads within window
+//   maybeWinsorizeAll(pLo, pHi)                — 'all'-direction winsor buffer (matched charts)
+//   setBalticThresholds(deficit, surplus)      — regime thresholds (read at chart-compute time)
 //   setDayTypeFilter(filter)                   — "all" | "workday" | "weekend-holiday"
-//   spreadByAxisRegime(axis, regime, n)        — 1-D bucketed box stats (mirrors GraphsEngine)
-//   spreadByWindSolarRegime(regime, w, s)      — 2-D heatmap stats
+//   spreadByAxisAllRegimes(w, s, dir)          — FUSED 6-chart pass (1-D boxes + 2-D heatmaps)
 //   absSpreadMatchedByDA(daBins, levels, fn)   — 5-panel grouped boxes (any level fn)
 //   absSpreadByWindMatchedByDABand(da, n)      — wrapper: level = baltic_wind_da
 //   absSpreadBySolarMatchedByDABand(da, n)     — wrapper: level = baltic_solar_da
@@ -110,7 +112,11 @@ const AfrrSpreadEngine = (() => {
   function setBalticThresholds(d, s) {
     _balticDeficit = d;
     _balticSurplus = s;
-    cachedKey = null; // because regimes change which entries enter winsor
+    // No cache invalidation: regime thresholds classify entries at
+    // chart-compute time and never enter the winsor path — its cache key
+    // (window × percentiles × direction × day-type) is content-addressed,
+    // so nulling it here only forced a pointless re-sort of up to 8.5 M
+    // entries on every update.
   }
 
   // ---------- day-type filter --------------------------------------------
@@ -191,26 +197,6 @@ const AfrrSpreadEngine = (() => {
     if (key === cachedKeyAll) return;
     _winsorizeRange(0, P.n, win, pLow, pHigh, spread_w_all);
     cachedKeyAll = key;
-  }
-
-  // --------- core: collect spreads matching a regime + filter -------------
-  // For each price entry k, look up its ISP's baltic_imb_vol; include if it
-  // matches the requested regime. Returns an array of spread values.
-  function _spreadsInRegime(regime) {
-    const win = Engine.getWindow();
-    const out = [];
-    if (!P) return out;
-    const imb = D.baltic_imb_vol;
-    for (let k = 0; k < P.n; k++) {
-      const i = P.isp_idx[k];
-      if (i < win.start || i >= win.end) continue;
-      const iv = imb[i];
-      if (isNaN(iv)) continue;
-      const s = spread_w[k];
-      if (regime === "surplus" && iv >= _balticSurplus) out.push(s);
-      else if (regime === "deficit" && iv <= _balticDeficit) out.push(s);
-    }
-    return out;
   }
 
   // --------- box-plot stats (re-implementation matching graphs-engine.js) -
@@ -340,8 +326,8 @@ const AfrrSpreadEngine = (() => {
   //     solar:   { surplus: <BoxBucketResult>, deficit: <BoxBucketResult> },
   //     heatmap: { surplus: <HeatmapResult>,    deficit: <HeatmapResult>    },
   //   }
-  // where shapes match what spreadByAxisRegime / spreadByWindSolarRegime used
-  // to return individually, so the chart drawers don't need to change.
+  // where the per-chart shapes match GraphsEngine's spreadByAxisRegime /
+  // spreadByWindSolarRegime results, so the shared chart drawers work as-is.
   function spreadByAxisAllRegimes(windBins, solarBins, direction = "all") {
     const win = Engine.getWindow();
     const imb = D.baltic_imb_vol;
@@ -492,89 +478,6 @@ const AfrrSpreadEngine = (() => {
     };
   }
 
-  // --------- 1-D bucketed box stats (graphs 1-4) --------------------------
-  // axis: 'wind' | 'solar'; regime: 'surplus' | 'deficit'
-  // direction: 'all' | 'pos' | 'neg'
-  // Each price entry's bin is determined by its ISP's wind/solar value.
-  // (Kept for back-compat / direct callers; the active app path now uses
-  //  spreadByAxisAllRegimes which fuses all 6 charts into one pair of passes.)
-  function spreadByAxisRegime(axis, regime, nBins, direction = "all") {
-    const win = Engine.getWindow();
-    const valArr = axis === "wind" ? D.baltic_wind_da : D.baltic_solar_da;
-    const imb = D.baltic_imb_vol;
-    // Step 1 — find quantile edges from the ISP-level distribution restricted
-    // to the regime (so bin sizes are regime-specific, matching the mFRR
-    // section's behaviour). Direction filtering doesn't affect ISP-level
-    // edges — they describe the wind/solar distribution of qualifying ISPs.
-    const ispVals = [];
-    for (let i = win.start; i < win.end; i++) {
-      if (!_acceptsDay(i)) continue;
-      const iv = imb[i];
-      if (isNaN(iv)) continue;
-      if (regime === "surplus" && iv < _balticSurplus) continue;
-      if (regime === "deficit" && iv > _balticDeficit) continue;
-      ispVals.push(valArr[i]);
-    }
-    const { edges, labels } = quantileEdges(ispVals, nBins, "MW");
-
-    // Step 2 — drop each price entry (within direction-filtered range) into
-    // its ISP's bucket.
-    const [kStart, kEnd] = _dirRange(direction);
-    const buckets = Array.from({ length: nBins }, () => []);
-    let totalN = 0;
-    for (let k = kStart; k < kEnd; k++) {
-      const i = P.isp_idx[k];
-      if (i < win.start || i >= win.end) continue;
-      if (!_acceptsDay(i)) continue;
-      const iv = imb[i];
-      if (isNaN(iv)) continue;
-      if (regime === "surplus" && iv < _balticSurplus) continue;
-      if (regime === "deficit" && iv > _balticDeficit) continue;
-      const b = binIndex(valArr[i], edges);
-      buckets[b].push(spread_w[k]);
-      totalN++;
-    }
-    return { labels, edges, boxes: buckets.map(boxStats), totalN };
-  }
-
-  // --------- 2-D heatmap stats (graphs 5-6) -------------------------------
-  // direction: 'all' | 'pos' | 'neg'
-  function spreadByWindSolarRegime(regime, windBins, solarBins, direction = "all") {
-    const win = Engine.getWindow();
-    const imb = D.baltic_imb_vol;
-    // Edges from the regime-restricted ISP-level distribution
-    const wIspVals = [];
-    const sIspVals = [];
-    for (let i = win.start; i < win.end; i++) {
-      if (!_acceptsDay(i)) continue;
-      const iv = imb[i];
-      if (isNaN(iv)) continue;
-      if (regime === "surplus" && iv < _balticSurplus) continue;
-      if (regime === "deficit" && iv > _balticDeficit) continue;
-      wIspVals.push(D.baltic_wind_da[i]);
-      sIspVals.push(D.baltic_solar_da[i]);
-    }
-    const W = quantileEdges(wIspVals, windBins, "MW");
-    const S = quantileEdges(sIspVals, solarBins, "MW");
-    const cells = Array.from({ length: solarBins }, () =>
-      Array.from({ length: windBins }, () => []),
-    );
-    const [kStart, kEnd] = _dirRange(direction);
-    for (let k = kStart; k < kEnd; k++) {
-      const i = P.isp_idx[k];
-      if (i < win.start || i >= win.end) continue;
-      if (!_acceptsDay(i)) continue;
-      const iv = imb[i];
-      if (isNaN(iv)) continue;
-      if (regime === "surplus" && iv < _balticSurplus) continue;
-      if (regime === "deficit" && iv > _balticDeficit) continue;
-      const wB = binIndex(D.baltic_wind_da[i], W.edges);
-      const sB = binIndex(D.baltic_solar_da[i], S.edges);
-      cells[sB][wB].push(spread_w[k]);
-    }
-    return { wind: W, solar: S, cells: cells.map((row) => row.map(boxStats)) };
-  }
-
   // --------- |spread| matched by DA price band (graph 7-9) ----------------
   // levelFn(i) returns the level value (wind / solar / wind+solar) for ISP i.
   // Uses spread_w_all (direction-independent winsor) so results are stable
@@ -677,8 +580,6 @@ const AfrrSpreadEngine = (() => {
     setDayTypeFilter,
     maybeWinsorize,
     maybeWinsorizeAll,
-    spreadByAxisRegime,        // legacy single-chart API (unused by app, kept for tests)
-    spreadByWindSolarRegime,   // legacy single-chart API
     spreadByAxisAllRegimes,    // FUSED — produces the 6 regime/axis charts in 2 passes
     absSpreadMatchedByDA,
     absSpreadByWindMatchedByDABand,

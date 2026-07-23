@@ -1,8 +1,8 @@
 ================================================================================
-  main_data_imputed.csv  —  COLUMN DESCRIPTIONS
+  main_data_with_imbalance.csv  —  COLUMN DESCRIPTIONS
 ================================================================================
 
-File:     main_data_imputed.csv
+File:     main_data_with_imbalance.csv
 Period:   2025-02-05 00:00 UTC  to  2026-05-02 23:45 UTC
 Interval: 15 minutes, strictly UTC, no timezone offset
 

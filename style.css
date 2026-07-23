@@ -324,8 +324,9 @@ main {
   transform: rotate(45deg);
 }
 
-/* The .strategy-toggle-box span is reserved for future label text next to
-   the box; currently only the checkbox is visible. */
+/* The .strategy-toggle-box span sits next to every strategy checkbox in
+   index.html / bess.html; it carries no visible content, so it is hidden
+   (the native checkbox alone renders). */
 .strategy-toggle-box {
   display: none;
 }
@@ -749,6 +750,20 @@ p.chart-desc {
 
 .big-stat .value.down {
   color: var(--bad);
+}
+
+/* Tinted table cells: the Forecast per-horizon argmax column (POS green /
+   NEG red, classes set by forecast-charts.js) and the BESS SoC-safety
+   table's ✓/⚠ cell (bess-app.js `value up/down`) — any .decomposition
+   table cell carrying these classes. */
+table.decomposition td.up {
+  color: var(--good);
+  font-weight: 600;
+}
+
+table.decomposition td.down {
+  color: var(--bad);
+  font-weight: 600;
 }
 
 table.decomposition {

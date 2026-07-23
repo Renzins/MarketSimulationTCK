@@ -242,13 +242,14 @@
              — uses Baltic-level imbalance only (per request).
              — every 4-second slot contributes a spread; both POS and NEG
                directions merged into one distribution per chart.
-             — data-afrr-prices.js (86 MB) is lazy-loaded on first use.
+             — data-afrr-prices-001…-003.js (~90 MB total) lazy-loaded on first use.
              ============================================================ -->
         <div class="card placeholder-card" id="g-afrr-prices-loading-card" style="display: none">
           <h2>Loading aFRR price data…</h2>
           <p class="card-desc">
-            The aFRR price file is large (~86 MB raw, ~25-35 MB gzipped).
-            It loads on demand the first time you scroll to these charts;
+            The aFRR price data is large (3 chunk files, ~90 MB raw,
+            ~25-35 MB gzipped). It loads on demand when this tab (or the
+            mFRR-vs-aFRR compare tab) is first opened, or on Recompute;
             once cached the page loads instantly.
           </p>
           <p class="card-desc" id="g-afrr-prices-loading-status">Fetching…</p>
@@ -397,8 +398,11 @@
           <p class="card-desc">
             Headline numbers: how often each market fires, how often they
             fire in agreement, and the Pearson correlation between the two
-            spreads (where both are defined — i.e. mFRR cleared AND
-            aFRR-up had favourable activity in the same ISP).
+            spreads. In the 4-s slot view (the default once the price data
+            loads) the correlation runs over every POS+NEG slot entry; in
+            the ISP-level fallback it uses ISPs where mFRR cleared AND
+            aFRR-up had favourable activity. Each tile's own help line
+            states its exact denominator.
           </p>
           <div id="g-cmp-stats" class="cmp-stats-grid"></div>
         </div>
@@ -428,10 +432,13 @@
             defined, we record the sign of <em>mFRR spread</em>
             (= p_mfrr − p_da, broadcast from the encompassing ISP) and
             the sign of <em>aFRR spread</em> (= AST_POS − p_da on the
-            left chart, AST_NEG − p_da on the right). Four
-            mutually-exclusive buckets: both positive (both markets
+            left chart, AST_NEG − p_da on the right). Six
+            mutually-exclusive segments: both positive (both markets
             above DA → upward signal), both negative (below DA →
-            downward signal), or mixed.
+            downward signal), the two mixed-sign disagreements, "both
+            near DA" (both prices within ±10% of DA — signs not
+            meaningful), and "aFRR N/A" (that direction never activated
+            in the slot).
             <strong>Note on data:</strong> these slot-level charts use
             the <em>raw</em> per-4-s AST_POS / AST_NEG clearings — the
             favourable-only filter (which drops unfavourable slots) is
@@ -480,11 +487,13 @@
             <h2>Spread correlation scatter</h2>
           </div>
           <p class="card-desc">
-            Each point is one ISP plotted at (mFRR spread, aFRR spread).
-            A clean diagonal cloud means the two markets move together;
-            a flat or anti-diagonal cloud means they're uncorrelated or
-            inverse. Left: aFRR-up direction; right: aFRR-down direction.
-            Subsampled to ≤ 8 k points for responsiveness.
+            Each point is one 4-s slot entry (or one ISP in the fallback
+            before the price data loads) plotted at (mFRR spread, aFRR
+            spread). A clean diagonal cloud means the two markets move
+            together; a flat or anti-diagonal cloud means they're
+            uncorrelated or inverse. Left: aFRR-up direction; right:
+            aFRR-down direction. Subsampled to ≤ 8 k points for
+            responsiveness.
           </p>
           <div class="two-col">
             <div id="g-cmp-scatter-pos" class="chart"></div>
@@ -575,19 +584,23 @@
             capacity premium (daily mean price × 24 h, EUR/MW·day), y = a
             <b>realized activation-payoff proxy</b> for 1 MW offered all day —
             mFRR-dn: 0.25 h × Σ max(0, −p<sub>mFRR</sub>) over the day's ISPs
-            (energy earned absorbing at negative prices); aFRR-dn: the same
-            with the dispatched fraction, 0.25 × Σ (n<sub>neg</sub>/225) ×
-            max(0, −avg p<sub>neg</sub>). The proxy ignores award probability
+            (energy earned absorbing at negative prices); aFRR-dn:
+            0.25 × Σ max(0, −avg p<sub>neg</sub>) — no extra dispatch factor,
+            because avg p<sub>neg</sub> is the favourable-slot sum ÷ 225, so
+            the partial-dispatch dilution is already inside the price (the
+            same convention the backtester's aFRR revenue uses). The proxy
+            ignores award probability
             and positive-price buy-backs — read it as relative option value,
             not P&amp;L. Points far below the diagonal = premium paid richly
             vs what activations returned; far above = capacity was cheap
             insurance. The premium axis respects the capacity winsor pairs
             above; the payoff proxy uses the <b>activation energy price</b>
             winsor pair (raw mFRR has ±10&nbsp;000&nbsp;€/MWh outliers — one
-            ISP can add 2&nbsp;500&nbsp;€/MW·day to a day's proxy). Event
-            markers (when the window reaches them): dotted red = Baltic
-            desynchronization (8 Feb 2025); shaded = aFRR market ramp-up
-            (Feb–Apr 2025).
+            ISP can add 2&nbsp;500&nbsp;€/MW·day to a day's proxy). These
+            scatters have no time axis; the structural-break markers
+            (dotted red = Baltic desynchronization, 8 Feb 2025; shaded =
+            aFRR market ramp-up, Feb–Apr 2025) live on this tab's
+            date-axis charts.
           </p>
           <div class="two-col">
             <div id="g-res-opt-mfrr" class="chart"></div>
@@ -693,7 +706,7 @@
             (no winsorisation) exceeds the up-spike threshold, the share below
             the down-spike threshold, and the mean size of the up-exceedance
             (line, right axis). The dataset spans the Baltic
-            desynchronization (markers) — if spike frequency drifts month to
+            desynchronization (Feb 2025, the first bar) — if spike frequency drifts month to
             month, pooled statistics and backtest optima are blending
             different regimes.
           </p>
@@ -795,14 +808,14 @@
       timing" subtab; the page degrades gracefully if it is missing.
     -->
     <script src="data-fund.js?v=1"></script>
-    <script src="engine.js?v=48"></script>
+    <script src="engine.js?v=49"></script>
     <script src="graphs-engine.js?v=29"></script>
     <script src="graphs-fund-engine.js?v=1"></script>
     <script src="graphs-charts.js?v=29"></script>
     <script src="afrr-engine.js?v=29"></script>
-    <script src="afrr-charts.js?v=29"></script>
-    <script src="afrr-spread-engine.js?v=29"></script>
-    <script src="mfrr-vs-afrr-engine.js?v=29"></script>
-    <script src="graphs-app.js?v=46"></script>
+    <script src="afrr-charts.js?v=30"></script>
+    <script src="afrr-spread-engine.js?v=30"></script>
+    <script src="mfrr-vs-afrr-engine.js?v=30"></script>
+    <script src="graphs-app.js?v=47"></script>
   </body>
 </html>

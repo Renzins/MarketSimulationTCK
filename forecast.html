@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>Baltic Imbalance Forecast — TCK Market Dashboard</title>
-    <link rel="stylesheet" href="style.css?v=39" />
+    <link rel="stylesheet" href="style.css?v=41" />
   </head>
   <body>
     <nav class="site-nav">
@@ -64,8 +64,8 @@
                   <p>
                     Private GitHub repository hosting the model and
                     <code>forecast.json</code>. Edit the constants at the
-                    top of <code>forecast-app.js</code> to point at your
-                    repo.
+                    top of <code>gh-run.js</code> (shared with the
+                    Bid-data page) to point at your repo.
                   </p>
                 </div>
               </div>
@@ -144,8 +144,7 @@
             <h2>Per-horizon detail</h2>
           </div>
           <p class="card-desc">
-            Full numeric forecast for every horizon. Sortable by clicking
-            a header (delivery time / argmax / expected price).
+            Full numeric forecast for every horizon, in delivery order.
           </p>
           <table class="decomposition" id="horizon-table"></table>
         </div>
@@ -165,6 +164,9 @@
       charset="utf-8"
     ></script>
     <script src="forecast-charts.js?v=39"></script>
-    <script src="forecast-app.js?v=40"></script>
+    <!-- gh-run.js: shared PAT-unlock + dispatch/poll client (also used by
+         bids.html) — must load before the page controller. -->
+    <script src="gh-run.js?v=1"></script>
+    <script src="forecast-app.js?v=41"></script>
   </body>
 </html>

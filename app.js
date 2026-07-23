@@ -5,11 +5,12 @@
 // Single unified panel — no Level 1 / 2 / 3 tabs. The engine always runs
 // the full L3 codepath; the legacy "levels" are now expressible via:
 //   · two source selectors in Setup (actualSource, idSource)
-//   · four per-strategy enable checkboxes (DA withhold, split, ID trust,
-//     intra-day oversell)
+//   · six per-strategy enable checkboxes (reserve up, reserve down,
+//     DA withhold, split, ID trust, intra-day oversell)
 //
 // Disabling a strategy greys its card and the engine treats its
-// parameters as neutral (Y=0, s_up=s_dn=1, Z=0, X_cap=0 respectively).
+// parameters as neutral (R_up=0, R_dn=0, Y=0, s_up=s_dn=1, Z=0, X_cap=0
+// respectively).
 // The optimiser only sweeps dimensions belonging to checked strategies.
 //
 // FLOW
@@ -17,7 +18,7 @@
 //   1. Engine.init(WIND_DATA)      — typed-array bootstrap of the dataset
 //   2. renderSetup()               — Setup card (sim window, winsor, θ,
 //                                    source selectors)
-//   3. renderStrategyCards()       — four strategy panels from PARAM_DEFS
+//   3. renderStrategyCards()       — six strategy panels from PARAM_DEFS
 //   4. renderStatsTables()         — decomposition + counts tables
 //   5. bindAll()                   — wires every control to scheduleUpdate
 //   6. update()                    — the hot path:
@@ -58,7 +59,7 @@
       isSourceSelect: true,
       label: "Actual power source",
       description:
-        "What the engine treats as the realised generation Q_pot when computing shortfall (Q_position − Q_pot). With \"DA forecast\" the simulation is fully self-consistent (no surprises ⇒ no shortfall ⇒ no imbalance cost) — this is the legacy Level 1 setup. With \"Real actual power\" the SCADA-derived wind_park_possible series drives shortfall — the legacy Level 2/3 setup. \"Intra-day forecast\" is an experimental in-between.",
+        "What the engine treats as the realised generation Q_pot when computing shortfall (Q_position − Q_pot). With \"DA forecast\" the simulation is fully self-consistent (no surprises ⇒ no shortfall ⇒ no imbalance cost — provided S3 is off; an un-hedged oversell can still short) — this is the legacy Level 1 setup. With \"Real actual power\" the SCADA-derived wind_park_possible series drives shortfall — the legacy Level 2/3 setup. \"Intra-day forecast\" is an experimental in-between.",
       options: [
         { value: "da", label: "DA forecast" },
         { value: "id", label: "Intra-day forecast" },
@@ -1749,7 +1750,8 @@
   //  Each completed Optimise appends a row capturing the setup, which
   //  strategies were enabled, and the optimal parameters found — so runs
   //  (e.g. summer vs winter, workdays vs weekends) line up for comparison.
-  //  In-memory only; cleared on reload or via the Clear button.
+  //  Persisted per tab in sessionStorage (tck.optimRuns.v5) — survives
+  //  same-tab navigation/reloads, clears when the tab closes or via Clear.
   // =====================================================================
   const DAYTYPE_LABEL = {
     all: "All",

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1200, initial-scale=1" />
     <title>TCK Market Dashboard — Backtester - BESS</title>
-    <link rel="stylesheet" href="style.css?v=40" />
+    <link rel="stylesheet" href="style.css?v=41" />
   </head>
   <body>
     <nav class="site-nav">
@@ -36,10 +36,12 @@
 
     <!-- =================================================================
          SETUP — battery physics + operating band + market bounds.
-         Everything here bounds the experiment and is NOT optimised nor
-         touched by "Reset to defaults". Unlike the wind-park page there is
-         no actual-power / intra-day-power source selector (a battery has no
-         generation forecast) and no reserve winsorisation.
+         Everything here bounds the experiment and is NOT optimised.
+         "Reset to defaults" resets Setup too (all params return to their
+         defaults); only the sim date range and the day-type filter
+         survive. Unlike the wind-park page there is no actual-power /
+         intra-day-power source selector (a battery has no generation
+         forecast) and no reserve winsorisation.
          ================================================================= -->
     <div class="setup-wrapper">
       <section class="setup-box">
@@ -50,7 +52,8 @@
               Define the battery and the experiment environment — physical
               limits, the safe operating band (red zones), the round-trip
               margin we demand, and how the markets are bounded. Setup is not
-              varied by the optimiser and not touched by "Reset to defaults".
+              varied by the optimiser. "Reset to defaults" resets everything
+              except the sim date range and the day-type filter.
             </p>
           </div>
           <div class="controls-grid" id="setup-params"></div>
@@ -62,9 +65,12 @@
       <!-- =================================================================
            STRATEGY PANEL — five toggleable cards. Unchecking a card greys
            it out and the engine treats its strategy as neutralised:
-             · DA discharge off  → no day-ahead sell schedule
-             · Dynamic charging off → battery never charges (read-only test)
-             · mFRR↔aFRR split off → all balancing volume to mFRR
+             · DA discharge off  → no day-ahead sell OR buy-low schedule
+             · Dynamic charging off → no REAL-TIME charging (a committed
+               DA buy-low still charges — it belongs to the DA card)
+             · mFRR↔aFRR split off → discharge volume all-mFRR (the
+               settled-usability re-route may still move the charge share
+               to aFRR-dn — that logic belongs to Dynamic charging)
              · Dynamic discharge off → offers always rest at the plain ask
                (no reactive re-pricing)
              · Opportunistic override off → committed DA is never diverted
@@ -82,10 +88,12 @@
                 Per-direction routing of balancing volume between mFRR and
                 aFRR that <em>adapts over time</em> (carried over from the
                 wind-park backtester). Each direction starts at split x, and
-                every y ISPs it re-checks which market paid more per MW over
-                the last y ISPs and shifts toward the winner by step z. Up
-                (discharge) and down (charge) are independent. Set z = 0 for
-                a fixed split at x.
+                every w ISPs (the cadence, default 1 = every ISP) it
+                re-checks which market paid more per MW over the trailing
+                y-ISP lookback window — ending at the last settled ISP —
+                and shifts toward the winner by step z. Up (discharge) and
+                down (charge) are independent. Set z = 0 for a fixed split
+                at x.
               </p>
             </div>
             <div class="controls-grid" id="split-params"></div>
@@ -215,7 +223,7 @@
               <div class="value" id="per-mwh">–</div>
             </div>
             <div class="big-stat">
-              <div class="label" title="Equivalent full cycles = total MWh discharged ÷ usable capacity. How hard the battery was worked over the window.">Full-cycle equivalents</div>
+              <div class="label" title="Equivalent full cycles = total MWh discharged ÷ usable capacity (the red-zone band, upper−lower red × nameplate — 24 MWh at defaults, not the 40 MWh nameplate). How hard the battery was worked over the window.">Full-cycle equivalents</div>
               <div class="value" id="cycles">–</div>
             </div>
           </div>
@@ -518,10 +526,10 @@
       reads via Engine.getData(). The BESS state-of-charge simulation itself
       lives entirely in bess-engine.js (BessEngine).
     -->
-    <script src="engine.js?v=48"></script>
-    <script src="bess-engine.js?v=7"></script>
+    <script src="engine.js?v=49"></script>
+    <script src="bess-engine.js?v=8"></script>
     <script src="optim-sens.js?v=1"></script>
-    <script src="bess-charts.js?v=7"></script>
-    <script src="bess-app.js?v=8"></script>
+    <script src="bess-charts.js?v=8"></script>
+    <script src="bess-app.js?v=9"></script>
   </body>
 </html>

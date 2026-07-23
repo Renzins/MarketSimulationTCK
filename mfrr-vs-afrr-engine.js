@@ -10,9 +10,10 @@
 //   afrrPosSpread[i] = avg_p_pos_raw[i] − p_da[i]           (only when avg_p_pos > 0; else NaN)
 //   afrrNegSpread[i] = avg_p_neg_raw[i] − p_da[i]           (only when avg_p_neg < 0; else NaN)
 //
-// Raw mFRR is used (not winsorized) because the agreement question is
-// about ALL clearings — capping outliers at the 5/95 percentile would
-// distort the sign-agreement counts.
+// Spreads are built from RAW prices, then CLIPPED to the user's winsor
+// bounds before sign-checking (see the sign-agreement functions): with the
+// mild 5/95 default this rarely flips a sign, and the clipping is the
+// user's explicit choice via the compare-tab winsor knobs.
 //
 // DIRECTION CLASSIFICATION
 //   mFRR direction:    0 = Up (p_mfrr ≥ 1)
@@ -71,8 +72,10 @@ const MfrrAfrrEngine = (() => {
   // in ISP and slot modes — both use the per-ISP distribution; aFRR
   // distributions differ between ISP-aggregated and per-entry, so they
   // get separate caches per direction).
-  let _winsorMfrr = { lo: 10, hi: 90 };
-  let _winsorAfrr = { lo: 10, hi: 90 };
+  // Defaults match the compare tab's UI defaults (graphs-app always calls
+  // setWinsorMfrr/setWinsorAfrr before the first compute anyway).
+  let _winsorMfrr = { lo: 5, hi: 95 };
+  let _winsorAfrr = { lo: 5, hi: 95 };
   let _bMfrr = null;
   let _bIspAfrrPos = null;
   let _bIspAfrrNeg = null;
@@ -258,6 +261,10 @@ const MfrrAfrrEngine = (() => {
       if (!_acceptsDay(i)) continue;
       const pmf = D.p_mfrr_raw[i];
       if (isNaN(pmf)) continue;
+      // Pre-aFRR-market ISPs (n_total = 0) are excluded, matching the
+      // slot-level matrix and the in-page setup text — otherwise they
+      // inflate the "Neither" column with structurally-empty rows.
+      if (D.afrr_n_total && D.afrr_n_total[i] === 0) continue;
       const apos = D.avg_p_pos_raw ? D.avg_p_pos_raw[i] : 0;
       const aneg = D.avg_p_neg_raw ? D.avg_p_neg_raw[i] : 0;
       cells[_mfrrDir(pmf)][_afrrDir(apos, aneg)]++;
@@ -373,6 +380,8 @@ const MfrrAfrrEngine = (() => {
       if (!_acceptsDay(i)) continue;
       const pmf = D.p_mfrr_raw[i];
       if (isNaN(pmf)) continue;
+      // Pre-aFRR-market ISPs excluded, matching the slot-level stats.
+      if (D.afrr_n_total && D.afrr_n_total[i] === 0) continue;
       nTotal++;
       const mDir = _mfrrDir(pmf);
       if (mDir === 0) nMfrrUp++;
@@ -693,8 +702,12 @@ const MfrrAfrrEngine = (() => {
       sumXX += ms * ms;
       sumYY += as * as;
     }
-    // Total 4-s slots in window (Σ n_total over accepted ISPs).
+    // Total 4-s slots in window (Σ n_total over accepted ISPs) + the union
+    // count Σ n_any (slots with ≥1 direction priced — a slot with BOTH
+    // directions must count once here, unlike the per-direction nPos/nNeg
+    // entry counts, whose sum can exceed the slot count).
     let totalSlots = 0;
+    let anySlots = 0;
     let nIspsWithAfrr = 0;
     for (let i = win.start; i < win.end; i++) {
       if (!_acceptsDay(i)) continue;
@@ -702,6 +715,7 @@ const MfrrAfrrEngine = (() => {
       const nt = D.afrr_n_total ? D.afrr_n_total[i] || 0 : 0;
       if (nt > 0) {
         totalSlots += nt;
+        if (afrrNAny) anySlots += afrrNAny[i] || 0;
         nIspsWithAfrr++;
       }
     }
@@ -717,6 +731,7 @@ const MfrrAfrrEngine = (() => {
     return {
       mode: "slot",
       nSlots: totalSlots,
+      nAny: anySlots,
       nIspsWithAfrr,
       nPos,
       nNeg,

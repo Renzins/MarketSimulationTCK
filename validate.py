@@ -1,11 +1,15 @@
 """
-Mirror of the JS engine simulation, run in Python on the real dataset.
-Used to:
-  (a) cross-verify that the JS engine logic is correct,
-  (b) compute ground-truth Level 1 / Level 2 optima,
-  (c) generate the findings summary numerics.
+HISTORICAL (v1-era, May 2025) — Python mirror of the ORIGINAL Level 1/2
+engine, kept as provenance for windpark_backtest_report.md. Used at the time
+to cross-verify the JS engine, compute L1/L2 ground-truth optima, and
+generate the findings numerics.
 
-Stays exactly aligned with engine.js — every formula here matches the JS.
+NOT aligned with today's unified engine.js: it predates the reserve
+strategies, the adaptive mFRR<->aFRR split, the aFRR feeds and S3.
+Its winsorize() also does not skip NaN, so on the current dataset
+(~2,900 null p_imb rows) the L2 path would produce NaN totals if run.
+The maintained mirror is tests.py; sensitivity.py imports from here and
+shares this status.
 """
 
 import json

@@ -6,11 +6,15 @@ WHY A SEPARATE FILE
 The "Drivers & timing" Graphs sub-tab needs the market FUNDAMENTALS the
 original export left behind: renewables/load ACTUALS (so forecast ERRORS can
 be computed — balancing prices are driven by surprises, not levels), the
-knowable DA→intraday wind-forecast revision, the 3-h intraday VWAP snapshot,
-the EE/LT mFRR clearing prices (cross-zone divergence) and the LV accepted
-SA-mFRR bid bands (merit-order scarcity). Rather than regenerate data.js
-(which would risk drifting the frozen regression arrays), we ship these as a
-separate optional file — exactly the pattern used by data-reserve.js.
+knowable DA→intraday wind-forecast revision, the EE/LT mFRR clearing prices
+(cross-zone divergence) and the LV accepted SA-mFRR UP bid band
+(merit-order scarcity). Rather than regenerate data.js (which would risk
+drifting the frozen regression arrays), we ship these as a separate optional
+file — exactly the pattern used by data-reserve.js.
+
+Four shipped columns are currently UNREAD by any chart (solar_act, vwap_3h,
+mfrr_maxbid_dn, mfrr_minbid_dn — ~1 MB of the payload); they are kept
+deliberately so future charts can use them without a data regeneration.
 
 ALIGNMENT
 =========

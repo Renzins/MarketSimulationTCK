@@ -486,7 +486,7 @@
     // e.g. analyse aFRR on workdays only while leaving the mFRR view
     // unfiltered. Same 3 states / same semantics as state.dayType.
     dayType: "all",
-    // Lazy-load state for the 86 MB per-slot price file
+    // Lazy-load state for the ~90 MB per-slot price data
     pricesLoaded: false,
     pricesLoading: false,
     // Direction filter for signed-spread charts: 'all' | 'pos' | 'neg'.
@@ -719,7 +719,7 @@
   // ---------------------------------------------------------------
   // Lazy loader for the chunked price file.
   //
-  // The 86 MB price data is split across N chunk files (currently 3,
+  // The ~90 MB price data is split across N chunk files (currently 3,
   // each ~30 MB) so that no single file exceeds GitHub's 50 MB warning
   // threshold. Loading order:
   //
@@ -733,7 +733,7 @@
   //      window.AFRR_PRICES — same shape AfrrSpreadEngine expects.
   //   4. Free the chunk references so the GC can release them.
   //
-  // Total transfer is the same 86 MB but split into smaller files, which
+  // Total transfer is the same ~90 MB but split into smaller files, which
   // also lets the browser fetch them in parallel (faster on multi-conn
   // hosts) and survive a single chunk's transient failure with a retry.
   // ---------------------------------------------------------------
@@ -904,6 +904,19 @@
 
   async function _runAfrrUpdate() {
     const t0 = performance.now();
+    // Pin the shared engine window to the aFRR tab's own range, and re-pin
+    // after every yield (_yieldPinned): another tab's synchronous render can
+    // run between our awaits and move the window — without the re-pin the
+    // remaining charts and the matched-cache entry would silently compute
+    // under that tab's window. Sync renders always pin their own window
+    // first, so re-pinning here cannot corrupt them.
+    const afrrWin = rangeToIdx(afrrState.sim.from, afrrState.sim.to);
+    const pinWin = () => Engine.setWindow(afrrWin.start, afrrWin.end);
+    const _yieldPinned = async () => {
+      await _yieldUI();
+      pinWin();
+    };
+    pinWin();
     AfrrSpreadEngine.setBalticThresholds(afrrState.balticDeficit, afrrState.balticSurplus);
     AfrrSpreadEngine.setDayTypeFilter(afrrState.dayType);
     const dir = afrrState.direction; // 'all' | 'pos' | 'neg'
@@ -931,17 +944,17 @@
 
     // ----- Winsor (direction-specific) -----
     setProg("winsorising spreads");
-    await _yieldUI();
+    await _yieldPinned();
     AfrrSpreadEngine.maybeWinsorize(wLo, wHi, dir);
 
     // ----- Fused 6-chart pass (charts 1-6) -----
     setProg("computing regime/axis box stats");
-    await _yieldUI();
+    await _yieldPinned();
     const fused = AfrrSpreadEngine.spreadByAxisAllRegimes(wB, sB, dir);
 
     // 1-D wind box plots
     setProg("wind surplus");
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawSpreadByBucket(
       "g-afrr-spread-wind-surplus", fused.wind.surplus, "SURPLUS",
       "Baltic Day-Ahead Wind Forecast",
@@ -950,7 +963,7 @@
     );
 
     setProg("wind deficit");
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawSpreadByBucket(
       "g-afrr-spread-wind-deficit", fused.wind.deficit, "DEFICIT",
       "Baltic Day-Ahead Wind Forecast",
@@ -960,7 +973,7 @@
 
     // 1-D solar box plots
     setProg("solar surplus");
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawSpreadByBucket(
       "g-afrr-spread-solar-surplus", fused.solar.surplus, "SURPLUS",
       "Baltic Day-Ahead Solar Forecast",
@@ -969,7 +982,7 @@
     );
 
     setProg("solar deficit");
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawSpreadByBucket(
       "g-afrr-spread-solar-deficit", fused.solar.deficit, "DEFICIT",
       "Baltic Day-Ahead Solar Forecast",
@@ -979,14 +992,14 @@
 
     // 2-D heatmaps
     setProg("heatmap deficit");
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawWindSolarHeatmap(
       "g-afrr-heatmap-deficit", fused.heatmap.deficit, "DEFICIT",
       `DEFICIT — aFRR spread by Wind × Solar${dirSuffix} (${wB}×${sB} bins)`,
     );
 
     setProg("heatmap surplus");
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawWindSolarHeatmap(
       "g-afrr-heatmap-surplus", fused.heatmap.surplus, "SURPLUS",
       `SURPLUS — aFRR spread by Wind × Solar${dirSuffix} (${wB}×${sB} bins)`,
@@ -1004,19 +1017,19 @@
     if (!cache || cache.key !== matchedKey) {
       matchedFromCache = false;
       setProg("matched-by-DA (computing — first time / params changed)");
-      await _yieldUI();
+      await _yieldPinned();
       AfrrSpreadEngine.maybeWinsorizeAll(wLo, wHi);
       const mWind = AfrrSpreadEngine.absSpreadByWindMatchedByDABand(daB, mL);
-      await _yieldUI();
+      await _yieldPinned();
       const mSolar = AfrrSpreadEngine.absSpreadBySolarMatchedByDABand(daB, mL);
-      await _yieldUI();
+      await _yieldPinned();
       const mRenew = AfrrSpreadEngine.absSpreadByRenewablesMatchedByDABand(daB, mL);
       cache = { key: matchedKey, mWind, mSolar, mRenew, daB, mL };
       _afrrMatchedCache = cache;
     } else {
       setProg("matched-by-DA (cached — direction-agnostic)");
     }
-    await _yieldUI();
+    await _yieldPinned();
     GraphsCharts.drawAbsSpreadMatchedPanels(
       "g-afrr-matched-wind", cache.mWind,
       `|aFRR spread| by Wind Level — Matched by DA Price Band (${cache.daB} panels × ${cache.mL} levels)`,
@@ -1366,7 +1379,7 @@
           [1, "#ffd166"],
         ],
         showscale: true,
-        colorbar: { title: { text: "ISP count", side: "right" } },
+        colorbar: { title: { text: labelMode === "slot" ? "4-s slot count" : "ISP count", side: "right" } },
         hovertemplate:
           "%{y}<br>%{x}<br>n = %{z:,}<extra></extra>",
       },
@@ -1407,9 +1420,11 @@
   //   gray    = N/A — that aFRR direction didn't activate for this 4-s slot
   // The "near DA" bucket dedupes the user's example case (DA=100, aFRR=101,
   // mFRR=99: strict signs disagree, but both prices are essentially at DA).
-  function drawCmpSignBar(targetId, result, title, subtitle) {
+  function drawCmpSignBar(targetId, result, title, subtitle, labelMode) {
     const { counts, total } = result;
     const tot = total || 1;
+    // Unit-honest labels: slot mode counts 4-s slots, the fallback counts ISPs.
+    const unit = labelMode === "slot" ? "4-s slots" : "ISPs";
     const segs = [
       ["Both POS (agree, mkts above DA)", "#3fb950", counts.ppos],
       ["mFRR+ / aFRR− (disagree)", "#f0883e", counts.pneg],
@@ -1426,7 +1441,7 @@
       customdata: [[n, tot]],
       marker: { color: colour, line: { color: "#0d1117", width: 1 } },
       hovertemplate:
-        `<b>${name}</b><br>%{y:.2f}%<br>%{customdata[0]:,} / %{customdata[1]:,} slots<extra></extra>`,
+        `<b>${name}</b><br>%{y:.2f}%<br>%{customdata[0]:,} / %{customdata[1]:,} ${unit}<extra></extra>`,
     }));
     const annotations = [];
     let cum = 0;
@@ -1453,7 +1468,7 @@
       barmode: "stack",
       yaxis: {
         ...CMP_LAYOUT.yaxis,
-        title: "% of ISPs",
+        title: `% of ${unit}`,
         range: [0, 100],
         ticksuffix: "%",
       },
@@ -1626,7 +1641,7 @@
             <span style="color:#9aa5b1"> · </span>
             <span style="color:#f85149">${fmtInt(s.nNeg)}</span>
           </div>
-          <div class="cmp-stat-help">${fmtPct(s.nPos + s.nNeg, s.nSlots)} of slots had at least one direction cleared</div>
+          <div class="cmp-stat-help">${fmtPct(s.nAny, s.nSlots)} of slots had at least one direction cleared</div>
         </div>
         <div class="cmp-stat">
           <div class="cmp-stat-label">Co-fire (mFRR ↑ AND aFRR POS slot)</div>
@@ -1756,10 +1771,15 @@
     // for. If the lazy-loaded 4-s price file isn't ready, render the
     // ISP-level fallback and trigger the load; re-renders automatically
     // once the load completes (see loadAfrrPriceData below).
+    // The window is re-pinned INSIDE each deferred callback: the async aFRR
+    // price render re-pins its own window between yields, so a compute that
+    // ran 30 ms after this function returned could otherwise land under the
+    // aFRR tab's range.
     if (MfrrAfrrEngine.isSlotDataLoaded()) {
       progEl.textContent = "computing (4-s mode)…";
       setTimeout(() => {
         const t0 = performance.now();
+        Engine.setWindow(start, end);
         renderCmpStats(MfrrAfrrEngine.slotLevelStats(), "slot");
         drawCmpMatrix("g-cmp-matrix", MfrrAfrrEngine.slotLevelMatrix(), "slot");
         drawCmpSignBar(
@@ -1767,12 +1787,14 @@
           MfrrAfrrEngine.slotLevelSignAgreement("pos"),
           "Sign agreement — aFRR POS slots",
           "Per 4-s POS slot: sign(p_mfrr − p_da) vs sign(AST_POS − p_da)",
+          "slot",
         );
         drawCmpSignBar(
           "g-cmp-sign-neg",
           MfrrAfrrEngine.slotLevelSignAgreement("neg"),
           "Sign agreement — aFRR NEG slots",
           "Per 4-s NEG slot: sign(p_mfrr − p_da) vs sign(AST_NEG − p_da)",
+          "slot",
         );
         drawCmpMfrrOnlyBar(
           "g-cmp-sign-na-pos",
@@ -1807,6 +1829,7 @@
       progEl.textContent = "loading 4-second aFRR price data… (ISP-level shown meanwhile)";
       setTimeout(() => {
         const t0 = performance.now();
+        Engine.setWindow(start, end); // re-pin — see the slot-mode note above
         renderCmpStats(MfrrAfrrEngine.statsScoreboard(), "isp");
         drawCmpMatrix("g-cmp-matrix", MfrrAfrrEngine.agreementMatrix(), "isp");
         drawCmpSignBar(
@@ -1814,12 +1837,14 @@
           MfrrAfrrEngine.signAgreement("pos"),
           "Sign agreement — aFRR-up direction (ISP-level)",
           "spread = avg_p_pos − p_da (only ISPs with avg_p_pos > 0)",
+          "isp",
         );
         drawCmpSignBar(
           "g-cmp-sign-neg",
           MfrrAfrrEngine.signAgreement("neg"),
           "Sign agreement — aFRR-dn direction (ISP-level)",
           "spread = avg_p_neg − p_da (only ISPs with avg_p_neg < 0)",
+          "isp",
         );
         drawCmpScatter(
           "g-cmp-scatter-pos",
@@ -1943,7 +1968,7 @@
       // Re-pin the engine window to whichever tab we just activated
       if (section === "afrr") {
         scheduleAfrrUpdate();
-        // Only kick the 86 MB price file load if it hasn't been loaded yet.
+        // Only kick the ~90 MB price data load if it hasn't been loaded yet.
         // If it IS already loaded, scheduleAfrrUpdate → updateAfr's chain
         // handles refreshing the price charts. Calling loadAfrrPriceData()
         // unconditionally here would cause it to also call
@@ -2164,8 +2189,9 @@
 
   // Option-value view: daily DOWN capacity premium (daily mean hourly price
   // × 24 → EUR/MW·day) vs a realized activation-payoff PROXY for 1 MW
-  // offered all day: mFRR-dn 0.25·Σ max(0, −p_mfrr); aFRR-dn the same with
-  // the dispatched fraction n_neg_fav/225 and avg_p_neg. Ignores award
+  // offered all day: mFRR-dn 0.25·Σ max(0, −p_mfrr); aFRR-dn
+  // 0.25·Σ max(0, −avg_p_neg) — no dispatch factor, avg_p_neg already
+  // embeds the /225 dilution (see aPay below). Ignores award
   // probability and positive-price buy-backs — relative value, not P&L.
   function computeResOption() {
     if (typeof RESERVE_DATA === "undefined" || !RESERVE_DATA) return null;
@@ -2207,9 +2233,12 @@
       aPrice: { fn: (i) => clip(nv(R.reserve_afrr_dn, i), caLo, caHi), agg: "mean" },
       mPay: { fn: (i) => { const p = clip(pmf[i], pmLo, pmHi); return isFinite(p) && p < 0 ? -p * 0.25 : 0; }, agg: "sum" },
       aPay: { fn: (i) => {
+        // avg_p_neg = Σ(favourable AST_NEG)/225, so the dispatch fraction is
+        // already inside the price: 1 MW offered for the whole ISP earns
+        // −avg_p_neg × 0.25 — the engine's aFRR revenue convention. Scaling
+        // by n_neg_fav/225 again would double-count the dilution.
         const a = clip(anRaw ? anRaw[i] : NaN, anLo, anHi);
-        const f = D.afrr_n_neg_fav ? D.afrr_n_neg_fav[i] : 0;
-        return isFinite(a) && a < 0 ? -a * (f / 225) * 0.25 : 0;
+        return isFinite(a) && a < 0 ? -a * 0.25 : 0;
       }, agg: "sum" },
     });
     return {

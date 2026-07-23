@@ -187,7 +187,9 @@ const GraphsEngine = (() => {
   }
 
   // Bin a value into one of N bins given N+1 edges. Returns 0..N-1.
-  // Lower edge inclusive, upper edge inclusive on the last bin.
+  // Upper edge inclusive (v ≤ edges[k+1] → bin k); everything above the
+  // second-to-last edge lands in the last bin — matching the "≤ e / > e"
+  // bin labels.
   function binIndex(v, edges) {
     const N = edges.length - 1;
     for (let k = 0; k < N - 1; k++) {

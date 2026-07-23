@@ -263,6 +263,11 @@ const BessCharts = (() => {
         terms.push(sim.revDn[k]);
         terms.push(sim.revChg[k]);
         s_ += section("Charge", balDn);
+      } else if (sim.revDn[k] !== 0 || sim.revChg[k] !== 0) {
+        // committed DA buy with zero absorbable volume: cash leg exists
+        // (financial settlement) even though no charge volume is shown
+        terms.push(sim.revDn[k]);
+        terms.push(sim.revChg[k]);
       }
       if (Math.abs(sim.revID[k]) > 0.5) {
         const df = sim.divFlag ? sim.divFlag[k] : 0;

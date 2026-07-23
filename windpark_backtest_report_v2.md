@@ -6,6 +6,11 @@ capped at their 80th percentile (19–52 €/MW·h depending on product), becaus
 expect the 2025 spike levels to persist. All figures are backtested, not realised — read
 the caveats.*
 
+*Re-verified 2026-07-22 on the corrected engine (native window-aware caches; the
+optimiser objective's whole-MW flooring fixed to match the displayed engine). Every
+headline number reproduced — see "Re-verification on the fixed engine" at the end.
+One figure moved: the speculative 5/95 reserve counterfactual, +€4.3M → +€4.6M.*
+
 ## Bottom line
 
 - The three energy strategies are worth **+€5.8M (+54%)** over plain day-ahead selling
@@ -62,14 +67,14 @@ everything:
 
 | Pricing assumption | Reserve value on top of energy strategies |
 | --- | --- |
-| Spikes persist (old 5/95 winsor, aFRR up to 430 €/MW·h) | **+€4.3M** — offer everything, all-aFRR |
+| Spikes persist (old 5/95 winsor, aFRR up to 430 €/MW·h) | **+€4.6M** — offer everything, all-aFRR (was +€4.3M pre-fix; the corrected optimiser objective finds a slightly better optimum) |
 | Spikes don't persist (prices capped ~19–26 €/MW·h) | **€0.0M** — optimal participation is zero |
 
 Mechanics of the zero: awarded down-capacity MW must be sold day-ahead, which defeats the
 withholding strategy exactly when it earns most; up-capacity moves MW out of guaranteed
 day-ahead sales into a capacity fee plus conditional activation revenue — together worth
-less than just selling the power. At full participation the capacity leg collects €1.9M
-but the total drops €1.0M.
+less than just selling the power. At full down-participation the capacity leg collects
+~€2.1M but the total drops €1.0M (re-measured on the fixed engine).
 
 **The nuance worth keeping an eye on — reserves were not always worthless:**
 
@@ -163,3 +168,42 @@ away: aFRR capacity reached 430 €/MW·h at the old 5/95 winsor and 4,000 €/M
 coordinate refinement + sensitivity analysis), reserve conclusions verified with seeded
 refinement and joint parameter sweeps. "Do-nothing" = sell the day-ahead forecast at the
 day-ahead price. v1 anchors reproduced exactly (baseline €10.69M, withholding-only €11.95M).*
+
+## Re-verification on the fixed engine (2026-07-22)
+
+Since v2 was written, two engine defects that this report had to work around were
+fixed at the source: (1) window-only changes now natively re-derive the reserve
+winsor caps and the adaptive-split price cache (content-addressed cache keys — the
+v2 harness had worked around the stale-cache bug manually), and (2) the optimiser's
+fast evaluator no longer under-floors whole-MW quantities at fractional parameter
+values (`|0` truncation → epsilon floor), so the optimiser now ranks candidates on
+exactly the revenue the engine displays. Every experiment above was re-run from
+scratch on the fixed engine (same seed, same N=4000 + 5-start refinement, same
+per-configuration optimiser runs):
+
+- **Reproduced exactly** (to the reported precision): the do-nothing baseline
+  (€10.69M), the fixed configuration (€16.49M, +54%), every added-in-order and
+  if-dropped strategy value (+1.27/+1.81/+2.73; −2.13/−2.51/−2.73), all five
+  seasonal fixed/do-nothing rows, all five own-optimum captures
+  (98.0/94.3/98.4/99.4/99.9%), the S3 numbers (+1.3M at safety settings, +1.9M
+  optimiser-tuned), the 0/80 caps (19.4/26.2/29.0/51.6 €/MW·h), the risk profile
+  (no losing month, 37/451 losing days, worst day −€27k, −€47k max drawdown,
+  1%→24% / 5%→63% concentration, imbalance €2.0M vs €1.9M), and the reserve
+  mechanics check (full down-participation: total drops €1.0M).
+- **Zero-participation verified structurally**: with reserves enabled at
+  conservative caps and both coefficients at zero, revenue equals the energy-only
+  optimum to the cent — the "+€0.0M" rows are the true optimum, not an optimiser
+  artefact (raw joint searches under-find by 0.1–0.5M with the extra reserve
+  dimensions, exactly the noise the caveats describe).
+- **One number moved**: the speculative 5/95 reserve counterfactual improved from
+  +€4.3M to **+€4.6M** — the corrected objective no longer under-values
+  fractional-coefficient candidates, so the (already upper-bound) counterfactual
+  optimum is found slightly higher. No conclusion changes.
+- **Provenance note**: the v2 seasonal windows actually started one calendar day
+  before their labels (a local-time date conversion in the old harness — e.g.
+  "May–Jul" spanned Apr 30 – Jul 31 inclusive). All comparisons above use the same
+  windows, so no seasonal figure or conclusion is affected; the labels should be
+  read as ±1 day.
+- The energy optimum found by the fixed optimiser **is** the fixed configuration
+  (withhold below 40, Y=1, Z=1, adaptive splits at 1-h lookback / 15-min re-check /
+  step 0.5) — the full-period capture is 100% by construction.

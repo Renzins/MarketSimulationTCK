@@ -16,9 +16,10 @@ stateful state-of-charge loop, exercised three ways:
 
 DYNAMIC DISCHARGE PRICING (reactive ask): every discretionary balancing offer
 carries an ask = effCost + minDelta; a leg clears only when ITS price reaches
-the ask. On a gate-observable run-up (p_mfrr[i-1] - p_mfrr[i-1-lookback] >=
-dd_threshold) the whole offer is re-priced to p_mfrr[i-1] + dd_markup — full
-volume stays offered, nothing is withheld (the old dd_hold withholding is gone).
+the ask. On a SETTLED run-up (p_mfrr[i-3] - p_mfrr[i-3-lookback] >=
+dd_threshold; LAG_SETTLED = 3) the whole offer is re-priced to
+p_mfrr[i-3] + dd_markup — full volume stays offered, nothing is withheld
+(the old dd_hold withholding is gone).
 
 RED-ZONE TIME AUDIT: counts.lowRed / counts.upRed = ISPs whose end-of-ISP SoC is
 pinned at/inside a red zone (soc < loRed + 0.25/etaLeg, soc > hiRed - 0.25*etaLeg
@@ -62,8 +63,11 @@ E4 = 0.25  # hours per ISP
 # Current freeze: FAIR INFORMATION TIMING (all decisions on settled ≤ i−3
 # prices + the pre-gate intraday quote; realised prices only clear bids) +
 # reactive-ask dynamic discharge (lb=1/thr=20/markup=75; the old hard
-# mFRR→aFRR switch removed) + per-leg ask gate + red-zone time audit.
-FROZEN_DEFAULT_REVENUE_EUR = 2109994.41
+# mFRR→aFRR switch removed) + per-leg ask gate + red-zone time audit +
+# DA FINANCIAL SETTLEMENT (committed DA volume paid in full; the physical
+# gap — short sell or unabsorbed buy — settles at p_imb with θ on the gap;
+# was 2,109,994.41 under the pre-2026-07 delivered-only booking).
+FROZEN_DEFAULT_REVENUE_EUR = 3409313.15
 
 
 # =============================================================================
@@ -166,14 +170,44 @@ def _iso_ms(iso):
     return int(_dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp() * 1000)
 
 
+def jround(x):
+    """Mirror engine Math.round: half UP (toward +∞). Python's builtin
+    round() is half-to-even and diverges at exact half-MW split products
+    (0.5 × 5 MW = 2.5 → engine 3, banker's 2)."""
+    return math.floor(x + 0.5)
+
+
 def day_type_mask(data):
+    """Mirror engine.js _computeDayTypeMask: 0 = workday, 1 = weekend,
+    2 = LV/EE/LT public holiday (weekend wins — the engine checks
+    day-of-week first). Degrades to weekend-only when the `holidays`
+    package is missing, exactly like engine.js does when the
+    date-holidays CDN fails. Same approach as tests.py's _day_type_mask."""
+    import datetime as _dt
     n = data["n"]
     start_ms = _iso_ms(data["start_iso"])
     step_ms = data["step_min"] * 60000
+    hol = set()
+    try:
+        import holidays as _holidays
+        ms0 = start_ms + int(data["offsets"][0]) * step_ms
+        ms1 = start_ms + int(data["offsets"][n - 1]) * step_ms
+        years = list(range(
+            _dt.datetime.fromtimestamp(ms0 / 1000, _dt.timezone.utc).year,
+            _dt.datetime.fromtimestamp(ms1 / 1000, _dt.timezone.utc).year + 1,
+        ))
+        for cc in ("LV", "EE", "LT"):
+            hol.update(_holidays.country_holidays(cc, years=years).keys())
+    except Exception:
+        hol = set()  # weekend-only fallback
     mask = np.zeros(n, dtype=np.uint8)
     for i in range(n):
-        dow = (((start_ms + int(data["offsets"][i]) * step_ms) // 86400000) + 4) % 7  # getUTCDay
-        mask[i] = 1 if dow in (0, 6) else 0
+        ms = start_ms + int(data["offsets"][i]) * step_ms
+        dow = ((ms // 86400000) + 4) % 7  # getUTCDay
+        if dow in (0, 6):
+            mask[i] = 1
+        elif _dt.datetime.fromtimestamp(ms / 1000, _dt.timezone.utc).date() in hol:
+            mask[i] = 2
     return mask
 
 
@@ -369,10 +403,12 @@ def bess_run(A, params):
             commitMW = min(p["da_mw"], eMaxMW)
             maxDelivMW = math.floor(min(budgetMW, (soc * eta) / E4))
             delivMW = min(commitMW, maxDelivMW)
+            # DA settles financially: the committed sale is paid in full at
+            # P_da; the undelivered remainder is bought back at imbalance.
+            cDA += commitMW * E4 * P_da
             if delivMW > 0:
                 soc -= delivMW * E4 / eta
                 budgetMW -= delivMW
-                cDA += delivMW * E4 * P_da
                 daSellMW = delivMW
             shortMW = commitMW - delivMW
             if shortMW > 0 and not math.isnan(P_imb):
@@ -385,13 +421,20 @@ def bess_run(A, params):
             commitMW = min(p["da_mw"], eMaxMW)
             maxChgMW = math.floor(min(budgetMW, (cap - soc) / (E4 * eta)))
             chgMW = min(commitMW, maxChgMW)
+            # Financial mirror of the sale: the committed buy is paid in full;
+            # unabsorbable energy is sold back at imbalance (long), θ on the gap.
+            cChg -= commitMW * E4 * P_da
             if chgMW > 0:
                 stored = chgMW * E4 * eta
                 cb = (cb * soc + P_da * chgMW * E4) / (soc + stored)
                 soc += stored
                 budgetMW -= chgMW
-                cChg -= chgMW * E4 * P_da
                 chgOtherMW += chgMW
+            surplusMW = commitMW - chgMW
+            if surplusMW > 0 and not math.isnan(P_imb):
+                shortE = surplusMW * E4
+                cImb -= shortE * P_imb
+                cFlat += shortE * theta
 
         # realised charge usability — clearing conditions only
         mfrrChgU = P_mfrr <= -1 and P_mfrr <= ceiling
@@ -464,7 +507,7 @@ def bess_run(A, params):
                             ask = raised
                             repriced = True
                 toMfrr = sUp  # mFRR<->aFRR routing is the adaptive split's job
-                routedMfrr = round(toMfrr * availMW)
+                routedMfrr = jround(toMfrr * availMW)
                 routedAfrr = availMW - routedMfrr
                 budgetMW -= availMW  # offered capacity reserved whether or not it clears
                 any_clear = False
@@ -504,7 +547,7 @@ def bess_run(A, params):
                 if lag_known and not mfrrChgLag and not afrrChgLag:
                     idMW = headMW if idChgU else 0
                 else:
-                    mShare = round(sDn * headMW)
+                    mShare = jround(sDn * headMW)
                     aShare = headMW - mShare
                     if lag_known and not mfrrChgLag and afrrChgLag:
                         aMW = aShare + mShare
@@ -544,6 +587,7 @@ def bess_run(A, params):
 
         if soc < -1e-6 or soc > cap + 1e-6:
             max_viol = max(max_viol, abs(soc - min(max(soc, 0), cap)))
+            c["unfulfilled"] += 1  # mirror of the engine's must-fulfil audit
         soc = 0.0 if soc < 0 else (cap if soc > cap else soc)
 
         rev = cDA + cUpM + cUpA + cDnM + cDnA + cID + cChg - cImb - cFlat
@@ -847,9 +891,10 @@ def test_dwell_blocks_fast_flip():
 
 
 def test_dwell_enforces_rest_between_opposite_phases():
-    """The dwell is a COOLDOWN measured from the last action (block END): after a
-    discharge block, the battery must idle >= dwell ISPs before it may start
-    charging, even when charging is immediately attractive."""
+    """The dwell is a COOLDOWN measured from the last action (block END): the
+    opposite phase may start once >= dwell ISPs have passed since the last
+    discharge (dwell-1 fully idle ISPs in between), even when charging is
+    immediately attractive."""
     n = 10
     pm = np.array([300.0, 300, 300, 300, -50, -50, -50, -50, -50, -50])
     A = synth(n, p_mfrr=pm)
@@ -1223,7 +1268,7 @@ R.add("whole-MW: daSell / mFRR / charge volumes are integers", test_whole_mw_mar
 R.add("min-delta gate blocks thin discharge, passes above gate", test_min_delta_blocks_thin_discharge)
 R.add("red zones bound discretionary discharge at the lower red", test_red_zones_bound_discretionary)
 R.add("dwell-time suppresses a discharge right after a charge", test_dwell_blocks_fast_flip)
-R.add("dwell enforces a real rest (>= dwell idle ISPs) between opposite phases", test_dwell_enforces_rest_between_opposite_phases)
+R.add("dwell enforces a real rest (opposite starts >= dwell ISPs apart)", test_dwell_enforces_rest_between_opposite_phases)
 R.add("must-fulfil: SoC never sized out of [0, cap] over random prices", test_must_fulfil_no_soc_violation_random)
 R.add("price-aware charging skips an above-ceiling side, uses the usable one", test_charge_price_aware_skips_above_ceiling)
 R.add("day-ahead buy-low fires at a committed forecast trough", test_da_buy_low_committed_at_trough)
@@ -1246,6 +1291,23 @@ R.add("strategy-off: dynamic discharge off ⇒ no repriced bids", test_dynamic_d
 R.add("strategy-off: opportunistic off ⇒ no intraday close leg", test_opportunistic_off_no_intraday_leg)
 R.add("both splits static (step=0) collapse to all-mFRR (=1)", test_both_splits_static_collapse_to_one)
 R.add("frozen default-config revenue + must-fulfil = 0 (prints value)", test_frozen_default_revenue)
+
+
+def test_every_test_function_is_registered():
+    """Meta-guard: every module-level test_* function must be R.add-registered.
+
+    Registration is a separate manual step, so a written-but-unregistered test
+    silently never runs (this orphaned seven reserve-up tests in tests.py).
+    """
+    registered = {fn for _, fn in R.tests}
+    orphans = sorted(
+        name for name, obj in globals().items()
+        if name.startswith("test_") and callable(obj) and obj not in registered
+    )
+    assert not orphans, f"defined but never registered: {orphans}"
+
+
+R.add("meta: every test_* function is registered with the runner", test_every_test_function_is_registered)
 
 if __name__ == "__main__":
     sys.exit(R.run())

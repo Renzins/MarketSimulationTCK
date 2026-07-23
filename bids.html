@@ -62,8 +62,8 @@
                   <p>
                     Private GitHub repository hosting the bids workflow and
                     <code>bids.json</code>. Same repo as the Forecast page;
-                    edit the constants at the top of <code>bids-app.js</code>
-                    to point elsewhere.
+                    edit the constants at the top of the shared
+                    <code>gh-run.js</code> to point elsewhere.
                   </p>
                 </div>
               </div>
@@ -185,7 +185,10 @@
       src="https://cdn.plot.ly/plotly-2.35.2.min.js"
       charset="utf-8"
     ></script>
-    <script src="bids-charts.js?v=41"></script>
-    <script src="bids-app.js?v=42"></script>
+    <script src="bids-charts.js?v=42"></script>
+    <!-- gh-run.js: shared PAT-unlock + dispatch/poll client (also used by
+         forecast.html) — must load before the page controller. -->
+    <script src="gh-run.js?v=1"></script>
+    <script src="bids-app.js?v=43"></script>
   </body>
 </html>

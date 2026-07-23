@@ -1,7 +1,8 @@
 // bids-charts.js — Plotly renderers for the "Bid data" page.
 //
 // The Bid data page shows, for the most recent four 15-minute delivery
-// periods, the LV mFRR balancing-energy bid stack as a histogram:
+// periods, the selected area's (EE / LV / LT) mFRR balancing-energy bid
+// stack as a histogram:
 //
 //     X axis = price (€/MWh), binned
 //     Y axis = MW offered (sum of every bid's volume that falls in the bin)
@@ -112,7 +113,11 @@ const BidCharts = (() => {
               (s.counts && s.counts[i]) || 0,
             ]),
             hovertemplate:
-              "€%{customdata[0]:.0f} … %{customdata[1]:.0f}/MWh<br>" +
+              // one decimal when the nice bin width is fractional (2.5×10^k),
+              // so displayed edges aren't off by 0.5
+              (Number.isInteger(bw)
+                ? "€%{customdata[0]:.0f} … %{customdata[1]:.0f}/MWh<br>"
+                : "€%{customdata[0]:.1f} … %{customdata[1]:.1f}/MWh<br>") +
               "%{y:.1f} MW offered<br>%{customdata[2]} bid(s)<extra></extra>",
           },
         ];
@@ -187,10 +192,5 @@ const BidCharts = (() => {
     });
   }
 
-  function clear(targetId) {
-    const el = document.getElementById(targetId);
-    if (el) Plotly.purge(el);
-  }
-
-  return { drawDirectionSection, drawHistogram, clear, niceBinWidth };
+  return { drawDirectionSection, drawHistogram, niceBinWidth };
 })();

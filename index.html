@@ -42,7 +42,8 @@
             <p class="group-desc">
               Define the experiment environment — what data is fed into
               the simulation and how it is bounded. Setup is not varied
-              by the optimiser and not touched by "Reset to naïve".
+              by the optimiser. "Reset to defaults" resets everything
+              except the sim window and the day-type filter.
             </p>
           </div>
           <div class="controls-grid" id="setup-params"></div>
@@ -52,7 +53,7 @@
 
     <main>
       <!-- =================================================================
-           UNIFIED STRATEGY PANEL — four strategy cards, each toggleable
+           UNIFIED STRATEGY PANEL — six strategy cards, each toggleable
            via the checkbox in the card head. Unchecking a card greys it
            out and the engine treats its strategy as neutralised:
              · DA withhold off → Y = 0 (full forecast always sold to DA)
@@ -113,8 +114,9 @@
                 (price&nbsp;×&nbsp;MW&nbsp;×&nbsp;0.25&nbsp;h) and the awarded MW
                 become <em>mandatory</em>: sold to DA regardless of the clearing
                 price (they bypass the withhold rule) and offered as
-                mFRR/aFRR-down. Activation still uses our own price gates. Only
-                down capacity is modelled. Off ⇒ the reserve market is ignored.
+                mFRR/aFRR-down. Activation still uses our own price gates. The
+                up side is the separate card above. Off ⇒ down capacity is
+                ignored.
               </p>
             </div>
             <div class="controls-grid" id="reserve-params"></div>
@@ -130,9 +132,9 @@
               </label>
               <h3>DA withhold on low prices (non-reserve volume) <span class="badge">optimised</span></h3>
               <p class="group-desc">
-                When DA clears at or below price threshold X, hold back fraction
-                Y of the forecast from DA and offer it to balancing instead.
-                Above X, sell the full forecast to DA as usual.
+                When DA clears strictly below price threshold X, hold back
+                fraction Y of the forecast from DA and offer it to balancing
+                instead. At or above X, sell the full forecast to DA as usual.
               </p>
             </div>
             <div class="controls-grid" id="da-withhold-params"></div>
@@ -150,10 +152,11 @@
               <p class="group-desc">
                 Per-direction routing of balancing volume between mFRR and aFRR
                 that <em>adapts over time</em>. Each direction starts at a split
-                x, and every y ISPs it re-checks which market paid more per MW
-                over the last y ISPs and shifts the split toward the winner by
-                step z. Up and down are independent (x₁/y₁/z₁ and x₂/y₂/z₂).
-                Set z = 0 for a fixed (static) split at x.
+                x, and every w ISPs (the cadence, default 1 = every ISP) it
+                re-checks which market paid more per MW over the trailing y-ISP
+                lookback window and shifts the split toward the winner by step
+                z. Up and down are independent (x/y/w/z per direction — eight
+                parameters). Set z = 0 for a fixed (static) split at x.
               </p>
             </div>
             <div class="controls-grid" id="split-params"></div>
@@ -170,7 +173,8 @@
               <h3>ID trust coefficient <span class="badge">optimised</span></h3>
               <p class="group-desc">
                 How much of the intra-day forecast revision (ID − DA) to act on
-                as additional mFRR-up volume. Negative revisions are not acted on
+                as additional balancing-up volume (routed mFRR/aFRR by the
+                split). Negative revisions are not acted on
                 (no buy-back modelled). Only meaningful when the ID forecast
                 source in Setup is set to "Real intra-day forecast" — otherwise
                 ID − DA = 0 and the term collapses.
@@ -285,7 +289,7 @@
               <div class="label">Top 1% concentration</div>
               <div class="big-num" id="top1pct">–</div>
               <div class="robust-help">
-                Share of total revenue earned by the best 1% (≈ 402 ISPs) of periods.
+                Share of total revenue earned by the best 1% of periods (≈ 430 ISPs on the full dataset; fewer with a sub-window or day filter).
                 <br><b>&lt; 10%:</b> well-distributed.
                 <br><b>&gt; 30%:</b> strategy depends on rare events.
               </div>
@@ -294,14 +298,14 @@
               <div class="label">Top 5% concentration</div>
               <div class="big-num" id="top5pct">–</div>
               <div class="robust-help">
-                Best 5% (~ 2 011 ISPs). A balanced strategy contributes ≈ 5 % from each percentile bucket.
+                Best 5% (≈ 2 150 ISPs full-dataset). A balanced strategy contributes ≈ 5 % from each percentile bucket.
               </div>
             </div>
             <div class="robust-item">
               <div class="label">Top 10% concentration</div>
               <div class="big-num" id="top10pct">–</div>
               <div class="robust-help">
-                Best 10% (~ 4 022 ISPs). Anything &gt; 60 % means revenue is highly skewed.
+                Best 10% (≈ 4 300 ISPs full-dataset). Anything &gt; 60 % means revenue is highly skewed.
               </div>
             </div>
           </div>
@@ -393,8 +397,9 @@
              sources, winsor/θ), which strategies were enabled, and the
              optimal parameters the sweep found, so different configurations
              (e.g. summer vs winter, workdays vs weekends) can be compared
-             side by side. Populated by app.js renderOptimRuns(); in-memory
-             only, cleared on reload or via the Clear button.
+             side by side. Populated by app.js renderOptimRuns(); persisted
+             per tab in sessionStorage (survives same-tab navigation and
+             reloads, clears when the tab closes) or via the Clear button.
              ================================================================= -->
         <div class="card" id="optim-runs-card">
           <div class="card-head">
@@ -410,8 +415,9 @@
             ⚠ = saturated at a sweep edge). Use it to compare, for example,
             whether summer and winter (or workdays vs weekends) prefer
             different parameters — and to spot when a "different" optimum only
-            differs in parameters that carry no weight. The list is in-memory
-            and clears on reload.
+            differs in parameters that carry no weight. The list persists per
+            browser tab (sessionStorage): it survives navigation and reloads
+            and clears when the tab closes — or via Clear.
           </p>
           <div class="optim-runs-wrap">
             <table class="optim-runs" id="optim-runs-table"></table>
@@ -461,9 +467,9 @@
       gracefully optional — engine.js falls back to all-NaN (reserve never fires).
     -->
     <script src="data-reserve.js?v=43"></script>
-    <script src="engine.js?v=48"></script>
+    <script src="engine.js?v=49"></script>
     <script src="optim-sens.js?v=1"></script>
     <script src="charts.js?v=46"></script>
-    <script src="app.js?v=47"></script>
+    <script src="app.js?v=48"></script>
   </body>
 </html>

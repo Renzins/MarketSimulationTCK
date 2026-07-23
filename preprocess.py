@@ -26,7 +26,8 @@ The Backtester and Graphs pages auto-adapt to:
   * new bin boundaries (recomputed from data on every chart render)
 
 Manual updates needed for:
-  * tests.py frozen regression values (L1 = 13,257,221 €, L2 = 13,367,642 €)
+  * tests.py frozen regression values (FROZEN_L1/L2/L3_DEFAULT_EUR — the
+    suite prints the new totals; see the freeze policy in tests.py)
   * cache-busting ?v=N on <script> tags in index.html / graphs.html
 
 If the source CSV's column names change, NEEDED below must be updated

@@ -1,46 +1,50 @@
-# TCK Market Dashboard — Backtester + BESS + Spread Graphs + Forecast
+# TCK Market Dashboard — Backtester + BESS + Spread Graphs + Forecast + Bid data
 
-A static, four-page web tool (UI brand **"TCK Market Dashboard"**) for
+A static, five-page web tool (UI brand **"TCK Market Dashboard"**) for
 the Vanessa / Targale wind park (14 × 4.2 MW = 58.8 MW, Latvia). No
 server, no build step, no install — every page is plain HTML + JS served
 as-is. (The Backtester page is titled **"Backtester - Wind Park"** in the
 navbar.)
 
 The **Backtester** and **Graphs** pages run **entirely client-side and
-offline**: embedded datasets (~3 MB main + ~1.2 MB aFRR + ~85 MB
+offline**: embedded datasets (~3 MB main + ~1.2 MB aFRR + ~90 MB
 lazy-loaded per-4-s spread) drive all simulation in the browser. The
-**Forecast** page is the one exception that touches the network — it
-reads a live `forecast.json` (and can trigger a fresh model run) from a
-separate **private** repo via the GitHub API; see "Forecast" below.
+**Forecast** and **Bid data** pages are the exceptions that touch the
+network — each reads a live output file (and can trigger a fresh run)
+from a separate **private** repo via the GitHub API, through the shared
+`gh-run.js` client; see "Forecast" below.
 
-The tool is split into four pages, navigable from a top navbar:
+The tool is split into five pages, navigable from a top navbar:
 
 | Page              | What it does                                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------------- |
-| **Backtester - Wind Park** | Strategy P&L over a configurable simulation window, with a **day-type filter** (all / weekends+holidays / workdays). A unified engine runs **five toggleable, jointly-optimised strategies**: **reserve-market** capacity (down), **DA-withhold on low prices**, **adaptive mFRR↔aFRR split**, **ID-trust**, and **intra-day oversell + hedge-mFRR-dn (S3)**. Each ⚡ Optimise is logged to an **Optimised-runs** comparison table (persists per browser tab). |
+| **Backtester - Wind Park** | Strategy P&L over a configurable simulation window, with a **day-type filter** (all / weekends+holidays / workdays). A unified engine runs **six toggleable, jointly-optimised strategies**: **reserve-market** capacity (down **and up**), **DA-withhold on low prices**, **adaptive mFRR↔aFRR split**, **ID-trust**, and **intra-day oversell + hedge-mFRR-dn (S3)**. Each ⚡ Optimise is logged to an **Optimised-runs** comparison table (persists per browser tab). |
 | **Backtester - BESS** | Grid-scale **battery** (default 40 MWh / 20 MW) trading DA / mFRR / aFRR / intraday. A **stateful** 15-min simulation: state-of-charge is *carried* across periods. Five toggleable strategies — **adaptive mFRR↔aFRR split** (carried over), **sell-on-DA**, **dynamic multi-source charging**, **dynamic discharge pricing**, **opportunistic balancing override** — over an operating band (red zones), a round-trip-margin gate (min delta) and a must-fulfil guarantee on balancing activations. Same optimiser + Optimised-runs log. See [Backtester — BESS](#backtester--bess). |
 | **Graphs**        | Box plots and heatmaps over four sub-tabs: **mFRR** spread, **aFRR** spread/activation, **mFRR vs aFRR** (joint slot-level analysis), and **mFRR vs aFRR reserves** (daily reserve-capacity-price dynamics + imbalance-risk link). |
 | **Forecast**      | Six-hour-ahead (24 × 15-min) probability forecast of Baltic imbalance regimes — NEG (deficit) / ZRO (balanced) / POS (surplus) — plus expected imbalance prices. The model lives in a private repo; the page reads its `forecast.json`, and a single button dispatches a fresh run via GitHub Actions, then redraws when it lands. A completed run is cached per browser tab so navigating away and back keeps it on screen. |
+| **Bid data**      | Eight mFRR bid histograms — the four most recent 15-min UTC delivery periods × up/down — with an EE/LV/LT scheduling-area toggle (pure client-side re-filter of one fetched `bids.json`). Same private repo, password and PAT as Forecast (via the shared `gh-run.js` client), on its own `bids.yml` workflow route; a completed pull is cached per browser tab. |
 
 ## Repository layout
 
 ```
 .
 ├── index.html                  Backtester page (Setup + day-type filter +
-│                               Reserve / DA-withhold / adaptive-Split / ID-trust /
-│                               S3 strategy cards + parameter-sensitivity card +
+│                               Reserve-up / Reserve-down / DA-withhold / adaptive-Split /
+│                               ID-trust / S3 strategy cards + parameter-sensitivity card +
 │                               Optimised-runs log)
 ├── graphs.html                 Graphs page (tabs: mFRR / aFRR / mFRR vs aFRR /
 │                               mFRR vs aFRR reserves / Drivers & timing)
 ├── forecast.html               Forecast page (Baltic imbalance regime forecast;
 │                               reads forecast.json from a private model repo)
+├── bids.html                   Bid data page (8 mFRR bid histograms, EE/LV/LT area
+│                               toggle; reads bids.json from the same private repo)
 ├── bess.html                   Backtester - BESS page (battery; Setup + 5 strategy
 │                               cards + DA-forecast / SoC / bid-lifecycle / ops /
 │                               SoC-safety charts + parameter-sensitivity card +
 │                               Optimised-runs log)
 ├── style.css                   Dark-theme stylesheet (shared)
 │
-├── data.js                     1.7 MB main dataset (regenerated by preprocess.py)
+├── data.js                     ~3 MB main dataset (regenerated by preprocess.py)
 ├── data-afrr.js                ~580 KB per-ISP aFRR activation counts
 │                               (n_total / n_pos / n_neg / n_any) from preprocess-afrr.py
 ├── data-afrr-15min.js          ~650 KB per-ISP averaged AST_POS / AST_NEG +
@@ -110,10 +114,18 @@ The tool is split into four pages, navigable from a top navbar:
 │
 ├── forecast-charts.js          Forecast Plotly renderers (stacked NEG/ZRO/POS
 │                               regime bars, expected-price lines, per-horizon table)
-├── forecast-app.js             Forecast UI controller (PAT unlock, one-shot workflow
-│                               dispatch, poll-for-completion, fetch + render forecast.json)
+├── forecast-app.js             Forecast UI controller (render + per-tab cache of
+│                               forecast.json; run mechanics live in gh-run.js)
+├── bids-charts.js              Bid-data Plotly renderer (8 price/volume histograms,
+│                               shared nice bins + y-range per direction)
+├── bids-app.js                 Bid-data UI controller (area filter, period selection,
+│                               trimmed per-tab cache; run mechanics live in gh-run.js)
+├── gh-run.js                   SHARED GitHub-Actions run client for the Forecast and
+│                               Bid-data pages: PAT unlock, one-shot workflow dispatch,
+│                               poll-for-completion, output fetch — and the single
+│                               ENCRYPTED_PAT copy (PAT rotation edits this file only)
 ├── encrypt-pat.html            Local-only utility: encrypt a GitHub PAT with the shared
-│                               password (PBKDF2 → AES-GCM) → ENCRYPTED_PAT for forecast-app.js
+│                               password (PBKDF2 → AES-GCM) → ENCRYPTED_PAT for gh-run.js
 │
 ├── preprocess.py               Build data.js from main_data_with_imbalance.csv
 ├── preprocess-afrr.py          Build data-afrr.js + chunked spread files from ast_afrr_data.csv
@@ -123,13 +135,13 @@ The tool is split into four pages, navigable from a top navbar:
 │                               prices), aligned to data.js ISP indices by timestamp
 ├── preprocess-fundamentals.py  Build data-fund.js (fundamentals for the Drivers &
 │                               timing tab), timestamp-aligned like data-reserve.js
-├── tests.py                    85-test wind-park audit suite (data integrity, engine
+├── tests.py                    Wind-park audit suite, 93 tests (data integrity, engine
 │                               invariants, day-type filter, reserve market, adaptive
 │                               split, reserve↔split interaction, aFRR, sensitivity
 │                               anchor, FundEngine mirrors + data-fund.js alignment,
 │                               frozen regressions; some registrations conditional on
 │                               data files)
-├── tests_bess.py               31-test BESS suite (Python mirror of bess-engine.js):
+├── tests_bess.py               BESS suite, 32 tests (Python mirror of bess-engine.js):
 │                               forecast/peak+trough ranks, core mechanics (efficiency,
 │                               cost-basis, min-delta, whole-MW, red zones + red-zone
 │                               time audit, dwell, must-fulfil, price-aware charging,
@@ -157,7 +169,7 @@ inert — Pages just serves them as static assets. The 250 MB
 Two CDN scripts are loaded at runtime (no SRI — the CDNs don't
 publish hashes):
 
-- **Plotly** (cdn.plot.ly, versioned URL) — all three pages.
+- **Plotly** (cdn.plot.ly, versioned URL) — all five pages.
 - **date-holidays** v3.28 (jsdelivr, UMD bundle exposing `Holidays.default`)
   — on the Graphs **and** Backtester pages; drives the day-type filter for
   LV / EE / LT public-holiday detection. If the CDN is unreachable,
@@ -257,13 +269,15 @@ sign-flipping doesn't cancel out earnings — see "aFRR market"
 section. ISPs before `afrr_start_iso` (May 2025) have all four arrays
 at 0, so the engine's aFRR contribution is naturally 0 for them.
 
-### `data-reserve.js` — reserve (capacity) down-prices
+### `data-reserve.js` — reserve (capacity) prices, down + up
 
 ```js
 const RESERVE_DATA = {
   n: 43070,
   reserve_mfrr_dn: [...],   // LV mFRR-down hourly capacity price, EUR/MW·h (null where missing)
   reserve_afrr_dn: [...],   // LV aFRR-down hourly capacity price, EUR/MW·h (null where missing)
+  reserve_mfrr_up: [...],   // LV mFRR-up hourly capacity price (drives the Reserve-up card)
+  reserve_afrr_up: [...],   // LV aFRR-up hourly capacity price
 };
 ```
 
@@ -350,8 +364,8 @@ re-evaluates *every ISP* off a sliding `y`-ISP window — responsive *and*
 stable; `w = y` reproduces the original non-overlapping block behaviour.
 The adaptation is **causal** (each step uses only past prices) and runs
 continuously from the dataset start (like the S3 rolling stats), so a
-sub-window inherits the right split state; a winsor-keyed prefix-sum
-cache (`_splitEffPrefix`) keeps the optimiser fast. All eight params
+sub-window inherits the right split state; a (window × winsor)-keyed
+prefix-sum cache (`_splitEffPrefix`) keeps the optimiser fast. All eight params
 (`x₁ y₁ w₁ z₁` up, `x₂ y₂ w₂ z₂` down) are swept by the optimiser.
 
 **`z = 0` ⇒ the split never moves ⇒ static split at `x`** — the engine
@@ -433,7 +447,8 @@ capacity (`F_avail`). Data: hourly LV `reserves_mfrr_downward_lv` /
 `reserves_afrr_downward_lv` prices (EUR/MW·h), shipped in `data-reserve.js`
 (see Data layout). Parameters:
 
-- **DA offer coefficient** `r_coef` — awarded MW = `floor(r_coef × F)`.
+- **DA offer coefficient** `r_coef` — awarded MW = `floor(r_coef × F_avail)`
+  (the forecast left after any up-capacity carve-out; = `F` with up off).
 - **mFRR ↔ aFRR reserve split** `r_split` — routes the award between the
   two reserve products (each paid its own capacity price).
 - **Min reserve price** `r_min_price` — per-product reservation floor; a
@@ -493,13 +508,17 @@ There are no more "Level 1 / 2 / 3" tabs — a single unified engine always
 runs the full codepath, and behaviour is expressed via two source
 selectors (actual-power, ID-forecast) plus **six toggleable strategy
 cards**. Setup lives in one **shared box at the top**: anything there
-(sim window, day-type filter, winsor pairs, θ_flat) bounds the experiment
-and is **not** swept by the optimiser nor touched by "Reset to defaults".
+(sim window, day-type filter, sources, winsor pairs, θ_flat) bounds the
+experiment and is **not** swept by the optimiser. "Reset to defaults"
+resets everything **except** the sim window and the day-type filter —
+sources, winsor pairs and θ_flat return to their defaults along with
+the strategy parameters.
 Below it sit the strategy cards (Reserve-up → Reserve-down → DA-withhold →
 adaptive Split → ID-trust → S3), and at the very bottom the
 **Optimised-runs** log.
 
-Setup (experiment environment — NOT reset by "Reset to defaults"):
+Setup (experiment environment — only the sim window and day-type filter
+survive "Reset to defaults"; the rest returns to the values below):
 
 | Param                       | Default            | Notes                                                      |
 | --------------------------- | ------------------ | ---------------------------------------------------------- |
@@ -509,7 +528,7 @@ Setup (experiment environment — NOT reset by "Reset to defaults"):
 | Imbalance winsor            | 5 / 95 percentile  | Latvia imbalance price                                     |
 | aFRR up / down avg winsor   | 5 / 95 percentile  | per-ISP averaged AST_POS / AST_NEG                         |
 | mFRR / aFRR reserve winsor  | 5 / 95 percentile  | LV reserve (capacity) prices — clips the 4000 €/MW·h spikes (only bites when Reserve is on) |
-| θ_flat                      | 30 EUR/MWh         | flat penalty per MWh of shortfall; not swept, not reset    |
+| θ_flat                      | 30 EUR/MWh         | flat penalty per MWh of shortfall; not swept (Reset returns it to 30) |
 
 Every winsor input shows a live cap preview alongside the percentile
 (e.g. `(≤ −66.5 €/MWh) / (≥ 258 €/MWh)`).
@@ -661,7 +680,7 @@ different parameters, and whether two "different" optima actually differ
 only in weightless parameters. Newest run on top; **Clear** empties it.
 
 The log is **persisted per-tab** in `sessionStorage`
-(`tck.optimRuns.v1`): it survives navigating to Graphs / Forecast and
+(`tck.optimRuns.v5`): it survives navigating to Graphs / Forecast and
 back (and same-tab reloads), and is wiped only when the tab is closed.
 Writes are best-effort (wrapped in try/catch, so a disabled/full store
 just degrades to in-memory). See [Per-tab caching](#per-tab-caching).
@@ -675,19 +694,16 @@ basins: if a second basin appears with a competitive optimum, top-K
 will include samples from both, refining catches both, and we
 return the better one.
 
-**Per-level config** (measured per-sim costs: L1 0.65 ms, L2 1.26 ms,
-L3 2.10 ms — L3 is dearer because S3's rolling stats run per-ISP):
-
-| Level | N    | K | Random | Refine (K × ~)   | Wall  |
-|-------|------|---|--------|------------------|-------|
-| L1    | 2000 | 3 | 1.3 s  | 3 × 0.4 s = 1.2s | 2.5 s |
-| L2    | 4000 | 3 | 5 s    | 3 × 0.7 s = 2.1s | 7 s   |
-| L3    | 4000 | 5 | 8.4 s  | 5 × 3 s   = 15s  | 23 s  |
+**Config** (post-unification the optimiser always runs N = 4000 random
+samples + K = 5 refine starts; the sweep dimensionality — and thus the
+wall time, roughly 5–25 s — depends only on which strategies are
+enabled; the historical per-level N/K table predates the unified
+engine).
 
 **Reproducibility**: a seeded Mulberry32 PRNG (default seed
 `0xC0FFEE`) drives all sampling, so clicking Optimise twice on the
 same Setup produces identical results. The debug hook
-`window.__optimiseSilent(level, seed)` runs the same logic with a
+`window.__optimiseSilent(seed)` runs the same logic with a
 chosen seed and returns `{revenue, sample, ms}` without touching the
 UI — used for the variance analysis above.
 
@@ -832,7 +848,7 @@ core loop `_run(params, detail)` feeds both `simulate()` (full per-ISP detail +
 bid log + ops/SoC stats) and `simulateTotal()` (fast, optimiser hot path) — a
 single code path so the two can never diverge (locked by a parity test).
 
-### Setup (experiment environment — NOT optimised, NOT reset)
+### Setup (experiment environment — NOT optimised; Reset returns it to defaults)
 
 The wind-park's actual-power / intra-day-power source selectors and reserve
 winsorisation are **removed** (a battery has no generation forecast). What's
@@ -849,22 +865,27 @@ winsor, θ_flat. New battery parameters:
 | Upper red zone | 80 % | stop placing new **charge** bids above this |
 | Lower red zone | 20 % | stop placing new discretionary **discharge** bids below this |
 | Min delta | 100 €/MWh | required round-trip margin per delivered MWh |
-| θ_flat | 30 €/MWh | flat penalty on **unmet DA** MWh (balancing is never unmet) |
+| θ_flat | 30 €/MWh | flat penalty per MWh of DA commitment not physically met — short sell or unabsorbed buy (balancing is never unmet) |
 
 ### Sign conventions, efficiency and the min-delta gate
 
 Energy `E = MW × 0.25 h`; price €/MWh; **+ = money in**.
 
 ```
-DA discharge    +E · p_da                          (sell stored energy to DA)
+DA discharge    +E_committed · p_da                (financial: the D−1 sale is paid in
+                                                    full whether or not it is deliverable)
 mFRR-up         +E · p_mfrr      (p_mfrr ≥ +1)      (discharge into balancing)
 aFRR-up         +E · avg_p_pos   (avg_p_pos > 0)    (partial dispatch n_pos_fav/225)
 mFRR-dn charge  −E · p_mfrr      (p_mfrr ≤ −1)      (charge; p<0 ⇒ PAID to absorb ⇒ +)
 aFRR-dn charge  −E · avg_p_neg   (avg_p_neg < 0)    (partial dispatch n_neg_fav/225)
 intraday charge −E · vwap                           (real-time charge; vwap<0 ⇒ income)
-DA buy-low      −E · p_da                           (day-ahead committed trough buy)
+DA buy-low      −E_committed · p_da                 (financial mirror: the D−1 buy is
+                                                    paid in full whether or not it fits)
 opportunistic   close diverted DA on INTRADAY: −E · vwap   (DA revenue is KEPT)
-DA shortfall    −E_short · (p_imb + θ)              (unmet DA settles at imbalance)
+DA mismatch     short (undelivered sell): −E_short · (p_imb + θ)
+                surplus (unabsorbed buy): +E_surp · p_imb − E_surp · θ
+                (physical gap vs the DA commitment settles at imbalance;
+                 NaN p_imb ⇒ gap settlement skipped — wind-park NaN convention)
 ```
 
 ### Information timing — no future leakage
@@ -907,11 +928,14 @@ clairvoyance). Consequences worth knowing:
   realised balancing prices must change **nothing** that was placed for that
   ISP (direction, products, MW, intraday volume, DA delivery, divert
   commitment) — only clearing outcomes may differ.
-- Under fair timing the same default config re-measures from **3.10 M€ to
+- Under fair timing the same default config re-measured from **3.10 M€ to
   2.03 M€ (−34 %)** — that gap was the look-ahead premium of the old
-  clairvoyant routing/direction/divert logic, now removed. (The shipped
-  default lands at **2.11 M€** after also dropping the harmful switch — see
-  the re-pricing section.)
+  clairvoyant routing/direction/divert logic, now removed. (It then landed at
+  **2.11 M€** after also dropping the harmful switch — see the re-pricing
+  section — and re-measures at **3.41 M€** after the 2026-07 DA
+  financial-settlement fix: committed DA volume is paid in full and only the
+  physical gap settles at imbalance. Same placed offers and SoC path,
+  corrected cash.)
 
 Efficiency is split √η per leg, grid-side: charging `g` MWh raises SoC by
 `g·√η`; delivering `d` MWh drops SoC by `d/√η`. The **cost basis** is the
@@ -939,8 +963,10 @@ DA is fine; failing a balancing activation is not").
 DA is committed a day in advance, so the strategy can't see tomorrow's price. It
 uses a **lag-24h (96-ISP) persistence forecast**: `forecast[i] = p_da[i−96]`.
 Within each UTC day the ISPs are ranked by that forecast and the top
-`da_n_periods` are targeted for discharge; the offer (floor `da_min_price`)
-clears at delivery iff the **actual** `p_da ≥ floor`. The rank is
+`da_n_periods` are targeted for discharge; placement requires the
+**forecast** ≥ `da_min_price` (a limit order isn't posted below the floor)
+and the trade fills iff the **actual** `p_da ≥ floor` too — the same dual
+forecast+actual gate the buy side documents. The rank is
 param-independent (depends only on `p_da`), so it's built once at init.
 
 ### Day-type filter (stateful analogue of "run fully, filter")
@@ -961,8 +987,10 @@ matching-day ISPs. Because the filter gates accumulation rather than the SoC
 | **Dynamic discharge pricing** | run-up lookback (1), run-up threshold (20), reactive ask mark-up (75) | **reactive ask re-pricing** — every discretionary offer carries an ask (`effCost + minDelta`; each leg clears only when *its* realised price reaches the ask). On a run-up over **settled** ISPs (`p_mfrr[i−3] − p_mfrr[i−3−lb] ≥ threshold`) the whole offer is re-priced to `p_mfrr[i−3] + mark-up`: full volume stays offered, nothing is withheld — it clears only if the spike keeps running, and rests unfilled if it stalls. Mark-up 0 ≡ strategy off. |
 | **Opportunistic balancing override** | spike threshold (100) | a committed **bet**: when the last settled mFRR price runs ≥ threshold above the live intraday quote, buy the DA-sold volume back on intraday (cost committed at T−30) and re-offer the freed energy to mFRR at `quote + threshold` (T−25). Spike persists ⇒ clears, DA revenue kept, gain ≈ `mFRR − intraday`; spike fizzles ⇒ the offer rests, the energy stays stored and the ISP nets `DA − intraday` (a "divert miss"). Imbalance is never a chosen close. |
 
-Disabling a card collapses its strategy to a neutral no-op (charging off ⇒ the
-battery never charges; split off ⇒ all-mFRR; etc.), and the optimiser only
+Disabling a card collapses its strategy to a neutral no-op (charging off ⇒ no
+**real-time** charging — a committed DA buy-low still charges, it belongs to the
+DA card; split off ⇒ all-mFRR on the discharge side, though the settled-usability
+re-route can still move the **charge** share to aFRR-dn; etc.), and the optimiser only
 sweeps enabled cards' dimensions — same machinery (seeded Mulberry32 random +
 multi-start coord-descent refine) and same per-tab `sessionStorage` Optimised-
 runs log as the wind-park page (each run row also records its **top drivers**
@@ -1039,10 +1067,14 @@ level by the mark-up.
 
 Measured on the FAIR-timing engine (full dataset, defaults elsewhere):
 
-- re-pricing at lb 1 / thr 20 / mark-up 75 (shipped default): **+28.8 k€** vs
-  mark-up 0 (2,109,994 vs 2,081,222 €) — under honest timing the raised ask
-  genuinely earns; `mark-up 0` and `dd off` now coincide exactly, so the
-  toggle isolates one clean mechanism.
+- re-pricing at lb 1 / thr 20 / mark-up 75 (shipped default): measured
+  **+28.8 k€** vs mark-up 0 under the pre-2026-07 delivered-only DA booking
+  (2,109,994 vs 2,081,222 €), but that gain was partly avoidance of a
+  shortfall penalty that over-charged shorts by p_da. Under DA financial
+  settlement the same comparison re-measures **−5.2 k€** (3,409,313 vs
+  3,414,512 €) — the shipped mark-up is a re-optimisation candidate, not a
+  proven gain. `mark-up 0` and `dd off` still coincide exactly, so the toggle
+  isolates one clean mechanism.
 - the old hard mFRR→aFRR switch ("route everything to aFRR when it paid more
   last ISP") was **removed**: under fair timing it measured **−72.7 k€**
   (trailing-window routing is the adaptive split's job; a 45-min-old one-ISP
@@ -1062,7 +1094,7 @@ these numbers supersede the pre-fair-timing ones, which were leakage-inflated.
 ### Per-ISP decision order
 
 1. **Day-ahead** (committed a day ahead): discharge at a forecast peak (deliver from SoC; shortfall → imbalance) OR buy-low at a forecast trough.
-2. **Direction pick** for leftover power (discharge vs real-time charge) on **known info only** — settled (≤ i−3) balancing prices and the live intraday quote — respecting the dwell cooldown: a flip to the opposite direction needs ≥ dwell idle ISPs since the last action (DA commitments exempt). Offers are placed whenever physically possible and rest if the market never reaches them.
+2. **Direction pick** for leftover power (discharge vs real-time charge) on **known info only** — settled (≤ i−3) balancing prices and the live intraday quote — respecting the dwell cooldown: a flip to the opposite direction is allowed once ≥ `dwell` ISPs have passed since the last action, i.e. `dwell−1` fully idle ISPs sit in between (dwell 4 ⇒ opposite actions at least an hour apart, start to start; DA commitments exempt). Offers are placed whenever physically possible and rest if the market never reaches them.
 3. **Discharge leg**: opportunistic divert (a committed bet — intraday buy-back paid, freed energy offered at `quote + threshold`; a miss keeps the energy and pays the spread) → set the ask (reactively re-priced on a settled run-up) → **up-split** routing to mFRR-up/aFRR-up, each leg clearing only if its realised price ≥ the ask.
 4. **Real-time charge leg**: share the headroom by the **down split**, re-route lag-unusable sides, intraday only when settled balancing was dead; every order priced at the ceiling and cleared only by its own realised price.
 
@@ -1104,8 +1136,11 @@ price-impact / market-clearing model**: offering more is always net-positive on
 the frozen liquidity assumption. So the optimiser tends to drive `da_min_price`
 toward its low floor (sell DA almost always), `da_charge_price` / `max_charge_price`
 high (buy energy aggressively) — these are **liquidity levers**, not free money in
-the real market. Treat them as constraints to set deliberately; the interior dims
-(the split params, dwell, hold fraction) are genuine optima.
+the real market. Treat them as constraints to set deliberately; the interior
+dims the optimiser actually sweeps (the split params, `da_mw` /
+`da_n_periods`, the re-pricing `dd_*` knobs, `opp_threshold`) are genuine
+optima. (`dwell` is a Setup parameter, never swept; the old `dd_hold`
+fraction was removed with the whole-offer re-pricing rework.)
 
 ### Simplifications (documented, by design)
 
@@ -1116,17 +1151,19 @@ the real market. Treat them as constraints to set deliberately; the interior dim
 - **Initial energy is zero-cost.** The Initial SoC's cost basis is 0 (the gate
   `sell ≥ 0 + minDelta` is conservative anyway); over a 14-month run the initial
   20 MWh is negligible against the ~18 k MWh of throughput.
-- **DA over-buy is not penalised.** A committed day-ahead buy charges only what
-  fits in the battery; an un-storable committed buy (rare — we plan around the
-  forecast) is dropped rather than modelled as an over-position. Day-ahead
-  *discharge* shortfalls ARE penalised (the imbalance risk you care about).
+- **DA commitments settle financially.** A committed day-ahead trade is
+  paid/charged in full at p_da; only the physical gap settles at the
+  imbalance price, with θ per MWh of gap: an undelivered sell buys the short
+  back, an unabsorbable buy (rare — we plan around the forecast; 98 ISPs at
+  defaults) sells the surplus back. NaN p_imb skips the gap settlement for
+  that ISP (same convention as the wind-park engine).
 - **Greedy controller, not an optimal-control solver.** Each ISP is dispatched
   greedily under the strategy gates — a faithful *strategy* backtest, not a
   perfect-foresight MILP.
 
 ### Tests + frozen value
 
-`python tests_bess.py` runs **31 tests** against a Python mirror of
+`python tests_bess.py` runs **32 tests** against a Python mirror of
 `bess-engine.js` (plus a mirror of `optim-sens.js`'s sensitivity math —
 hand-computed OAT weight/band/shape/edge/sharp cases, Spearman with ties,
 interaction scores ranking a multiplicative pair above additive ones, and an
@@ -1147,9 +1184,9 @@ intraday volume, DA delivery, divert commitment — only clearing outcomes);
 and real-data invariants (rev == Σ components, SoC ∈ [0, cap], whole-MW
 volumes, day-type partition, strategy-off neutrality — dd off ⇒ zero repriced
 bids — both-splits static collapse).
-The **frozen default-config revenue** is **2,109,994.41 €** over the full
-dataset (fair information timing) — the browser `BessEngine` matches this
-Python mirror **to the cent** (float32-vs-float64 drift ≈ 0.03 €),
+The **frozen default-config revenue** is **3,409,313.15 €** over the full
+dataset (fair information timing, DA financial settlement) — the browser
+`BessEngine` matches this Python mirror to within float32-vs-float64 drift,
 establishing JS↔Python parity exactly as the wind-park frozen values do.
 Re-freeze (`FROZEN_DEFAULT_REVENUE_EUR`) after any engine change or data
 refresh.
@@ -1214,7 +1251,7 @@ could measure it). The fix lives in `graphs-app.js`: on tab switch,
 the handler calls `Plotly.Plots.resize` on every `.chart` in the
 newly-active panel.
 
-Below those, a lazy-loaded section (~86 MB chunked) renders the same
+Below those, a lazy-loaded section (~90 MB chunked) renders the same
 mFRR-style box plots / heatmaps but using the per-4-s aFRR price file
 — direction filterable (All / POS only ↑ / NEG only ↓).
 
@@ -1248,9 +1285,12 @@ takes over the moment the 4-s file finishes loading (via a
    Neither" 4-s slot types (using `AFRR_DATA.n_pos`, `n_neg`, `n_any`,
    `n_total`); ISP-mode uses aFRR-Up-only / Dn-only / Both / Neither
    ISP classification.
-3. **Sign agreement bars** — for each direction (POS / NEG), 4-way
-   tally of `sign(mFRR spread) × sign(aFRR spread)`. Both-positive +
-   both-negative = agreement; mixed signs = disagreement. **Caveat**:
+3. **Sign agreement bars** — for each direction (POS / NEG), a stacked
+   tally of `sign(mFRR spread) × sign(aFRR spread)`: in slot mode six
+   segments (both-positive + both-negative = agreement; the two mixed
+   signs = disagreement; plus "both near DA ±10%" where signs aren't
+   meaningful, and "aFRR N/A" slots where that direction never
+   activated). **Caveat**:
    aFRR-NEG spread is structurally ≤ 0 (since `avg_p_neg ≤ 0` and
    `p_da` typically > 0), so the right-hand chart is heavily dominated
    by "both negative" — informative for confirming that bias rather
@@ -1328,13 +1368,16 @@ Two later additions to this subtab:
 - **Capacity premium vs realized activation value** — the option-value lens.
   Each day: x = the DOWN capacity premium (daily mean price × 24,
   EUR/MW·day), y = a realized activation-payoff **proxy** for 1 MW offered
-  all day (mFRR-dn: `0.25·Σ max(0, −p_mfrr)`; aFRR-dn: the same with the
-  dispatched fraction `n_neg_fav/225` on `avg_p_neg`). The proxy ignores
-  award probability and positive-price buy-backs — relative value, not P&L.
-  Full-dataset reading: the premium runs several times the negative-price
-  activation proxy (≈ 371 vs 84 €/MW·day for mFRR-dn; ≈ 276 vs 44 for
-  aFRR-dn) and is nearly uncorrelated with it day-to-day (r ≈ 0.1 / −0.1) —
-  capacity is priced as insurance, not as expected activation margin.
+  all day (mFRR-dn: `0.25·Σ max(0, −p_mfrr)`; aFRR-dn: `0.25·Σ max(0,
+  −avg_p_neg)` — no extra dispatch factor: `avg_p_neg` is the
+  favourable-slot sum ÷ 225, so the partial-dispatch dilution is already
+  inside the price, exactly like the backtester's aFRR revenue formula).
+  The proxy ignores award probability and positive-price buy-backs —
+  relative value, not P&L. Default-view reading (default window + winsor
+  pairs): the premium runs several times the negative-price activation
+  proxy (≈ 371 vs 85 €/MW·day for mFRR-dn; ≈ 277 vs 53 for aFRR-dn) and is
+  nearly uncorrelated with it day-to-day (r ≈ 0.1 / −0.1) — capacity is
+  priced as insurance, not as expected activation margin.
 - **Structural-break markers** on every reserves time axis (and the daily
   charts of the Drivers tab): dotted red = **Baltic desynchronization from
   BRELL (8 Feb 2025** — three days after the dataset starts); shaded band =
@@ -1467,8 +1510,11 @@ Three views render from the same `forecast.json`:
 
 1. **Probability per horizon** — stacked bar (`p_neg` + `p_zero` +
    `p_pos` = 1) per 15-min delivery slot.
-2. **Expected imbalance price** — model-weighted expected price (solid)
-   vs a calendar-only baseline (dashed). The gap is the value the model
+2. **Expected imbalance price** — up to four lines: the model-weighted
+   expected price (solid) vs its calendar-only baseline (dashed), plus —
+   when the model emits them — a **dynamic** expected-price set
+   (`expected_dynamic_imbalance_price[_baseline]_eur_mwh`) and the DA
+   price for context. The model-vs-baseline gap is the value the model
    adds over a no-model expectation.
 3. **Per-horizon detail** — the full numeric table, argmax cell bolded.
 
@@ -1490,8 +1536,10 @@ when the user clicks again.
 4. `waitForRunCompletion` — poll every **5 s** (`POLL_INTERVAL_MS`) until
    the run completes, giving up after a **15-minute** timeout
    (`POLL_MAX_MS`).
-5. `fetchAndRender` — read `forecast.json` via the Contents API and
-   redraw all three views.
+5. Fetch `forecast.json` (raw media type via the shared `gh-run.js`
+   client — no Contents-API 1 MB base64 limit) and redraw all three
+   views. A payload carrying a non-null `error` keeps the error in the
+   status line and leaves the previous charts untouched.
 
 While a run is in flight the button becomes **Cancel** (aborts the
 in-flight poll). The typed password stays in the masked field between
@@ -1515,7 +1563,7 @@ result are persisted in **`sessionStorage`** — deliberately *not*
 `localStorage`. `sessionStorage` survives same-tab navigation and reload
 but is cleared when the tab closes, which matches the intent: "keep my
 work while I bounce between pages, but don't resurrect a stale run
-tomorrow." Keys are version-suffixed (`…​.v1`) so a future shape change
+tomorrow." Keys are version-suffixed (`….vN`) so a future shape change
 can invalidate old caches, and every read/write is wrapped in try/catch
 so a disabled or full store degrades gracefully to in-memory behaviour.
 Nothing sensitive is stored: the forecast cache holds only model output,
@@ -1538,7 +1586,11 @@ A single JSON document, committed at the root of the private repo:
       "argmax": 1,                          // index of the most likely class
       "argmax_label": "ZRO",                // "NEG" | "ZRO" | "POS"
       "expected_imbalance_price_eur_mwh": 38.4,
-      "expected_imbalance_price_baseline_eur_mwh": 41.0
+      "expected_imbalance_price_baseline_eur_mwh": 41.0,
+      // optional — drawn as a second line pair + context line when present:
+      "expected_dynamic_imbalance_price_eur_mwh": 39.9,
+      "expected_dynamic_imbalance_price_baseline_eur_mwh": 42.1,
+      "da_price_eur_mwh": 45.0
     }
     // … 24 entries
   ]
@@ -1550,17 +1602,21 @@ last successfully-rendered charts untouched.
 
 ### Configuration (before the page works)
 
-Everything the page needs is at the top of `forecast-app.js`:
+The run mechanics (PAT unlock, dispatch, poll, output fetch) live in the
+shared **`gh-run.js`** module — the Forecast and Bid-data pages both attach
+to it with their own workflow/output config:
 
-| Constant            | Meaning                                                         |
-| ------------------- | --------------------------------------------------------------- |
-| `REPO_OWNER`        | Owner of the private model repo.                                |
-| `REPO_NAME`         | Private model repo name.                                        |
-| `WORKFLOW_FILENAME` | Workflow file under `.github/workflows/` (e.g. `forecast.yml`). |
-| `FORECAST_PATH`     | Path to `forecast.json` within the repo (root by default).      |
-| `ENCRYPTED_PAT`     | `{ iterations, salt, iv, ciphertext }` — generated below.       |
-| `POLL_INTERVAL_MS`  | Poll cadence after dispatch (5 s).                              |
-| `POLL_MAX_MS`       | Give-up timeout for a single run (15 min).                      |
+| Constant (gh-run.js)  | Meaning                                                       |
+| --------------------- | ------------------------------------------------------------- |
+| `REPO_OWNER`          | Owner of the private model repo.                              |
+| `REPO_NAME`           | Private model repo name.                                      |
+| `ENCRYPTED_PAT`       | `{ iterations, salt, iv, ciphertext }` — generated below. The ONE shared copy, used by both pages. |
+| `POLL_INTERVAL_MS`    | Poll cadence after dispatch (5 s).                            |
+| `POLL_MAX_MS`         | Give-up timeout for a single run (15 min).                    |
+
+Per-page config is the `GhRun.attach({ workflowFile, outputPath, … })` call
+at the bottom of `forecast-app.js` (`forecast.yml` / `forecast.json`) and
+`bids-app.js` (`bids.yml` / `bids.json`).
 
 To (re)generate `ENCRYPTED_PAT`, open **`encrypt-pat.html`** under
 `file://` — it is local-only (no network, nothing written to disk):
@@ -1573,10 +1629,12 @@ To (re)generate `ENCRYPTED_PAT`, open **`encrypt-pat.html`** under
 3. Keep PBKDF2 iterations at ≥ 600 000 (OWASP-2023 floor for SHA-256 —
    ~1 s per decrypt, i.e. ~1 s per attacker guess).
 4. Copy the emitted `const ENCRYPTED_PAT = { … };` snippet over the
-   placeholder in `forecast-app.js`.
+   block in `gh-run.js` — the single shared copy; both the Forecast and
+   Bid-data pages read it, so one paste rotates both.
 
 Rotating the PAT or changing the password is just a re-run of
-`encrypt-pat.html` with the new value, then re-pasting the snippet.
+`encrypt-pat.html` with the new value, then re-pasting the snippet into
+`gh-run.js`.
 
 ### Security model
 
@@ -1612,8 +1670,10 @@ Internally the canonical form is still `YYYY-MM-DD` (ISO).
 
 ## Tests
 
-`tests.py` runs 86 audit / regression tests (a few are gated on the
-optional aFRR / reserve data files, so a stripped repo still passes):
+`tests.py` runs the full audit / regression suite — 93 tests at the time
+of writing, incl. a meta-guard that fails if any `test_*` function is
+defined but not registered (a few are gated on the optional aFRR /
+reserve data files, so a stripped repo still passes):
 
 ```
 python tests.py
@@ -1663,20 +1723,21 @@ Categories:
   asymmetric `s_up = 1, s_dn = 0` routes per direction independently;
   L1 with real aFRR feeds vs zeroed feeds confirms the feeds are wired.
 
-Frozen regression values (checked by `tests.py`'s Python mirror):
+Frozen regression values (checked by `tests.py`'s Python mirror — the
+same constants as the "Frozen regression values" section above):
 
-- L1 default (`X=30, Y=1, s_up=s_dn=1`)               = **13,257,221 €**
-- L2 default (`X=30, Y=1, Z=1, θ=30, s_up=s_dn=1`)    = **13,367,642 €**
+- L1 default (`X=30, Y=1, s_up=s_dn=1`)               = **13,760,612 €**
+- L2 default (`X=30, Y=1, Z=1, θ=30, s_up=s_dn=1`)    = **13,932,199 €**
 
 These hold as long as the default split keeps everything in mFRR
 (matches pre-aFRR behaviour). Any unintentional engine change shows
 up immediately.
 
-L3 doesn't have a Python-side frozen test (the speculation strategy is
-JS-only), but the equivalent **manual smoke check** is browser-side:
+L3 has a Python-side frozen test too (`test_l3_default_value` — the S3
+mirror lives in `simulate_total_l3`); the browser-side smoke checks:
 
-- L3 with `s3_X_cap = 0` (S3 disabled) = **13,367,642 €** (must equal L2 ✓)
-- L3 default (`K=4, S_min=25, σ_max=75, X_cap=5, M=5`) = **14,419,800 €**
+- L3 with `s3_X_cap = 0` (S3 disabled) = **13,932,199 €** (must equal L2 ✓)
+- L3 default (`K=4, S_min=25, σ_max=75, X_cap=5, M=5`) = **15,185,134 €**
 
 The X_cap=0 check is the most important one — it confirms that toggling
 S3 off truly returns L3 to L2 (i.e., the slot-level S3 contribution is
@@ -1686,9 +1747,9 @@ zero everywhere when the volume cap is zero). The `engine.js`
 
 ## Preprocessing scripts
 
-Three Python preprocessors build the embedded JS data files from the
-raw CSVs. Run order matters only for the aFRR scripts (they read
-`data.js` for the timeline).
+Five Python preprocessors build the embedded JS data files from the
+raw CSVs. Run order matters only for the scripts that read `data.js`
+for the timeline (aFRR / reserve / fundamentals).
 
 ### `preprocess.py` → `data.js`
 
@@ -1749,7 +1810,7 @@ NaN-row filtering changes); hourly prices are broadcast to each 15-min
 ISP, `null` where missing. The Oct–Dec 2025 gap in the source feed was
 backfilled into the CSV via `scratch/patch_reserves.py` from the official
 procured-reserves export — see the
-[`data-reserve.js`](#data-reservejs--reserve-capacity-down-prices) section.
+[`data-reserve.js`](#data-reservejs--reserve-capacity-prices-down--up) section.
 
 ## Data refresh workflow
 
@@ -1760,6 +1821,7 @@ python preprocess.py                # if main_data_with_imbalance.csv changed
 python preprocess-afrr.py           # if ast_afrr_data.csv changed (counts + chunked spread)
 python preprocess-afrr-15min.py     # if ast_afrr_data.csv changed (averaged 15-min prices)
 python preprocess-reserve.py        # rebuild data-reserve.js (reserve prices)
+python preprocess-fundamentals.py   # rebuild data-fund.js (Drivers & timing tab)
 python tests.py                     # see "frozen regression values" caveat below
 ```
 
@@ -1782,8 +1844,8 @@ What re-derives **automatically** from the new datasets:
 What needs **manual attention** when the data changes substantially:
 
 - **`tests.py` regression values** are frozen on the current dataset:
-  - L1 default = 13,257,221 €
-  - L2 default = 13,367,642 €
+  - L1 default = 13,760,612 €
+  - L2 default = 13,932,199 €
   - L3 default = 15,185,134 € (S3 on, reserve off, split all-mFRR)
   - April-row count = 2,880
   - ~2,911 NaN p_imb entries
@@ -1905,7 +1967,8 @@ These are non-obvious behaviours by design — read before "fixing".
     optimiser would just learn to stay in mFRR universally.
 
 14. **Day-type filter holidays via CDN plugin.** `date-holidays` v3.28
-    is loaded from jsdelivr only on `graphs.html`. The UMD bundle
+    is loaded from jsdelivr on every page that runs `Engine.init`
+    (`index.html`, `bess.html`, `graphs.html`). The UMD bundle
     exposes `Holidays.default` (NOT `Holidays` directly — newer
     ES-module-flavoured wrapping). `engine.js` probes both shapes.
     If the CDN fails entirely, `Engine.init` logs a console.info and
@@ -1967,7 +2030,7 @@ These are non-obvious behaviours by design — read before "fixing".
        because the wind park profits from the shortfall it created.
      - When `p_imb` is NaN (April-2026 rows), all three terms are
        zeroed in lockstep — S3 looks artificially profitable in those
-       windows. The L2 NaN-handling caveat (Known quirks #14) extends
+       windows. The L2 NaN-handling caveat (Known quirks #1) extends
        to S3.
      Both behaviours are tested in `tests.py`
      (`test_s3_imbalance_decomposition_equals_naive_short_cost`,
@@ -2000,7 +2063,7 @@ These are non-obvious behaviours by design — read before "fixing".
 18. **Some dims are held fixed (physical / liquidity constraints).** The
     optimiser sweeps the enabled strategies' levers (reserve-up
     `ru_coef`/`ru_split`/`ru_min_mw`, reserve-down `r_coef`/`r_split`,
-    `X`, `Y`, the six adaptive-split params, `Z`, S3 `K`/`S_min`/`σ_max`/`M`)
+    `X`, `Y`, the eight adaptive-split params, `Z`, S3 `K`/`S_min`/`σ_max`/`M`)
     but holds **both min reserve prices** and S3 **`X_cap` / lag `L` /
     `DA_skip`** at the user's values — they're physical / liquidity
     constraints, not strategy levers. `X_cap` in particular is excluded
@@ -2060,9 +2123,9 @@ stylesheet reference, so bumping `N` in `index.html`, `graphs.html`, and
 **per page** (each page's references share one number), so bump only the
 page whose assets changed.
 
-**The Forecast page additionally needs a configured private model repo.**
-Fill in the constants and `ENCRYPTED_PAT` in `forecast-app.js` (see
-"Forecast"), and set the `RUN_PASSWORD` secret on the workflow in that
+**The Forecast and Bid-data pages additionally need a configured private
+model repo.** Fill in the constants and `ENCRYPTED_PAT` in `gh-run.js` (see
+"Forecast"), and set the `RUN_PASSWORD` secret on the workflows in that
 private repo. Until then the page deploys fine but stays blank ("idle —
 enter password to begin"). `encrypt-pat.html` is a local-only helper and
 need not be deployed.
@@ -2070,16 +2133,18 @@ need not be deployed.
 ## Performance
 
 - All numeric arrays are converted to `Float32Array` at load time.
-- Winsorized arrays are cached and re-derived only when bounds /
-  window / day-type filter change. Cap values are returned even on
-  cache hits so the live preview can update without recomputing.
+- Winsorized arrays are cached under content-addressed keys — the key
+  encodes (window × percentile knobs), so nothing is ever invalidated;
+  a changed window or knob just misses the cache and re-derives. Cap
+  values are returned even on cache hits so the live preview can update
+  without recomputing.
 - Backtester optimiser cost (random + multi-start refine, see
   "Unified optimiser" above):
-  - L1: N=2000 random + 3 refines → ~2.5 s wall on the current dataset.
-  - L2: N=4000 random + 3 refines → ~7 s wall.
-  - L3: N=4000 random + 5 refines → ~23 s wall (refines dominate at
-    9 dims, so the bar pauses at the refine boundary; the inner loop
-    still yields every 200 ms so the UI stays responsive).
+  - Unified config: N=4000 random + 5 refine starts — roughly 5–25 s wall
+    depending on how many strategies (dimensions) are enabled; refines
+    dominate at high dim counts, and the inner loop yields every 200 ms
+    so the UI stays responsive. (The old per-level N/K figures predate
+    the unified engine.)
   - Cooperative yields via `MessageChannel.postMessage` (the
     `setTimeout(0)` clamp / background-tab throttling makes
     `setTimeout`-based yields ~50× slower in some browser contexts).

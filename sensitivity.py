@@ -1,4 +1,7 @@
-"""Pressure-test the optima under different assumptions."""
+"""HISTORICAL (v1-era, May 2025) — pressure-tested the original L1/L2 optima
+under different assumptions (winsor pairs, theta, drop-top-N). Imports the
+equally-historical validate.py mirror; see its docstring before running on
+current data. Kept as provenance for windpark_backtest_report.md."""
 
 import sys
 import os

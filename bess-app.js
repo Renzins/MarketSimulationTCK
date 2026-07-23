@@ -51,7 +51,7 @@
     },
     dwell_isps: {
       group: "setup", label: "Min time between direction change", unit: "ISPs (×15 min)", min: 0, max: 96, sliderStep: 1, numStep: 1, decimals: 0,
-      description: "A cooldown/rest: after the last charge or discharge, the battery must idle at least this many ISPs before it may switch to the OPPOSITE direction (continuing the same direction is unconstrained). Measured from the end of a block, so it forces a genuine break between a discharge phase and the next charge phase. Day-ahead-committed sells/buys override it.",
+      description: "A cooldown/rest: after the last charge or discharge, a switch to the OPPOSITE direction is allowed once this many ISPs have passed — i.e. dwell−1 fully idle ISPs in between (continuing the same direction is unconstrained). Measured from the end of a block, so opposite phases start at least dwell ISPs apart. Day-ahead-committed sells/buys override it.",
       extremes: [["4 (default)", "1 hour"], ["0", "flip freely"], ["96", "at most one flip per day"]],
     },
     upper_red_pct: {
@@ -121,7 +121,7 @@
       extremes: [["0", "static"], ["0.1", "10% per rebalance"]] },
     // -------- sell on day-ahead --------
     da_min_price: { group: "da-discharge", label: "Min DA sell price", unit: "EUR/MWh", min: -50, max: 300, sliderStep: 1, numStep: 1, decimals: 0,
-      description: "Floor price for day-ahead discharge offers. An offer is placed at a forecast peak and clears only when the actual DA price ≥ this floor.",
+      description: "Floor price for day-ahead discharge offers — a dual gate like the buy side: the offer is placed at a forecast peak only when the FORECAST ≥ this floor (no limit order posted below it), and the trade fills only when the actual DA price ≥ the floor too.",
       extremes: [["100 (default)", "only sell DA at ≥ 100"], ["0", "sell at any non-negative price"]] },
     da_n_periods: { group: "da-discharge", label: "Discharge periods / day", unit: "ISPs", min: 0, max: 48, sliderStep: 1, numStep: 1, decimals: 0,
       description: "How many of each day's forecast-peak 15-min periods to target for discharge. Fewer = concentrate on the very top; more = spread across a wider peak.",

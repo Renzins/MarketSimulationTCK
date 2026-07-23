@@ -39,15 +39,19 @@
 //   Flat penalty: -Q_short * theta_flat
 //   per-ISP rev = (DA + up + dn - imb - flat) * 0.25          [MW * h]
 //
-// MFRR ↔ AFRR SPLIT (two parameters: s_up, s_dn ∈ [0, 1]; 1 = all mFRR)
+// MFRR ↔ AFRR SPLIT (per direction, s_up / s_dn ∈ [0, 1]; 1 = all mFRR;
+//   the shipped strategy is the ADAPTIVE split — 8 params, see _splitBlocks —
+//   whose per-ISP value feeds the same formulas; a static scalar s is the
+//   step=0 special case)
 //   Round-and-remainder per direction over the FREE (non-reserve) volume:
 //     Q_up_mfrr = R_up_mfrr + round(s_up * up_free)   Q_up_afrr = R_up_afrr + remainder
 //     Q_dn_mfrr = R_mfrr    + round(s_dn * da_nonres)  Q_dn_afrr = R_afrr    + remainder
 //   The reserve-market awards (R_up_* / R_* — see the reserve blocks inside
 //   simulate()) are a MANDATORY floor carrying their own ru_split / r_split;
 //   only the free remainder follows s_up / s_dn. up_free = floor(F) − R_up −
-//   da_sold; da_nonres = da_sold − R_dn. With both reserves off (R = 0) this is
-//   exactly round(s * total). With s_up = s_dn = 1 both aFRR terms are 0.
+//   da_sold + trustedExtra; da_nonres = da_sold − R_dn. With both reserves off
+//   (R = 0) this is exactly round(s * total). With s_up = s_dn = 1 both aFRR
+//   terms are 0.
 //   aFRR prices come
 //   from data-afrr-15min.js: avg_p_pos[i] / avg_p_neg[i] are the
 //   time-weighted means of AST_POS / AST_NEG over each ISP's 4-s slots,
@@ -84,14 +88,20 @@
 // EXPORTS
 //   init(rawData)                  — bootstrap typed-array views, reset window
 //   getData()                      — internal D (typed arrays + meta + dayTypeMask + aFRR)
-//   setWindow(start, end)          — half-open ISP-index window (invalidates winsor cache)
+//   setWindow(start, end)          — half-open ISP-index window
 //   getWindow()                    — { start, end }
-//   maybeWinsorize(mfrrLo, mfrrHi, imbLo, imbHi, posLo, posHi, negLo, negHi)
-//                                  — keyed-cache; ALWAYS returns current bounds (for live UI)
-//   forceRewinsor()                — invalidate cache (rare)
+//   maybeWinsorize(mfrrLo, mfrrHi, imbLo, imbHi, posLo, posHi, negLo, negHi,
+//                  resMLo, resMHi, resALo, resAHi)
+//                                  — 12 args (4 main + reserve mFRR/aFRR pairs);
+//                                    cache keyed on (window × percentiles);
+//                                    ALWAYS returns current bounds (for live UI)
+//   forceRewinsor()                — drop all winsor + derived caches (only
+//                                    needed if raw arrays are mutated in place)
 //   simulate(params)               — full per-ISP detail
 //   simulateTotal(params)          — fast total-only (for sweeps / optimiser)
-//   naiveRevenue(params)           — simulateTotal at X=0, Y=0, Z=0 with current splits + sources
+//   naiveRevenue(params)           — simulateTotal with EVERY strategy neutralised
+//                                    (X=Y=Z=0, split forced all-mFRR, S3 + reserves off;
+//                                    keeps current θ/sources/day filter)
 //   topConcentration(perISP, frac) — top-N% revenue share (robustness)
 //   monthlyAggregation(params)     — month-bucketed decomposition (incl. aFRR + S3)
 //   totalPotMWhInWindow(params)    — sum of Q_pot in current window (Q_pot depends on actualSource)
@@ -319,16 +329,12 @@ const Engine = (() => {
   }
 
   function setWindow(start, end) {
+    // No cache invalidation here — winsor cache keys encode the window
+    // (see maybeWinsorize), so a stale entry simply can't match.
     const s = Math.max(0, Math.min(D.n, start | 0));
     const e = Math.max(s, Math.min(D.n, end | 0));
-    if (s !== winStart || e !== winEnd) {
-      winStart = s;
-      winEnd = e;
-      cachedMfrrKey = null;
-      cachedImbKey = null;
-      cachedAfrrPosKey = null;
-      cachedAfrrNegKey = null;
-    }
+    winStart = s;
+    winEnd = e;
     return { start: winStart, end: winEnd };
   }
 
@@ -350,7 +356,9 @@ const Engine = (() => {
   let cachedResAfrrKey = null;
   let cachedResMfrrBounds = { lo: 0, hi: 0 };
   let cachedResAfrrBounds = { lo: 0, hi: 0 };
-  // Adaptive-split effective-price prefix sums, cached by winsor state.
+  // Adaptive-split effective-price prefix sums, cached by winsor state
+  // (the family keys encode window × percentiles, so this cache follows
+  // window changes through the key strings alone).
   let _splitFxKey = null;
   let _splitFx = null;
 
@@ -463,10 +471,17 @@ const Engine = (() => {
     pResALow = 5,
     pResAHigh = 95,
   ) {
-    const mfrrKey = `${pMfrrLow}-${pMfrrHigh}`;
-    const imbKey = `${pImbLow}-${pImbHigh}`;
-    const posKey = `${pPosLow}-${pPosHigh}`;
-    const negKey = `${pNegLow}-${pNegHigh}`;
+    // Content-addressed keys: a winsorized array is a pure function of
+    // (window × percentile knobs) — applyWinsor samples percentiles from
+    // [winStart, winEnd) — so the key encodes both. Nothing ever invalidates
+    // these caches; a changed window (or knob) simply produces a different
+    // key. Caches derived from these keys (_splitEffPrefix) inherit
+    // window-awareness through the key strings.
+    const wKey = `${winStart}:${winEnd}`;
+    const mfrrKey = `${wKey}|${pMfrrLow}-${pMfrrHigh}`;
+    const imbKey = `${wKey}|${pImbLow}-${pImbHigh}`;
+    const posKey = `${wKey}|${pPosLow}-${pPosHigh}`;
+    const negKey = `${wKey}|${pNegLow}-${pNegHigh}`;
     if (mfrrKey !== cachedMfrrKey) {
       cachedMfrrBounds = applyWinsor(D.p_mfrr_raw, D.p_mfrr, pMfrrLow, pMfrrHigh);
       cachedMfrrKey = mfrrKey;
@@ -485,8 +500,8 @@ const Engine = (() => {
     }
     // Reserve down-capacity prices (only meaningful when data-reserve.js
     // loaded; otherwise the raw arrays are all-NaN and applyWinsor no-ops).
-    const resMKey = `${pResMLow}-${pResMHigh}`;
-    const resAKey = `${pResALow}-${pResAHigh}`;
+    const resMKey = `${wKey}|${pResMLow}-${pResMHigh}`;
+    const resAKey = `${wKey}|${pResALow}-${pResAHigh}`;
     if (resMKey !== cachedResMfrrKey) {
       cachedResMfrrBounds = applyWinsor(D.reserve_mfrr_dn_raw, D.reserve_mfrr_dn, pResMLow, pResMHigh);
       // UP mFRR-capacity shares the same percentile knob (its own distribution).
@@ -513,6 +528,10 @@ const Engine = (() => {
     cachedImbKey = null;
     cachedAfrrPosKey = null;
     cachedAfrrNegKey = null;
+    cachedResMfrrKey = null;
+    cachedResAfrrKey = null;
+    _splitFxKey = null;
+    _splitFx = null;
   }
 
   // ---------- adaptive mFRR↔aFRR split ----------------------------------
@@ -1023,6 +1042,12 @@ const Engine = (() => {
   // ---------- fast total-only simulation (for sweeps) --------------------
   // Same math as simulate() but returns only the scalar totalRevenue.
   // Inlined hot path; no per-ISP arrays allocated.
+  // INVARIANT: every whole-MW floor must stay textually identical to
+  // simulate() — Math.floor(x + 1e-9), never |0. Bare truncation drops the
+  // epsilon guard, so fractional-coefficient products (0.58 × 50 =
+  // 28.999999999999996) floor one MW lower here than in simulate(), and the
+  // optimiser then ranks candidates on a different objective than the
+  // headline the UI displays.
   function simulateTotal(params) {
     const p = _resolveParams(params);
     const s3Active = p.s3Enabled && p.s3_X_cap >= 1 && p.s3_K >= 1;
@@ -1065,7 +1090,7 @@ const Engine = (() => {
         R_up_afrr = 0,
         reserve_up_rate = 0;
       if (p.reserveUpEnabled && F >= p.ru_min_mw) {
-        const Ru_total = (p.ru_coef * F) | 0;
+        const Ru_total = Math.floor(p.ru_coef * F + 1e-9);
         const Rum0 = Math.round(p.ru_split * Ru_total);
         const pru_m = resMU_arr[i];
         const pru_a = resAU_arr[i];
@@ -1085,7 +1110,7 @@ const Engine = (() => {
         R_afrr = 0,
         reserve_rate = 0;
       if (p.reserveEnabled) {
-        const R_total = (p.r_coef * F_avail) | 0;
+        const R_total = Math.floor(p.r_coef * F_avail + 1e-9);
         const Rm0 = Math.round(p.r_split * R_total);
         const pr_m = resM_arr[i];
         const pr_a = resA_arr[i];
@@ -1099,11 +1124,11 @@ const Engine = (() => {
         }
       }
       const R_dn = R_mfrr + R_afrr;
-      const da_sold_wh = (aboveX ? F_avail : F_avail * (1 - p.Y)) | 0;
+      const da_sold_wh = Math.floor((aboveX ? F_avail : F_avail * (1 - p.Y)) + 1e-9);
       const da_sold = da_sold_wh > R_dn ? da_sold_wh : R_dn;
-      const Q_w = (F | 0) - R_up - da_sold;
+      const Q_w = Math.floor(F + 1e-9) - R_up - da_sold;
       const trustedRevRaw = p.Z * (ID_src[i] - F);
-      const trustedExtra = trustedRevRaw > 0 ? (trustedRevRaw | 0) : 0;
+      const trustedExtra = trustedRevRaw > 0 ? Math.floor(trustedRevRaw + 1e-9) : 0;
       const up_free = Q_w + trustedExtra;
       const da_nonreserve = da_sold - R_dn;
       const rest_up_mfrr = Math.round(sUp * up_free);
@@ -1136,7 +1161,7 @@ const Engine = (() => {
             if (spread >= p.s3_S_min && P_mfrr_sigma <= p.s3_sigma_max) {
               const sig = (spread - p.s3_S_min) / p.s3_S_min;
               const X_raw = p.s3_X_cap * (sig < 1 ? sig : 1);
-              const X_prop = (X_raw + 1e-9) | 0;
+              const X_prop = Math.floor(X_raw + 1e-9);
               if (X_prop >= 1) {
                 const bid_price = P_ID_est + p.s3_M;
                 rev += X_prop * P_ID_est;

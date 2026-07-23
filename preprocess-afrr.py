@@ -167,7 +167,7 @@ def main():
     print(f"  wrote {OUT}: {sz:.0f} KB")
 
     # =========================================================================
-    #  data-afrr-prices.js — every-4s spread file
+    #  data-afrr-prices-*.js — every-4s spread data (chunked)
     #
     #  For every 4-second slot in the aFRR CSV, emit ONE entry per non-null
     #  direction (so a slot with both POS and NEG active produces two entries).

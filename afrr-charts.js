@@ -47,9 +47,6 @@ const AfrrCharts = (() => {
   function fmtCount(n) {
     return n.toLocaleString("en-US");
   }
-  function fmtPct(p) {
-    return (p * 100).toFixed(2) + "%";
-  }
   function fmtSegLabel(p) {
     // Bigger numbers use 1dp, very small ones use 2dp; very tiny ones omit.
     if (p < 0.005) return "";

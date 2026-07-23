@@ -271,8 +271,9 @@ const GraphsCharts = (() => {
       for (const b of panel.boxes) {
         globalN += b.n;
         if (b.max > yMax) yMax = b.max;
-        // Cap at 95th-percentile-style — exclude extreme outliers from
-        // determining y-range, otherwise the boxes get squashed.
+        // Let outliers stretch the y-range only while they stay below
+        // 3× the running max — more extreme spikes are excluded so the
+        // boxes don't get squashed.
         for (const o of b.outliers) {
           if (o > yMax && o < yMax * 3) yMax = o;
         }
